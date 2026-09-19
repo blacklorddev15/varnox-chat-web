@@ -1,3 +1,11 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Keep the document dark so there is no white flash before the app mounts and no white
+   band behind short screens. Matches the dark `background` token (#171717) in
+   theme.config.js. */
+html,
+body {
+  background-color: #171717;
+}

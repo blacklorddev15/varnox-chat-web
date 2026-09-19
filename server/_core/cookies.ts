@@ -20,9 +20,21 @@ function isSecureRequest(req: Request) {
 }
 
 /**
+ * Hosts that genuinely need one cookie shared across their subdomains.
+ *
+ * The previous logic derived a parent domain from any three-part hostname, so
+ * "varnox-chat-web.vercel.app" produced Domain=.vercel.app. vercel.app is on the Public
+ * Suffix List and browsers reject cookies scoped to a public suffix, so the session
+ * cookie was silently dropped and every visitor had to sign in again on every visit.
+ */
+const SHARED_COOKIE_DOMAINS = ["manuspre.computer", "manus.computer"];
+
+/**
  * Extract parent domain for cookie sharing across subdomains.
  * e.g., "3000-xxx.manuspre.computer" -> ".manuspre.computer"
  * This allows cookies set by 3000-xxx to be read by 8081-xxx
+ *
+ * Any other host (vercel.app, a custom domain, localhost) gets a host-only cookie.
  */
 function getParentDomain(hostname: string): string | undefined {
   // Don't set domain for localhost or IP addresses
@@ -30,18 +42,16 @@ function getParentDomain(hostname: string): string | undefined {
     return undefined;
   }
 
-  // Split hostname into parts
-  const parts = hostname.split(".");
+  const shared = SHARED_COOKIE_DOMAINS.find(
+    (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+  );
 
-  // Need at least 3 parts for a subdomain (e.g., "3000-xxx.manuspre.computer")
-  // For "manuspre.computer", we can't set a parent domain
-  if (parts.length < 3) {
+  // Host-only cookie for everything else: safer, and it is what actually persists.
+  if (!shared) {
     return undefined;
   }
 
-  // Return parent domain with leading dot (e.g., ".manuspre.computer")
-  // This allows cookie to be shared across all subdomains
-  return "." + parts.slice(-2).join(".");
+  return "." + shared;
 }
 
 export function getSessionCookieOptions(

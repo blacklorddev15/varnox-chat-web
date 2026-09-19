@@ -11,11 +11,10 @@ export function useColorScheme() {
     setHasHydrated(true);
   }, []);
 
-  const colorScheme = useRNColorScheme();
+  // VARNOX uses a fixed dark palette (near-black surfaces, gold accents) rather than
+  // following the device preference, which previously rendered the site near-white for
+  // anyone whose phone or browser was in light mode.
+  useRNColorScheme();
 
-  if (hasHydrated) {
-    return colorScheme;
-  }
-
-  return "light";
+  return "dark";
 }
