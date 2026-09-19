@@ -24,6 +24,7 @@ import { createAudioPlayer, RecordingPresets, requestRecordingPermissionsAsync, 
 
 import { ScreenContainer } from "@/components/screen-container";
 import { useColors } from "@/hooks/use-colors";
+import { useAppVisible } from "@/hooks/use-app-visible";
 import { useAuth } from "@/hooks/use-auth";
 import { appendMessage, filterConversations } from "@/lib/pulse-chat";
 import { prepareAttachment } from "@/lib/media-upload";
@@ -109,6 +110,23 @@ function chatColor(seed: string): string {
   return CHAT_COLORS[hash % CHAT_COLORS.length];
 }
 
+/**
+ * "last seen 14:32" for today, a short date for anything older.
+ *
+ * Returns null when there is nothing to show: either the person has never been seen, or their
+ * `last seen` privacy setting hides it - the server blanks the value in that case rather than
+ * expecting every screen to remember to check.
+ */
+function lastSeenLabel(value?: string | Date | null): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  const now = new Date();
+  return date.toDateString() === now.toDateString()
+    ? `last seen ${date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+    : `last seen ${date.toLocaleDateString([], { month: "short", day: "numeric" })}`;
+}
+
 function chatTime(value?: string | Date | null): string {
   if (!value) return "";
   const date = new Date(value);
@@ -174,13 +192,15 @@ export default function HomeScreen() {
   const [deviceContacts, setDeviceContacts] = useState<ContactSuggestion[]>([]);
   const [webNotificationStatus, setWebNotificationStatus] = useState<NotificationPermission | "unsupported">("default");
   const seenRemoteMessages = useRef<Record<string, Set<string>>>({});
+  // Every refresh timer below is gated on this, so a backgrounded app stops talking to the server.
+  const appVisible = useAppVisible();
 
   // Real conversations from the backend. The hardcoded list below is only a pre-login
   // placeholder: it used to be what signed-in users saw (fake names, fake unread counts,
   // and fake notification titles), while the backend already had the real rows.
   const conversationListQuery = trpc.conversations.list.useQuery(undefined, {
     enabled: isAuthenticated,
-    refetchInterval: isAuthenticated ? 8000 : false,
+    refetchInterval: isAuthenticated && appVisible ? 8000 : false,
   });
   const markRead = trpc.conversations.markRead.useMutation();
   const markDelivered = trpc.conversations.markDelivered.useMutation();
@@ -234,7 +254,7 @@ export default function HomeScreen() {
   }, [conversations, chatFilter, query]);
   const liveMessagesQuery = trpc.conversations.messages.useQuery(
     { conversationId: selectedId ?? "local", since: undefined },
-    { enabled: Boolean(selectedId && isAuthenticated), refetchInterval: isAuthenticated ? 3000 : false },
+    { enabled: Boolean(selectedId && isAuthenticated), refetchInterval: isAuthenticated && appVisible ? 2500 : false },
   );
   const ensureConversation = trpc.conversations.ensure.useMutation();
   const startDirect = trpc.conversations.startDirect.useMutation();
@@ -242,6 +262,60 @@ export default function HomeScreen() {
   const uploadMedia = trpc.media.upload.useMutation();
   const registerPush = trpc.push.register.useMutation();
   const peopleSearch = trpc.people.search.useQuery({ query: contactQuery }, { enabled: isAuthenticated && contactQuery.trim().length >= 2 });
+
+  // Presence. The inbox variant covers the whole chat list so rows can show a typing line and an
+  // online dot; the per-conversation variant feeds the header of the chat that is open.
+  const presenceInbox = trpc.presence.inbox.useQuery(undefined, {
+    enabled: isAuthenticated && appVisible,
+    refetchInterval: isAuthenticated && appVisible ? 6000 : false,
+  });
+  const chatPresence = trpc.presence.forConversation.useQuery(
+    { conversationId: selectedId ?? "none" },
+    { enabled: Boolean(selectedId && isAuthenticated && appVisible), refetchInterval: isAuthenticated && appVisible ? 4000 : false },
+  );
+  const presenceHeartbeat = trpc.presence.heartbeat.useMutation();
+  // Presence keyed by conversation, for the list rows.
+  const inboxPresence = useMemo(() => new Map((presenceInbox.data ?? []).map((row) => [row.conversationId, row] as const)), [presenceInbox.data]);
+
+  // Refs, not state: these change on every keystroke and must not re-render the list.
+  const heartbeatRef = useRef(presenceHeartbeat);
+  heartbeatRef.current = presenceHeartbeat;
+  const typingTargetRef = useRef<string | null>(null);
+  const typingClearTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastTypingSentAt = useRef(0);
+
+  // A beat every 20s while the app is in front. It carries the current typing target, so the same
+  // call that proves the client is alive also refreshes the server's short typing lease.
+  useEffect(() => {
+    if (!isAuthenticated || !appVisible) return;
+    const beat = () => heartbeatRef.current.mutate({ typingConversationId: typingTargetRef.current });
+    beat();
+    const timer = setInterval(beat, 20_000);
+    return () => clearInterval(timer);
+  }, [isAuthenticated, appVisible]);
+
+  // Typing: announced on the first keystroke, re-sent every 4s while keys keep arriving (the
+  // server lease is 8s), and dropped the moment the box empties. If this client vanishes
+  // mid-sentence the lease expires on its own, so nobody is left watching a stuck indicator.
+  useEffect(() => {
+    if (!isAuthenticated || !appVisible) return;
+    const want = selectedId && composerText.trim().length > 0 ? selectedId : null;
+    if (want === null && typingTargetRef.current === null) return;
+    const now = Date.now();
+    if (want !== null && now - lastTypingSentAt.current < 4000) return;
+    if (typingClearTimer.current) clearTimeout(typingClearTimer.current);
+    typingTargetRef.current = want;
+    lastTypingSentAt.current = now;
+    heartbeatRef.current.mutate({ typingConversationId: want });
+    if (want) {
+      typingClearTimer.current = setTimeout(() => {
+        typingTargetRef.current = null;
+        heartbeatRef.current.mutate({ typingConversationId: null });
+      }, 6000);
+    }
+  }, [composerText, selectedId, isAuthenticated, appVisible]);
+
+  useEffect(() => () => { if (typingClearTimer.current) clearTimeout(typingClearTimer.current); }, []);
 
   const { startCall } = useCall();
 
@@ -587,6 +661,12 @@ export default function HomeScreen() {
 
   if (selectedChat) {
     const chatMessages = isAuthenticated && liveMessagesQuery.data ? backendMessages : (messages[selectedChat.id] ?? []);
+    // What the other side is doing, as far as I am allowed to see it. A direct chat has one peer,
+    // so the first entry is the person; groups report typing but never presence.
+    const peerRows = chatPresence.data ?? [];
+    const peerTyping = peerRows.some((row) => row.typingIn === selectedChat.id);
+    const peerOnline = peerRows.some((row) => row.online);
+    const peerLastSeen = lastSeenLabel(peerRows.find((row) => row.lastSeenAt)?.lastSeenAt ?? null);
     return (
       <ScreenContainer edges={["top", "bottom", "left", "right"]} containerClassName="bg-background">
         <StatusBar style="light" />
@@ -594,7 +674,7 @@ export default function HomeScreen() {
           <View style={[styles.chatHeader, { borderBottomColor: colors.border, backgroundColor: colors.surface }]}>
             <Pressable onPress={() => setSelectedId(null)} style={({ pressed }) => [styles.backButton, pressed && styles.pressed]}><MaterialIcons name="arrow-back-ios" size={20} color={colors.foreground} /></Pressable>
             <Avatar item={selectedChat} size={40} />
-            <Pressable onPress={() => router.push({ pathname: "/chat/group-info", params: { conversationId: selectedChat.id } })} style={styles.chatTitleBlock}><Text style={[styles.chatTitle, { color: colors.foreground }]}>{selectedChat.name}</Text><Text style={[styles.chatSubtitle, { color: colors.muted }]}>{selectedChat.group ? "tap for group info" : isAuthenticated ? "messages sync automatically" : "not signed in"}</Text></Pressable>
+            <Pressable onPress={() => router.push({ pathname: "/chat/group-info", params: { conversationId: selectedChat.id } })} style={styles.chatTitleBlock}><Text style={[styles.chatTitle, { color: colors.foreground }]}>{selectedChat.name}</Text><Text style={[styles.chatSubtitle, { color: peerTyping || peerOnline ? colors.primary : colors.muted }]}>{peerTyping ? "typing…" : peerOnline ? "online" : selectedChat.group ? "tap for group info" : peerLastSeen ?? (isAuthenticated ? "messages sync automatically" : "not signed in")}</Text></Pressable>
             <IconButton name="timer" color={selectedChat.disappearSeconds ? colors.primary : colors.muted} onPress={() => setShowTimer((current) => !current)} />
             <IconButton name="videocam" color={colors.primary} onPress={() => void startCall({ conversationId: selectedChat.id, kind: "video", peerName: selectedChat.name })} />
             <IconButton name="call" color={colors.primary} onPress={() => void startCall({ conversationId: selectedChat.id, kind: "audio", peerName: selectedChat.name })} />
@@ -630,7 +710,7 @@ export default function HomeScreen() {
       {showMenu ? <View style={[styles.menu, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => { setChatFilter("all"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="forum" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>All chats</Text></Pressable><Pressable onPress={() => { setChatFilter("unread"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="mark-chat-unread" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Unread</Text></Pressable><Pressable onPress={() => { setChatFilter("groups"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="groups" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Groups</Text></Pressable><Pressable onPress={() => { setChatFilter("archived"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="archive" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Archived</Text></Pressable><Pressable onPress={() => { setShowMenu(false); router.push("/chat/search"); }} style={styles.menuItem}><MaterialIcons name="manage-search" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Search messages</Text></Pressable><Pressable onPress={() => { setShowMenu(false); router.push("/chat/starred"); }} style={styles.menuItem}><MaterialIcons name="star-border" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Starred messages</Text></Pressable><Pressable onPress={() => { setShowMenu(false); router.push("/chat/new-group"); }} style={styles.menuItem}><MaterialIcons name="group-add" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>New group</Text></Pressable><Pressable onPress={() => { setShowMenu(false); Platform.OS === "web" ? requestWebNotifications() : notify(isAuthenticated ? "Push notifications are registered" : "Sign in to enable push notifications"); }} style={styles.menuItem}><MaterialIcons name="notifications-active" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Notification setup</Text></Pressable></View> : null}
       <View style={[styles.searchWrap, { backgroundColor: colors.surface, borderColor: searchFocused ? colors.primary : colors.border }, searchFocused && styles.searchWrapFocused]}><MaterialIcons name="search" size={20} color={searchFocused ? colors.primary : colors.muted} /><TextInput value={query} onChangeText={setQuery} onFocus={() => setSearchFocused(true)} onBlur={() => setSearchFocused(false)} placeholder="Search conversations" placeholderTextColor={colors.muted} style={[styles.searchInput, { color: colors.foreground }]} returnKeyType="search" />{query ? <Pressable onPress={() => setQuery("")} hitSlop={8} style={styles.searchClear}><MaterialIcons name="close" size={18} color={colors.muted} /></Pressable> : null}</View>
       <View style={styles.listHeader}><Text style={[styles.sectionLabel, { color: colors.muted }]}>RECENT</Text><Text style={[styles.countLabel, { color: colors.muted }]}>{filteredConversations.length} {filteredConversations.length === 1 ? "chat" : "chats"}</Text></View>
-      <FlatList data={filteredConversations} keyExtractor={(item) => item.id} contentContainerStyle={styles.chatList} showsVerticalScrollIndicator={false} ListEmptyComponent={<View style={styles.emptyState}><MaterialIcons name={query.trim() || chatFilter !== "all" ? "search-off" : "forum"} size={34} color={colors.muted}/><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{query.trim() ? "No chats match that search" : chatFilter === "unread" ? "Nothing unread" : chatFilter === "groups" ? "No groups yet" : "No chats yet"}</Text><Text style={[styles.emptyCopy, { color: colors.muted }]}>{query.trim() ? "Try a different name or message." : chatFilter === "unread" ? "You are all caught up." : "Start one and it will show up here."}</Text>{!query.trim() && chatFilter === "all" ? <Pressable onPress={() => setShowContacts(true)} style={({ pressed }) => [styles.emptyCta, { backgroundColor: colors.primary }, pressed && styles.rowPressed]}><MaterialIcons name="chat-bubble-outline" size={18} color="#FFFFFF" /><Text style={[styles.emptyCtaText, { color: "#FFFFFF" }]}>Start a chat</Text></Pressable> : null}</View>} renderItem={({ item }) => <Pressable onPress={() => setSelectedId(item.id)} onLongPress={() => setRowMenuId(rowMenuId === item.id ? null : item.id)} style={({ pressed }) => [styles.chatRow, pressed && styles.rowPressed]}><View style={styles.avatarWrap}><Avatar item={item}/></View><View style={[styles.chatCopy, { borderBottomColor: colors.border }]}><View style={styles.rowTop}><Text style={[styles.chatName, { color: colors.foreground }]} numberOfLines={1}>{item.name}</Text><Text style={[styles.chatTime, { color: item.unread ? colors.primary : colors.muted }]}>{item.time}</Text></View><View style={styles.rowBottom}><View style={styles.previewLine}>{item.pinned ? <MaterialIcons name="push-pin" size={13} color={colors.muted} style={styles.pin}/> : null}<Text style={[styles.chatPreview, { color: item.unread || item.draft ? colors.foreground : colors.muted }]} numberOfLines={1}>{item.draft ? <Text style={{ color: colors.primary }}>Draft: </Text> : null}{item.draft ?? item.preview}</Text></View>{item.muted ? <MaterialIcons name="volume-off" size={15} color={colors.muted} /> : null}{item.unread ? <View style={[styles.unread, { backgroundColor: colors.unreadBadge }]}><Text style={styles.unreadText}>{item.unread}</Text></View> : null}</View>{rowMenuId === item.id ? <View style={[styles.rowMenu, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => void toggleChatFlag(item.id, { pinned: !item.pinned })} style={styles.rowMenuItem}><MaterialIcons name="push-pin" size={15} color={colors.foreground}/><Text style={[styles.rowMenuText, { color: colors.foreground }]}>{item.pinned ? "Unpin" : "Pin"}</Text></Pressable><Pressable onPress={() => void toggleChatFlag(item.id, { muted: !item.muted })} style={styles.rowMenuItem}><MaterialIcons name={item.muted ? "notifications-active" : "notifications-off"} size={15} color={colors.foreground}/><Text style={[styles.rowMenuText, { color: colors.foreground }]}>{item.muted ? "Unmute" : "Mute"}</Text></Pressable><Pressable onPress={() => void toggleChatFlag(item.id, { archived: !item.archived })} style={styles.rowMenuItem}><MaterialIcons name="archive" size={15} color={colors.foreground}/><Text style={[styles.rowMenuText, { color: colors.foreground }]}>{item.archived ? "Unarchive" : "Archive"}</Text></Pressable></View> : null}</View></Pressable>} />
+      <FlatList data={filteredConversations} keyExtractor={(item) => item.id} contentContainerStyle={styles.chatList} showsVerticalScrollIndicator={false} ListEmptyComponent={<View style={styles.emptyState}><MaterialIcons name={query.trim() || chatFilter !== "all" ? "search-off" : "forum"} size={34} color={colors.muted}/><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{query.trim() ? "No chats match that search" : chatFilter === "unread" ? "Nothing unread" : chatFilter === "groups" ? "No groups yet" : "No chats yet"}</Text><Text style={[styles.emptyCopy, { color: colors.muted }]}>{query.trim() ? "Try a different name or message." : chatFilter === "unread" ? "You are all caught up." : "Start one and it will show up here."}</Text>{!query.trim() && chatFilter === "all" ? <Pressable onPress={() => setShowContacts(true)} style={({ pressed }) => [styles.emptyCta, { backgroundColor: colors.primary }, pressed && styles.rowPressed]}><MaterialIcons name="chat-bubble-outline" size={18} color="#FFFFFF" /><Text style={[styles.emptyCtaText, { color: "#FFFFFF" }]}>Start a chat</Text></Pressable> : null}</View>} renderItem={({ item }) => <Pressable onPress={() => setSelectedId(item.id)} onLongPress={() => setRowMenuId(rowMenuId === item.id ? null : item.id)} style={({ pressed }) => [styles.chatRow, pressed && styles.rowPressed]}><View style={styles.avatarWrap}><Avatar item={item}/>{inboxPresence.get(item.id)?.online ? <View style={[styles.onlineDot, { borderColor: colors.background }]} /> : null}</View><View style={[styles.chatCopy, { borderBottomColor: colors.border }]}><View style={styles.rowTop}><Text style={[styles.chatName, { color: colors.foreground }]} numberOfLines={1}>{item.name}</Text><Text style={[styles.chatTime, { color: item.unread ? colors.primary : colors.muted }]}>{item.time}</Text></View><View style={styles.rowBottom}><View style={styles.previewLine}>{item.pinned ? <MaterialIcons name="push-pin" size={13} color={colors.muted} style={styles.pin}/> : null}<Text style={[styles.chatPreview, { color: inboxPresence.get(item.id)?.typing || item.unread || item.draft ? colors.foreground : colors.muted }]} numberOfLines={1}>{!item.draft && inboxPresence.get(item.id)?.typing ? <Text style={{ color: colors.primary }}>typing…</Text> : <>{item.draft ? <Text style={{ color: colors.primary }}>Draft: </Text> : null}{item.draft ?? item.preview}</>}</Text></View>{item.muted ? <MaterialIcons name="volume-off" size={15} color={colors.muted} /> : null}{item.unread ? <View style={[styles.unread, { backgroundColor: colors.unreadBadge }]}><Text style={styles.unreadText}>{item.unread}</Text></View> : null}</View>{rowMenuId === item.id ? <View style={[styles.rowMenu, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => void toggleChatFlag(item.id, { pinned: !item.pinned })} style={styles.rowMenuItem}><MaterialIcons name="push-pin" size={15} color={colors.foreground}/><Text style={[styles.rowMenuText, { color: colors.foreground }]}>{item.pinned ? "Unpin" : "Pin"}</Text></Pressable><Pressable onPress={() => void toggleChatFlag(item.id, { muted: !item.muted })} style={styles.rowMenuItem}><MaterialIcons name={item.muted ? "notifications-active" : "notifications-off"} size={15} color={colors.foreground}/><Text style={[styles.rowMenuText, { color: colors.foreground }]}>{item.muted ? "Unmute" : "Mute"}</Text></Pressable><Pressable onPress={() => void toggleChatFlag(item.id, { archived: !item.archived })} style={styles.rowMenuItem}><MaterialIcons name="archive" size={15} color={colors.foreground}/><Text style={[styles.rowMenuText, { color: colors.foreground }]}>{item.archived ? "Unarchive" : "Archive"}</Text></Pressable></View> : null}</View></Pressable>} />
       <Pressable onPress={discoverContacts} style={({ pressed }) => [styles.fab, { backgroundColor: colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name="person-add-alt-1" size={22} color="#FFFFFF" /></Pressable>
       {showContacts ? <View style={[styles.contactSheet, { backgroundColor: colors.background, borderColor: colors.border }]}><View style={styles.contactHeader}><View><Text style={[styles.contactTitle, { color: colors.foreground }]}>New conversation</Text><Text style={[styles.contactSubtitle, { color: colors.muted }]}>Find people from your contacts</Text></View><IconButton name="close" color={colors.foreground} onPress={() => setShowContacts(false)} /></View><View style={[styles.searchWrap, styles.contactSearch, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="search" size={20} color={colors.muted}/><TextInput value={contactQuery} onChangeText={setContactQuery} placeholder="Search by name, phone or username" placeholderTextColor={colors.muted} style={[styles.searchInput, { color: colors.foreground }]}/></View><FlatList data={discoveredPeople} keyExtractor={(item) => item.id.toString()} contentContainerStyle={styles.contactList} ListEmptyComponent={<Text style={[styles.emptyCopy, { color: colors.muted }]}>{contactQuery.trim().length < 2 ? "Search by name, phone or username — at least two characters." : peopleSearch.isFetching ? "Searching…" : `No one found for “${contactQuery.trim()}”.`}</Text>} renderItem={({ item }) => <Pressable onPress={() => { const existing = conversations.find((conversation) => conversation.name === item.name || conversation.id === item.id); setShowContacts(false); setContactQuery(""); if (existing) { setSelectedId(existing.id); return; } if (!item.userId) { notify(`Invite link ready for ${item.name}`); return; } startDirect.mutate({ userId: item.userId }, { onSuccess: (result) => { void conversationListQuery.refetch(); setSelectedId(result.conversationId); notify(`Chat with ${item.name} started`); }, onError: (error) => notify(error.message) }); }} style={({ pressed }) => [styles.contactRow, pressed && styles.rowPressed]}><View style={[styles.contactAvatar, { backgroundColor: item.color }]}><Text style={styles.avatarText}>{item.initials}</Text></View><View style={styles.contactCopy}><Text style={[styles.chatName, { color: colors.foreground }]}>{item.name}</Text><Text style={[styles.chatPreview, { color: colors.muted }]}>{item.phone ?? item.email ?? "From your contacts"}</Text></View><MaterialIcons name="chevron-right" size={21} color={colors.muted}/></Pressable>} /></View> : null}
       {forwarding ? <View style={[styles.contactSheet, { backgroundColor: colors.background, borderColor: colors.border }]}><View style={styles.contactHeader}><View><Text style={[styles.contactTitle, { color: colors.foreground }]}>Forward to</Text><Text style={[styles.contactSubtitle, { color: colors.muted }]}>Pick the chat this message should go to</Text></View><IconButton name="close" color={colors.foreground} onPress={() => setForwarding(null)} /></View><FlatList data={conversations} keyExtractor={(item) => item.id} contentContainerStyle={styles.contactList} ListEmptyComponent={<Text style={[styles.emptyCopy, { color: colors.muted }]}>You have no other chats yet.</Text>} renderItem={({ item }) => <Pressable onPress={() => void forwardTo(item.id)} style={({ pressed }) => [styles.contactRow, pressed && styles.rowPressed]}><Avatar item={item} size={42} /><View style={styles.contactCopy}><Text style={[styles.chatName, { color: colors.foreground }]}>{item.name}</Text><Text style={[styles.chatPreview, { color: colors.muted }]} numberOfLines={1}>{item.preview}</Text></View><MaterialIcons name="chevron-right" size={21} color={colors.muted} /></Pressable>} /></View> : null}

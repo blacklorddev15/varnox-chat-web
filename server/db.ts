@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, ilike, inArray, isNull, like, lt, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, messageHides, messageMedia, messageReactions, messageStars, messages, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, messageHides, messageMedia, messageReactions, messageStars, messages, presence, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -1140,4 +1140,136 @@ export async function conversationDisappearSeconds(conversationId: string) {
   if (!db) return null;
   const rows = await db.select({ seconds: conversations.disappearSeconds }).from(conversations).where(eq(conversations.id, conversationId)).limit(1);
   return rows[0]?.seconds ?? null;
+}
+
+// ---------------------------------------------------------------- presence
+/** A heartbeat stays trustworthy this long. Clients beat every 20s, so one miss is tolerated. */
+const PRESENCE_WINDOW_MS = 45_000;
+/** How long one "typing" signal survives. The client re-sends it while the user keeps typing. */
+const TYPING_LEASE_MS = 8_000;
+
+export type PresenceView = {
+  userId: number;
+  online: boolean;
+  lastSeenAt: Date | null;
+  /** The conversation this user is typing in, while that signal is still fresh. */
+  typingIn: string | null;
+};
+
+/**
+ * Records that a user is active now, and optionally that they are typing in one conversation.
+ * Callers send their current state on every beat, so a plain beat clearing a stale typing flag is
+ * correct rather than a race.
+ */
+export async function recordPresence(userId: number, typingConversationId?: string | null): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  const now = new Date();
+  const typingUntil = typingConversationId ? new Date(now.getTime() + TYPING_LEASE_MS) : null;
+  try {
+    await db
+      .insert(presence)
+      .values({ userId, lastSeenAt: now, typingConversationId: typingConversationId ?? null, typingUntil })
+      .onConflictDoUpdate({ target: presence.userId, set: { lastSeenAt: now, typingConversationId: typingConversationId ?? null, typingUntil } });
+  } catch (error) {
+    // The table arrives with `pnpm db:push`. Until a deployment has run that, presence stays dark
+    // rather than breaking the request that recorded it.
+    console.warn("[Presence] heartbeat failed; has the presence table been migrated?", error);
+  }
+}
+
+/**
+ * Presence for a set of users, filtered to what the reader may see. The `lastSeen` privacy toggle
+ * hides "online" *and* the last-seen time - they are the same disclosure, so honouring one while
+ * leaking the other would defeat the setting.
+ *
+ * Typing is deliberately not gated by it: typing is an act the user performs towards this reader,
+ * and the reference app treats it the same way. Hiding last-seen must not silently disable the
+ * indicator someone else is actively sending.
+ */
+export async function readPresenceForUsers(userIds: number[]): Promise<PresenceView[]> {
+  if (userIds.length === 0) return [];
+  const db = await getDb();
+  if (!db) return [];
+  try {
+    const rows = await db.select().from(presence).where(inArray(presence.userId, userIds));
+    const settings = await db.select({ userId: userSettings.userId, lastSeen: userSettings.lastSeen }).from(userSettings).where(inArray(userSettings.userId, userIds));
+    const hidden = new Set(settings.filter((row) => row.lastSeen === 0).map((row) => row.userId));
+    const byUser = new Map(rows.map((row) => [row.userId, row]));
+    const now = Date.now();
+    return userIds.map((userId) => {
+      const row = byUser.get(userId);
+      const visible = !hidden.has(userId);
+      const lastSeenAt = row?.lastSeenAt ?? null;
+      const typing = Boolean(row?.typingUntil && row.typingUntil.getTime() > now && row.typingConversationId);
+      return {
+        userId,
+        online: visible && Boolean(lastSeenAt && now - lastSeenAt.getTime() < PRESENCE_WINDOW_MS),
+        lastSeenAt: visible ? lastSeenAt : null,
+        typingIn: typing ? (row?.typingConversationId ?? null) : null,
+      };
+    });
+  } catch (error) {
+    console.warn("[Presence] read failed; has the presence table been migrated?", error);
+    return [];
+  }
+}
+
+/** Everyone in a conversation except the viewer. */
+export async function listConversationPeerIds(conversationId: string, viewerId: number) {
+  const ids = await listConversationMemberIds(conversationId);
+  return ids.filter((id) => id !== viewerId);
+}
+
+export type PresenceInboxEntry = { conversationId: string; peerId: number | null; online: boolean; lastSeenAt: Date | null; typing: boolean };
+
+/**
+ * Presence for every conversation on the chat list, in one pass.
+ *
+ * Direct chats expose the peer's online state. Groups deliberately do not: a dot meaning "some
+ * member is online" would leak one person's activity to every other member, and cannot be
+ * attributed to anyone. Typing is reported for both, since that is about this conversation.
+ */
+export async function readPresenceInbox(viewerId: number): Promise<PresenceInboxEntry[]> {
+  const db = await getDb();
+  if (!db) return [];
+  try {
+    const mine = await db.select({ conversationId: conversationMembers.conversationId }).from(conversationMembers).where(eq(conversationMembers.userId, viewerId));
+    const conversationIds = mine.map((row) => row.conversationId);
+    if (conversationIds.length === 0) return [];
+
+    const members = await db
+      .select({ conversationId: conversationMembers.conversationId, userId: conversationMembers.userId, kind: conversations.kind })
+      .from(conversationMembers)
+      .innerJoin(conversations, eq(conversations.id, conversationMembers.conversationId))
+      .where(inArray(conversationMembers.conversationId, conversationIds));
+
+    const peers = new Map<string, { ids: number[]; group: boolean }>();
+    for (const row of members) {
+      const entry = peers.get(row.conversationId) ?? { ids: [], group: row.kind === "group" };
+      if (row.userId !== viewerId) entry.ids.push(row.userId);
+      peers.set(row.conversationId, entry);
+    }
+
+    const presenceRows = await readPresenceForUsers([...new Set([...peers.values()].flatMap((entry) => entry.ids))]);
+    const byUser = new Map(presenceRows.map((row) => [row.userId, row]));
+
+    return conversationIds.map((conversationId) => {
+      const entry = peers.get(conversationId);
+      const ids = entry?.ids ?? [];
+      const typing = ids.some((id) => byUser.get(id)?.typingIn === conversationId);
+      const direct = !entry?.group && ids.length === 1;
+      const peer = direct ? byUser.get(ids[0]) : undefined;
+      return {
+        conversationId,
+        peerId: direct ? ids[0] : null,
+        online: Boolean(peer?.online),
+        lastSeenAt: peer?.lastSeenAt ?? null,
+        typing,
+      };
+    });
+  } catch (error) {
+    console.warn("[Presence] inbox failed; has the presence table been migrated?", error);
+    return [];
+  }
 }

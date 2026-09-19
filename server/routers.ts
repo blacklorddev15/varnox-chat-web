@@ -12,6 +12,8 @@ import { messages } from "../drizzle/schema";
 // Message actions (reactions, stars, edits, deletes, per-chat preferences) sit with the other
 // row-level operations in db.ts; imported on their own line so the list above stays readable.
 import { consumeViewOnce, conversationDisappearSeconds, deleteMessageForEveryone, editMessageBody, getMessageById, hideMessageForUser, listStarredMessages, markConversationDelivered, reactToMessage, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setMessageStar } from "./db";
+// Presence: who is around right now, and who is mid-sentence. Also in db.ts, for the same reason.
+import { listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
 
 /**
  * Loads a message and proves the caller can see the conversation it lives in. Every message-level
@@ -168,6 +170,27 @@ export const appRouter = router({
       await setConversationDisappearing(input.conversationId, input.seconds && input.seconds > 0 ? input.seconds : null);
       return { ok: true as const };
     }),
+  }),
+  presence: router({
+    /**
+     * Beaten on a timer by every signed-in client, and again whenever someone starts or stops
+     * typing. One upsert and no history, because this is called often and must stay cheap.
+     */
+    heartbeat: protectedProcedure
+      .input(z.object({ typingConversationId: z.string().min(1).max(64).nullish() }))
+      .mutation(async ({ ctx, input }) => {
+        await recordPresence(ctx.user.id, input.typingConversationId ?? null);
+        return { ok: true } as const;
+      }),
+    /** Presence for the other members of one chat, which the conversation header reads. */
+    forConversation: protectedProcedure
+      .input(z.object({ conversationId: z.string().min(1).max(64) }))
+      .query(async ({ ctx, input }) => {
+        if (!(await isConversationMember(input.conversationId, ctx.user.id))) return [];
+        return readPresenceForUsers(await listConversationPeerIds(input.conversationId, ctx.user.id));
+      }),
+    /** Presence for the whole chat list, so rows can show a typing line and an online dot. */
+    inbox: protectedProcedure.query(({ ctx }) => readPresenceInbox(ctx.user.id)),
   }),
   media: router({
     upload: protectedProcedure.input(z.object({ fileName: z.string().min(1).max(255), contentType: z.string().min(1).max(160), base64: z.string().min(1).max(30_000_000) })).mutation(async ({ ctx, input }) => {

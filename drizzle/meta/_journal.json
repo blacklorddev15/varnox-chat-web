@@ -22,6 +22,13 @@
       "when": 1789837307568,
       "tag": "0002_flaky_red_hulk",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1789838603092,
+      "tag": "0003_absent_phalanx",
+      "breakpoints": true
     }
   ]
 }
