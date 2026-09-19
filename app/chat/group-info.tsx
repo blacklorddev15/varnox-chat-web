@@ -270,6 +270,18 @@ export default function GroupInfoScreen() {
         )}
 
         <Pressable
+          onPress={() => router.push({ pathname: "/chat/group-settings", params: { conversationId } })}
+          style={[styles.settingsRow, { backgroundColor: colors.surface, borderColor: colors.border }]}
+        >
+          <MaterialIcons name="admin-panel-settings" size={18} color={colors.primary} />
+          <View style={styles.settingsCopy}>
+            <Text style={[styles.settingsTitle, { color: colors.foreground }]}>Permissions and invite link</Text>
+            <Text style={[styles.hint, { color: colors.muted }]}>Who can send, edit info and add people</Text>
+          </View>
+          <MaterialIcons name="chevron-right" size={20} color={colors.muted} />
+        </Pressable>
+
+        <Pressable
           onPress={() => confirmThen("Leave this group? You will stop receiving its messages.", leaveGroup)}
           style={styles.leaveButton}
         >
@@ -284,6 +296,9 @@ export default function GroupInfoScreen() {
 }
 
 const styles = StyleSheet.create({
+  settingsRow: { flexDirection: "row", alignItems: "center", gap: 10, borderWidth: 1, borderRadius: 12, padding: 12, marginTop: 12 },
+  settingsCopy: { flex: 1 },
+  settingsTitle: { fontSize: 14, fontWeight: "700" },
   header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 20 },
   title: { flex: 1, fontSize: 21, fontWeight: "800" },
   content: { padding: 20, paddingBottom: 60 },

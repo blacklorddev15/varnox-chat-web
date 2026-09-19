@@ -1,7 +1,7 @@
-import { and, desc, eq, gt, ilike, inArray, isNull, like, lt, ne, or } from "drizzle-orm";
+import { and, desc, eq, gt, ilike, inArray, isNull, like, lt, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, messageHides, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, inviteLinks, messageHides, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -226,6 +226,105 @@ export async function getConversationRole(conversationId: string, userId: number
 }
 
 /** Members of a conversation, with the profile fields the group screen needs. */
+/** The three group settings an admin can turn, and what each of them allows. */
+export type GroupPermissions = { whoCanSend: string; whoCanEditInfo: string; whoCanAddMembers: string };
+
+/**
+ * Role and group settings for one person in one conversation, read together.
+ *
+ * A setting on its own means nothing until you know the role to test it against, and the two live in
+ * different tables, so they come back in one join instead of two round trips on every send.
+ */
+export async function getConversationAccess(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const [row] = await db
+    .select({ role: conversationMembers.role, whoCanSend: conversations.whoCanSend, whoCanEditInfo: conversations.whoCanEditInfo, whoCanAddMembers: conversations.whoCanAddMembers })
+    .from(conversationMembers)
+    .innerJoin(conversations, eq(conversations.id, conversationMembers.conversationId))
+    .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function getConversationPermissions(conversationId: string): Promise<GroupPermissions> {
+  const db = await getDb();
+  if (!db) return { whoCanSend: "all", whoCanEditInfo: "all", whoCanAddMembers: "all" };
+  const [row] = await db.select({ whoCanSend: conversations.whoCanSend, whoCanEditInfo: conversations.whoCanEditInfo, whoCanAddMembers: conversations.whoCanAddMembers }).from(conversations).where(eq(conversations.id, conversationId)).limit(1);
+  return row ?? { whoCanSend: "all", whoCanEditInfo: "all", whoCanAddMembers: "all" };
+}
+
+export async function setConversationPermissions(conversationId: string, patch: Partial<GroupPermissions>) {
+  const db = await getDb();
+  if (!db) return false;
+  await db.update(conversations).set(patch).where(eq(conversations.id, conversationId));
+  return true;
+}
+
+/** Whether a setting lets this role act. "all" covers every member; admins may always act. */
+export function permitted(setting: string, role: string | null | undefined) {
+  return setting !== "admins" || role === "admin" || role === "owner";
+}
+
+// ---- invite links ------------------------------------------------------------------------------
+/**
+ * Creates an invite link for a group.
+ *
+ * The code is random rather than derived from the conversation, so a revoked link cannot be guessed
+ * back into existence. Both limits are optional, and a missing limit means "until an admin revokes
+ * it", which is what a group's permanent link is.
+ */
+export async function createInviteLink(params: { conversationId: string; createdBy: number; expiresInMs?: number | null; maxUses?: number | null }) {
+  const db = await getDb();
+  if (!db) return null;
+  const [row] = await db
+    .insert(inviteLinks)
+    .values({ code: crypto.randomUUID().replace(/-/g, ""), conversationId: params.conversationId, createdBy: params.createdBy, role: "member", expiresAt: params.expiresInMs ? new Date(Date.now() + params.expiresInMs) : null, maxUses: params.maxUses ?? null })
+    .returning();
+  return row ?? null;
+}
+
+export async function listInviteLinks(conversationId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select().from(inviteLinks).where(eq(inviteLinks.conversationId, conversationId)).orderBy(desc(inviteLinks.createdAt));
+}
+
+export async function revokeInviteLink(conversationId: string, code: string) {
+  const db = await getDb();
+  if (!db) return false;
+  const removed = await db.delete(inviteLinks).where(and(eq(inviteLinks.conversationId, conversationId), eq(inviteLinks.code, code))).returning();
+  return removed.length > 0;
+}
+
+/**
+ * Redeems an invite: adds the caller to the group and counts the use.
+ *
+ * The use is claimed with a conditional UPDATE before the membership is written, so two people
+ * redeeming a one-use link at the same instant cannot both get in - the second update matches no row
+ * and is refused. If the membership write then failed the use would be spent, which is the safer
+ * direction to lose in.
+ */
+export async function redeemInviteLink(code: string, userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const [invite] = await db.select().from(inviteLinks).where(eq(inviteLinks.code, code)).limit(1);
+  if (!invite) throw new Error("That invite link is not valid");
+  if (invite.expiresAt && invite.expiresAt.getTime() < Date.now()) throw new Error("That invite link has expired");
+  // Already in the group: nothing to do, and no use spent on a link they did not need.
+  if (await isConversationMember(invite.conversationId, userId)) return invite.conversationId;
+
+  const claimed = await db
+    .update(inviteLinks)
+    .set({ uses: sql`${inviteLinks.uses} + 1` })
+    .where(and(eq(inviteLinks.code, code), or(isNull(inviteLinks.maxUses), lt(inviteLinks.uses, inviteLinks.maxUses))))
+    .returning();
+  if (claimed.length === 0) throw new Error("That invite link has reached its limit");
+
+  await addConversationMember(invite.conversationId, userId);
+  return invite.conversationId;
+}
+
 export async function listConversationMembersDetailed(conversationId: string) {
   const db = await getDb();
   if (!db) return [];
@@ -254,7 +353,10 @@ export async function createGroupConversation(creatorId: number, title: string, 
   const members = Array.from(new Set([creatorId, ...memberIds])).filter((value) => Number.isInteger(value));
 
   await db.transaction(async (tx) => {
-    await tx.insert(conversations).values({ id, kind: "group", title, createdBy: creatorId });
+      // Editing the group's info and adding people start admin-only, which is what these routes
+      // enforced before the settings existed, so no existing group changes behaviour. An admin can
+      // open either one up afterwards; sending starts open to everyone either way.
+      await tx.insert(conversations).values({ id, kind: "group", title, createdBy: creatorId, whoCanSend: "all", whoCanEditInfo: "admins", whoCanAddMembers: "admins" });
     await tx.insert(conversationMembers).values(
       members.map((userId) => ({
         conversationId: id,

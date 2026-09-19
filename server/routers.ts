@@ -11,7 +11,7 @@ import { notifyConversationMembers } from "./push";
 import { messages } from "../drizzle/schema";
 // Message actions (reactions, stars, edits, deletes, per-chat preferences) sit with the other
 // row-level operations in db.ts; imported on their own line so the list above stays readable.
-import { castPollVote, consumeViewOnce, conversationDisappearSeconds, deleteMessageForEveryone, editMessageBody, getMessageById, hideMessageForUser, listStarredMessages, markConversationDelivered, reactToMessage, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setMessageStar } from "./db";
+import { castPollVote, consumeViewOnce, conversationDisappearSeconds, createInviteLink, deleteMessageForEveryone, editMessageBody, getConversationAccess, getConversationPermissions, getMessageById, hideMessageForUser, listInviteLinks, listStarredMessages, markConversationDelivered, permitted, reactToMessage, redeemInviteLink, revokeInviteLink, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setConversationPermissions, setMessageStar } from "./db";
 // Presence: who is around right now, and who is mid-sentence. Also in db.ts, for the same reason.
 import { getConversationSummary, leaveGroup, listConversationMemberIds, listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
 // Server-Sent Events nudge channel; see nudgeConversation below.
@@ -75,6 +75,9 @@ function normalizeMessageMeta(kind: string, raw: unknown) {
   return null;
 }
 
+/** Who a group setting allows to act: everyone in the group, or only its admins. */
+const permissionWho = z.enum(["all", "admins"]);
+
 /** Options of a stored poll, read defensively: `meta` is JSON that an older or newer build wrote. */
 function pollOptionsOf(meta: unknown): string[] {
   const options = (meta as { options?: unknown } | null)?.options;
@@ -118,8 +121,9 @@ export const appRouter = router({
       return { role, members, title: summary?.title ?? null, description: summary?.description ?? null };
     }),
     addMembers: protectedProcedure.input(z.object({ conversationId: z.string().min(1), userIds: z.array(z.number().int().positive()).min(1).max(256) })).mutation(async ({ ctx, input }) => {
-      const role = await getConversationRole(input.conversationId, ctx.user.id);
-      if (role !== "owner" && role !== "admin") throw new Error("Only the group owner or an admin can add members");
+      const access = await getConversationAccess(input.conversationId, ctx.user.id);
+      if (!access) throw new Error("You are not a member of this group");
+      if (!permitted(access.whoCanAddMembers, access.role)) throw new Error("Only group admins can add members");
       const added = await addConversationMembers(input.conversationId, input.userIds);
       return { added };
     }),
@@ -144,6 +148,66 @@ export const appRouter = router({
       await setConversationMemberRole(input.conversationId, input.userId, input.role);
       return { userId: input.userId, role: input.role };
     }),
+    // ---- group settings and invite links ---------------------------------------------------
+    /** The group's settings together with my own role: one decides what the info screen may offer,
+     *  the other decides whether it offers anything at all. */
+    settings: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(async ({ ctx, input }) => {
+      const access = await getConversationAccess(input.conversationId, ctx.user.id);
+      if (!access) throw new Error("You are not a member of this group");
+      return { role: access.role, isAdmin: access.role === "admin" || access.role === "owner", whoCanSend: access.whoCanSend, whoCanEditInfo: access.whoCanEditInfo, whoCanAddMembers: access.whoCanAddMembers };
+    }),
+
+    /** Turns one or more group settings. Admins only, because that is precisely what they gate. */
+    setPermissions: protectedProcedure.input(z.object({ conversationId: z.string().min(1), whoCanSend: permissionWho.optional(), whoCanEditInfo: permissionWho.optional(), whoCanAddMembers: permissionWho.optional() })).mutation(async ({ ctx, input }) => {
+      const access = await getConversationAccess(input.conversationId, ctx.user.id);
+      if (!access) throw new Error("You are not a member of this group");
+      if (!permitted("admins", access.role)) throw new Error("Only group admins can change these settings");
+      const patch: { whoCanSend?: string; whoCanEditInfo?: string; whoCanAddMembers?: string } = {};
+      if (input.whoCanSend) patch.whoCanSend = input.whoCanSend;
+      if (input.whoCanEditInfo) patch.whoCanEditInfo = input.whoCanEditInfo;
+      if (input.whoCanAddMembers) patch.whoCanAddMembers = input.whoCanAddMembers;
+      if (Object.keys(patch).length > 0) {
+        await setConversationPermissions(input.conversationId, patch);
+        void nudgeConversation(input.conversationId, ctx.user.id, "group-updated");
+      }
+      return { ok: true as const };
+    }),
+
+    /** Existing invite links. Non-admins get an empty list rather than an error, so the screen can
+     *  simply not draw the section. */
+    invites: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(async ({ ctx, input }) => {
+      const access = await getConversationAccess(input.conversationId, ctx.user.id);
+      if (!access || !permitted("admins", access.role)) return [];
+      const rows = await listInviteLinks(input.conversationId);
+      return rows.map((row) => ({ code: row.code, uses: row.uses, maxUses: row.maxUses, expiresAt: row.expiresAt, createdAt: row.createdAt }));
+    }),
+
+    /** Mints an invite link. Zero for either limit means "no limit". */
+    createInvite: protectedProcedure.input(z.object({ conversationId: z.string().min(1), expiresInHours: z.number().int().min(0).max(8760).default(0), maxUses: z.number().int().min(0).max(10000).default(0) })).mutation(async ({ ctx, input }) => {
+      const access = await getConversationAccess(input.conversationId, ctx.user.id);
+      if (!access) throw new Error("You are not a member of this group");
+      if (!permitted("admins", access.role)) throw new Error("Only group admins can create an invite link");
+      const row = await createInviteLink({ conversationId: input.conversationId, createdBy: ctx.user.id, expiresInMs: input.expiresInHours > 0 ? input.expiresInHours * 3_600_000 : null, maxUses: input.maxUses > 0 ? input.maxUses : null });
+      if (!row) throw new Error("Could not create an invite link");
+      return { code: row.code, uses: row.uses, maxUses: row.maxUses, expiresAt: row.expiresAt };
+    }),
+
+    revokeInvite: protectedProcedure.input(z.object({ conversationId: z.string().min(1), code: z.string().min(1).max(64) })).mutation(async ({ ctx, input }) => {
+      const access = await getConversationAccess(input.conversationId, ctx.user.id);
+      if (!access) throw new Error("You are not a member of this group");
+      if (!permitted("admins", access.role)) throw new Error("Only group admins can revoke an invite link");
+      const revoked = await revokeInviteLink(input.conversationId, input.code);
+      if (!revoked) throw new Error("That link no longer exists");
+      return { ok: true as const };
+    }),
+
+    /** Redeems an invite link: whoever holds the code joins the group. */
+    redeemInvite: protectedProcedure.input(z.object({ code: z.string().trim().min(1).max(64) })).mutation(async ({ ctx, input }) => {
+      const conversationId = await redeemInviteLink(input.code, ctx.user.id);
+      void nudgeConversation(conversationId, ctx.user.id, "group-updated");
+      return { conversationId };
+    }),
+
     messages: protectedProcedure.input(z.object({ conversationId: z.string().min(1), since: z.string().datetime().optional() })).query(({ ctx, input }) => listMessages(input.conversationId, ctx.user.id, input.since ? new Date(input.since) : undefined)),
     ensure: protectedProcedure.input(z.object({ conversationId: z.string().min(1), title: z.string().max(255).optional() })).mutation(async ({ ctx, input }) => {
       if (!(await isConversationMember(input.conversationId, ctx.user.id))) await createConversation(input.conversationId, ctx.user.id, input.title);
@@ -159,7 +223,11 @@ export const appRouter = router({
       return result;
     }),
     send: protectedProcedure.input(z.object({ conversationId: z.string().min(1), body: z.string().max(10000).optional(), kind: messageKind.default("text"), mediaUrl: z.string().max(2000).optional(), mediaMime: z.string().max(160).optional(), mediaName: z.string().max(255).optional(), voiceDurationMs: z.number().int().min(0).max(3600000).optional(), replyToId: z.string().max(64).optional(), forwardedFromId: z.string().max(64).optional(), viewOnce: z.boolean().default(false), meta: z.unknown().optional() })).mutation(async ({ ctx, input }) => {
-      if (!(await isConversationMember(input.conversationId, ctx.user.id))) throw new Error("You are not a member of this conversation");
+      const access = await getConversationAccess(input.conversationId, ctx.user.id);
+      if (!access) throw new Error("You are not a member of this conversation");
+      // Announcement-style groups restrict sending to admins; the setting starts at "all", so every
+      // group that existed before it behaves exactly as it did.
+      if (!permitted(access.whoCanSend, access.role)) throw new Error("Only admins can send messages in this group");
       // The disappearing clock is stamped at send time, so changing the setting later cannot
       // retroactively expire messages somebody already received.
       const disappearSeconds = await conversationDisappearSeconds(input.conversationId);
@@ -257,8 +325,9 @@ export const appRouter = router({
       return outcome;
     }),
     setDescription: protectedProcedure.input(z.object({ conversationId: z.string().min(1), description: z.string().trim().max(255).nullable() })).mutation(async ({ ctx, input }) => {
-      const role = await getConversationRole(input.conversationId, ctx.user.id);
-      if (role !== "owner" && role !== "admin") throw new Error("Only the group owner or an admin can change the description");
+      const access = await getConversationAccess(input.conversationId, ctx.user.id);
+      if (!access) throw new Error("You are not a member of this group");
+      if (!permitted(access.whoCanEditInfo, access.role)) throw new Error("Only group admins can change the description");
       await setConversationDescription(input.conversationId, input.description || null);
       return { ok: true as const };
     }),

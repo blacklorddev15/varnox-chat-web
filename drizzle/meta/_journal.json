@@ -36,6 +36,13 @@
       "when": 1789850994936,
       "tag": "0004_careful_nocturne",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1789852486711,
+      "tag": "0005_strange_trish_tilby",
+      "breakpoints": true
     }
   ]
 }
