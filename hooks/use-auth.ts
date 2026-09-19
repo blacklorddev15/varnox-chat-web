@@ -39,6 +39,12 @@ export function useAuth(options?: UseAuthOptions) {
             moderationStatus: apiUser.moderationStatus,
             suspendedUntil: apiUser.suspendedUntil ? new Date(apiUser.suspendedUntil).toISOString() : null,
             moderationReason: apiUser.moderationReason ?? null,
+            about: apiUser.about ?? null,
+            // The server sends this as the cache-busting stamp for /api/avatar/<id>.
+            // Rebuilding the user field by field dropped it, so the profile and settings
+            // screens read an undefined avatarUpdatedAt, produced no avatar URL, and fell
+            // back to initials - an uploaded photo looked like it had never saved.
+            avatarUpdatedAt: apiUser.avatarUpdatedAt ?? null,
             lastSignedIn: new Date(apiUser.lastSignedIn),
           };
           setUser(userInfo);

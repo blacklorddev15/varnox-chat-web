@@ -47,9 +47,12 @@ export default function OAuthCallback() {
               const userInfo: Auth.User = {
                 id: userData.id,
                 openId: userData.openId,
+                username: userData.username ?? null,
                 name: userData.name,
                 email: userData.email,
                 loginMethod: userData.loginMethod,
+                about: userData.about ?? null,
+                avatarUpdatedAt: userData.avatarUpdatedAt ?? null,
                 lastSignedIn: new Date(userData.lastSignedIn || Date.now()),
               };
               await Auth.setUserInfo(userInfo);
@@ -198,9 +201,12 @@ export default function OAuthCallback() {
             const userInfo: Auth.User = {
               id: result.user.id,
               openId: result.user.openId,
+              username: result.user.username ?? null,
               name: result.user.name,
               email: result.user.email,
               loginMethod: result.user.loginMethod,
+              about: result.user.about ?? null,
+              avatarUpdatedAt: result.user.avatarUpdatedAt ?? null,
               lastSignedIn: new Date(result.user.lastSignedIn || Date.now()),
             };
             await Auth.setUserInfo(userInfo);
