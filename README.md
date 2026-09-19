@@ -42,7 +42,7 @@ Both deployments read the same set. Get the values from
 
 | Variable | Notes |
 |---|---|
-| `SERVER_PORT` | Pterodactyl injects the allocated port and the server reads it. `PORT` wins if both are set. |
+| `SERVER_PORT` | Pterodactyl injects the allocated port and the server reads it. `PORT` wins if both are set. **If your console logs a port that differs from the panel's Address, your panel is not supplying this — set `PORT` to the allocation instead.** Otherwise the log says "started" while the address answers nothing, which is the most confusing failure this app has. |
 | `VERCEL` | **Never set this to `1`.** When it is set the server deliberately does not listen, because on Vercel it is loaded as a function rather than owning a port. Symptom: the process runs and nothing answers. |
 
 ### Three things that are easy to get wrong
