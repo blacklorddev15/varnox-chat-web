@@ -74,7 +74,7 @@ export default function RootLayout() {
       name: "Messages",
       importance: Notifications.AndroidImportance.MAX,
       vibrationPattern: [0, 250, 250, 250],
-      lightColor: "#F59E0B",
+      lightColor: "#00A884",
     }).catch((error) => console.warn("[Notifications] Channel setup failed", error));
   }, []);
 

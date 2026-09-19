@@ -8,6 +8,10 @@ export const themeColors: {
   success: { light: string; dark: string };
   warning: { light: string; dark: string };
   error: { light: string; dark: string };
+  bubbleOutgoing: { light: string; dark: string };
+  bubbleIncoming: { light: string; dark: string };
+  bubbleOutgoingText: { light: string; dark: string };
+  unreadBadge: { light: string; dark: string };
 };
 
 declare const themeConfig: {

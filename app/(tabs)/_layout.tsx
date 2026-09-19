@@ -20,7 +20,7 @@ export default function TabLayout() {
         tabBarInactiveTintColor: colors.muted,
         tabBarButton: HapticTab,
         tabBarLabelStyle: { fontSize: 10, fontWeight: "700", marginBottom: 2 },
-        tabBarStyle: { paddingTop: 7, paddingBottom: bottomPadding, height: tabBarHeight, backgroundColor: colors.background, borderTopColor: colors.border, borderTopWidth: 0.5 },
+        tabBarStyle: { paddingTop: 7, paddingBottom: bottomPadding, height: tabBarHeight, backgroundColor: colors.surface, borderTopColor: colors.border, borderTopWidth: 0.5 },
       }}
     >
       <Tabs.Screen name="index" options={{ title: "Chats", tabBarIcon: ({ color }) => <MaterialIcons name="chat-bubble" size={24} color={color} /> }} />

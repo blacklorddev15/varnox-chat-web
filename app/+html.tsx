@@ -14,8 +14,10 @@ import type { PropsWithChildren } from "react";
 
 /** Matches theme.config.js, so the page does not flash white before the app paints. */
 const background = `
-html, body { background-color: #FFFDF8; }
-@media (prefers-color-scheme: dark) { html, body { background-color: #171717; } }
+html, body { background-color: #F0F2F5; }
+@media (prefers-color-scheme: dark) { html, body { background-color: #0B141A; } }
+input, textarea { background-color: transparent; }
+input:focus, textarea:focus { outline: none; }
 `;
 
 export default function Root({ children }: PropsWithChildren) {
