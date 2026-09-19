@@ -5,12 +5,15 @@ import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { createRoomToken, isLiveKitConfigured, liveKitUrl } from "./livekit";
-import { addConversationMembers, clearUserAvatar, createAppeal, createCallRecord, createGroupConversation, createMessage, createConversation, expireStaleCalls, getCallRecord, getConversationRole, getIncomingCallForUser, getUserByUsername, getUserSettings, isConversationMember, listRecentCalls, setCallStatus, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings } from "./db";
+import { addConversationMembers, clearUserAvatar, createAppeal, createCallRecord, createGroupConversation, createMessage, createConversation, expireStaleCalls, getCallRecord, getConversationRole, getIncomingCallForUser, getUserByUsername, getUserSettings, isConversationMember, listRecentCalls, setCallStatus, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings, adminRemoveStatus, createChannel, createChannelPost, createStatus, deleteStatus, deleteChannel, followChannel, getChannel, getChannelDetail, getChannelPost, getStatus, isChannelFollower, saveMessageMedia, listActiveStatusesByAuthors, listChannelFollowers, listChannelPosts, listChannelPostsForAdmin, listChannelsForAdmin, listChannelsForUser, listContactIdsForUser, listStatusesForAdmin, listStatusViewers, listViewedStatusIds, markChannelRead, markStatusViewed, removeChannelPost, searchChannels, setChannelSuspended, unfollowChannel } from "./db";
 import { storagePut } from "./storage";
 import { notifyConversationMembers } from "./push";
 import { messages } from "../drizzle/schema";
 
 const messageKind = z.enum(["text", "image", "video", "file", "voice"]);
+
+/** One row of listActiveStatusesByAuthors, used to type the grouped feed. */
+type StatusRow = Awaited<ReturnType<typeof listActiveStatusesByAuthors>>[number];
 
 export const appRouter = router({
   system: router({ health: publicProcedure.query(() => ({ status: "ok" as const })) }),
@@ -179,6 +182,95 @@ export const appRouter = router({
       return { text: "I’m Varnox Support. I can help with login, groups, privacy, blocking, reports, calls, and media. What do you need?" };
     }),
   }),
+  // ---- status: "stories" that expire 24 hours after they are posted --------------------
+  // Visible to the author and to anyone they share a conversation with. Images go through
+  // media.upload first, so the bytes live in messageMedia and only the URL is stored here.
+  status: router({
+    feed: protectedProcedure.query(async ({ ctx }) => {
+      const authorIds = [ctx.user.id, ...(await listContactIdsForUser(ctx.user.id))];
+      const rows = await listActiveStatusesByAuthors(authorIds);
+      const viewed = new Set(await listViewedStatusIds(rows.map((row) => row.id), ctx.user.id));
+      const byAuthor = new Map<number, { userId: number; name: string; username: string | null; avatarUpdatedAt: Date | null; allSeen: boolean; items: (StatusRow & { seen: boolean })[] }>();
+      for (const row of rows) {
+        const seen = row.userId === ctx.user.id || viewed.has(row.id);
+        const entry = byAuthor.get(row.userId) ?? { userId: row.userId, name: row.authorName ?? row.authorUsername ?? `User ${row.userId}`, username: row.authorUsername, avatarUpdatedAt: row.authorAvatarUpdatedAt, allSeen: true, items: [] as (StatusRow & { seen: boolean })[] };
+        entry.items.push({ ...row, seen });
+        if (!seen) entry.allSeen = false;
+        byAuthor.set(row.userId, entry);
+      }
+      // The author's own statuses lead the row, as they do in the apps this follows.
+      return Array.from(byAuthor.values()).sort((a, b) => Number(b.userId === ctx.user.id) - Number(a.userId === ctx.user.id));
+    }),
+    create: protectedProcedure.input(z.object({ kind: z.enum(["text", "image"]).default("text"), body: z.string().trim().max(700).optional(), mediaUrl: z.string().max(2000).optional(), background: z.string().max(16).default("amber") })).mutation(async ({ ctx, input }) => {
+      if (input.kind === "text" && !input.body) throw new Error("Write something for your status");
+      if (input.kind === "image" && !input.mediaUrl) throw new Error("Add a photo to your status");
+      const id = crypto.randomUUID();
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+      await createStatus({ id, userId: ctx.user.id, kind: input.kind, body: input.body ?? null, mediaUrl: input.mediaUrl ?? null, background: input.background, expiresAt });
+      return { id, expiresAt };
+    }),
+    view: protectedProcedure.input(z.object({ statusId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      await markStatusViewed(input.statusId, ctx.user.id);
+      return { ok: true as const };
+    }),
+    viewers: protectedProcedure.input(z.object({ statusId: z.string().min(1) })).query(async ({ ctx, input }) => {
+      const status = await getStatus(input.statusId);
+      if (!status) throw new Error("That status has expired");
+      if (status.userId !== ctx.user.id) throw new Error("Only the author can see who viewed a status");
+      return listStatusViewers(input.statusId);
+    }),
+    remove: protectedProcedure.input(z.object({ statusId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      await deleteStatus(input.statusId, ctx.user.id);
+      return { ok: true as const };
+    }),
+  }),
+  // ---- channels: one-to-many broadcasts anyone can follow ------------------------------
+  channels: router({
+    list: protectedProcedure.query(({ ctx }) => listChannelsForUser(ctx.user.id)),
+    search: protectedProcedure.input(z.object({ query: z.string().trim().min(1).max(80) })).query(({ ctx, input }) => searchChannels(input.query, ctx.user.id)),
+    get: protectedProcedure.input(z.object({ channelId: z.string().min(1) })).query(async ({ ctx, input }) => {
+      const channel = await getChannelDetail(input.channelId, ctx.user.id);
+      if (!channel) throw new Error("That channel no longer exists");
+      return channel;
+    }),
+    create: protectedProcedure.input(z.object({ name: z.string().trim().min(3).max(80), description: z.string().trim().max(255).optional() })).mutation(async ({ ctx, input }) => {
+      const channelId = await createChannel(ctx.user.id, input.name, input.description?.trim() || null);
+      return { channelId };
+    }),
+    follow: protectedProcedure.input(z.object({ channelId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      const channel = await getChannel(input.channelId);
+      if (!channel) throw new Error("That channel no longer exists");
+      if (channel.suspendedAt) throw new Error("This channel has been suspended");
+      await followChannel(channel.id, ctx.user.id);
+      return { ok: true as const };
+    }),
+    unfollow: protectedProcedure.input(z.object({ channelId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      await unfollowChannel(input.channelId, ctx.user.id);
+      return { ok: true as const };
+    }),
+    posts: protectedProcedure.input(z.object({ channelId: z.string().min(1), limit: z.number().int().min(1).max(100).default(50) })).query(({ input }) => listChannelPosts(input.channelId, input.limit)),
+    post: protectedProcedure.input(z.object({ channelId: z.string().min(1), body: z.string().trim().min(1).max(2000), mediaUrl: z.string().max(2000).optional() })).mutation(async ({ ctx, input }) => {
+      const channel = await getChannel(input.channelId);
+      if (!channel) throw new Error("That channel no longer exists");
+      if (channel.ownerId !== ctx.user.id) throw new Error("Only the channel owner can post");
+      if (channel.suspendedAt) throw new Error("This channel is suspended, so it cannot post");
+      const id = await createChannelPost({ id: crypto.randomUUID(), channelId: channel.id, authorId: ctx.user.id, body: input.body, mediaUrl: input.mediaUrl ?? null });
+      return { id };
+    }),
+    removePost: protectedProcedure.input(z.object({ postId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      const post = await getChannelPost(input.postId);
+      if (!post) return { ok: true as const };
+      const channel = await getChannel(post.channelId);
+      if (post.authorId !== ctx.user.id && channel?.ownerId !== ctx.user.id) throw new Error("Only the author or the channel owner can delete a post");
+      await removeChannelPost(post.id, ctx.user.id);
+      return { ok: true as const };
+    }),
+    followers: protectedProcedure.input(z.object({ channelId: z.string().min(1) })).query(({ input }) => listChannelFollowers(input.channelId)),
+    read: protectedProcedure.input(z.object({ channelId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      await markChannelRead(input.channelId, ctx.user.id);
+      return { ok: true as const };
+    }),
+  }),
   admin: router({
     users: adminProcedure.query(() => listUsersForAdmin()),
     appeals: adminProcedure.query(() => listAppealsForAdmin()),
@@ -189,6 +281,26 @@ export const appRouter = router({
       const user = await moderateUser(input.userId, input.status, until, input.reason?.trim() || null);
       if (!user) throw new Error("User not found");
       return { id: user.id, status: user.moderationStatus, suspendedUntil: user.suspendedUntil };
+    }),
+    // ---- status + channel moderation: list, then remove or suspend ----------------------
+    statuses: adminProcedure.query(() => listStatusesForAdmin()),
+    removeStatus: adminProcedure.input(z.object({ statusId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      await adminRemoveStatus(input.statusId, ctx.user.id);
+      return { ok: true as const };
+    }),
+    channels: adminProcedure.query(() => listChannelsForAdmin()),
+    channelPosts: adminProcedure.query(() => listChannelPostsForAdmin()),
+    suspendChannel: adminProcedure.input(z.object({ channelId: z.string().min(1), suspended: z.boolean(), reason: z.string().max(500).optional() })).mutation(async ({ input }) => {
+      await setChannelSuspended(input.channelId, input.suspended, input.reason?.trim() || null);
+      return { ok: true as const };
+    }),
+    removeChannelPost: adminProcedure.input(z.object({ postId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      await removeChannelPost(input.postId, ctx.user.id);
+      return { ok: true as const };
+    }),
+    deleteChannel: adminProcedure.input(z.object({ channelId: z.string().min(1) })).mutation(async ({ input }) => {
+      await deleteChannel(input.channelId);
+      return { ok: true as const };
     }),
   }),
 });

@@ -36,3 +36,20 @@ export type MessageMedia = typeof messageMedia.$inferSelect;
 // who started it, and the history the Calls tab shows.
 export const calls = pgTable("calls", { id: varchar("id", { length: 64 }).primaryKey(), conversationId: varchar("conversationId", { length: 64 }).notNull(), initiatorId: integer("initiatorId").notNull(), room: text("room").notNull(), kind: varchar("kind", { length: 8 }).default("audio").notNull(), status: varchar("status", { length: 12 }).default("ringing").notNull(), startedAt: timestamp("startedAt").defaultNow().notNull(), answeredAt: timestamp("answeredAt"), endedAt: timestamp("endedAt") });
 export type Call = typeof calls.$inferSelect;
+
+// ---------------------------------------------------------------- status updates
+// "Stories": short-lived posts that expire after a day. An image status keeps its bytes in
+// messageMedia (the same base64 store chat attachments use) and only the URL here, so it
+// inherits that size cap and is already served by GET /api/media/<id>.
+export const statusUpdates = pgTable("statusUpdates", { id: varchar("id", { length: 64 }).primaryKey(), userId: integer("userId").notNull(), kind: varchar("kind", { length: 8 }).default("text").notNull(), body: text("body"), mediaUrl: text("mediaUrl"), background: varchar("background", { length: 16 }).default("amber").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull(), expiresAt: timestamp("expiresAt").notNull(), removedAt: timestamp("removedAt"), removedBy: integer("removedBy") });
+export const statusViews = pgTable("statusViews", { statusId: varchar("statusId", { length: 64 }).notNull(), viewerId: integer("viewerId").notNull(), viewedAt: timestamp("viewedAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.statusId, table.viewerId] }) }));
+
+// ---------------------------------------------------------------- channels
+// One-to-many broadcast feeds: anyone can follow, only the owner posts.
+export const channels = pgTable("channels", { id: varchar("id", { length: 64 }).primaryKey(), ownerId: integer("ownerId").notNull(), name: varchar("name", { length: 80 }).notNull(), description: varchar("description", { length: 255 }), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull(), suspendedAt: timestamp("suspendedAt"), suspendedReason: text("suspendedReason") });
+export const channelPosts = pgTable("channelPosts", { id: varchar("id", { length: 64 }).primaryKey(), channelId: varchar("channelId", { length: 64 }).notNull(), authorId: integer("authorId").notNull(), body: text("body").notNull(), mediaUrl: text("mediaUrl"), createdAt: timestamp("createdAt").defaultNow().notNull(), removedAt: timestamp("removedAt"), removedBy: integer("removedBy") });
+export const channelFollowers = pgTable("channelFollowers", { channelId: varchar("channelId", { length: 64 }).notNull(), userId: integer("userId").notNull(), followedAt: timestamp("followedAt").defaultNow().notNull(), lastReadAt: timestamp("lastReadAt") }, (table) => ({ pk: primaryKey({ columns: [table.channelId, table.userId] }) }));
+
+export type StatusUpdate = typeof statusUpdates.$inferSelect;
+export type Channel = typeof channels.$inferSelect;
+export type ChannelPost = typeof channelPosts.$inferSelect;

@@ -1,7 +1,7 @@
-import { and, desc, eq, gt, ilike, inArray, like, lt, ne, or } from "drizzle-orm";
+import { and, desc, eq, gt, ilike, inArray, isNull, like, lt, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, calls, conversationMembers, conversations, InsertUser, messageMedia, messages, pushTokens, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, messageMedia, messages, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -581,4 +581,257 @@ export async function clearUserAvatar(userId: number) {
   if (!db) throw new Error("Account storage is not available");
   await db.delete(userAvatars).where(eq(userAvatars.userId, userId));
   await db.update(users).set({ avatarUpdatedAt: null, updatedAt: new Date() }).where(eq(users.id, userId));
+}
+
+// ---------------------------------------------------------------- status updates
+
+/** Everyone the user shares a conversation with: the audience a status update is visible to. */
+export async function listContactIdsForUser(userId: number): Promise<number[]> {
+  const db = await getDb();
+  if (!db) return [];
+  const mine = await db.select({ conversationId: conversationMembers.conversationId }).from(conversationMembers).where(eq(conversationMembers.userId, userId));
+  if (mine.length === 0) return [];
+  const peers = await db.select({ userId: conversationMembers.userId }).from(conversationMembers).where(inArray(conversationMembers.conversationId, mine.map((row) => row.conversationId)));
+  return Array.from(new Set(peers.map((row) => row.userId))).filter((id) => id !== userId);
+}
+
+export async function createStatus(input: { id: string; userId: number; kind: string; body: string | null; mediaUrl: string | null; background: string; expiresAt: Date }) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.insert(statusUpdates).values(input);
+  return input.id;
+}
+
+/** Live statuses (unexpired, not moderated away) from the given authors, newest first. */
+export async function listActiveStatusesByAuthors(authorIds: number[]) {
+  const db = await getDb();
+  if (!db || authorIds.length === 0) return [];
+  return db
+    .select({ id: statusUpdates.id, userId: statusUpdates.userId, kind: statusUpdates.kind, body: statusUpdates.body, mediaUrl: statusUpdates.mediaUrl, background: statusUpdates.background, createdAt: statusUpdates.createdAt, expiresAt: statusUpdates.expiresAt, authorName: users.name, authorUsername: users.username, authorAvatarUpdatedAt: users.avatarUpdatedAt })
+    .from(statusUpdates)
+    .innerJoin(users, eq(users.id, statusUpdates.userId))
+    .where(and(inArray(statusUpdates.userId, authorIds), isNull(statusUpdates.removedAt), gt(statusUpdates.expiresAt, new Date())))
+    .orderBy(desc(statusUpdates.createdAt))
+    .limit(300);
+}
+
+export async function getStatus(id: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(statusUpdates).where(eq(statusUpdates.id, id)).limit(1);
+  return rows[0];
+}
+
+/** Which of these statuses the viewer has already opened, so the ring can render as seen. */
+export async function listViewedStatusIds(statusIds: string[], viewerId: number): Promise<string[]> {
+  const db = await getDb();
+  if (!db || statusIds.length === 0) return [];
+  const rows = await db.select({ statusId: statusViews.statusId }).from(statusViews).where(and(inArray(statusViews.statusId, statusIds), eq(statusViews.viewerId, viewerId)));
+  return rows.map((row) => row.statusId);
+}
+
+export async function markStatusViewed(statusId: string, viewerId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.insert(statusViews).values({ statusId, viewerId }).onConflictDoNothing();
+}
+
+export async function listStatusViewers(statusId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({ userId: users.id, name: users.name, username: users.username, viewedAt: statusViews.viewedAt })
+    .from(statusViews)
+    .innerJoin(users, eq(users.id, statusViews.viewerId))
+    .where(eq(statusViews.statusId, statusId))
+    .orderBy(desc(statusViews.viewedAt))
+    .limit(200);
+}
+
+export async function deleteStatus(id: string, userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.delete(statusUpdates).where(and(eq(statusUpdates.id, id), eq(statusUpdates.userId, userId)));
+}
+
+export async function listStatusesForAdmin(limit = 200) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({ id: statusUpdates.id, userId: statusUpdates.userId, kind: statusUpdates.kind, body: statusUpdates.body, mediaUrl: statusUpdates.mediaUrl, createdAt: statusUpdates.createdAt, expiresAt: statusUpdates.expiresAt, removedAt: statusUpdates.removedAt, authorName: users.name, authorUsername: users.username })
+    .from(statusUpdates)
+    .innerJoin(users, eq(users.id, statusUpdates.userId))
+    .orderBy(desc(statusUpdates.createdAt))
+    .limit(limit);
+}
+
+/** Soft delete: the row stays for the audit trail, the feed filters it out. */
+export async function adminRemoveStatus(id: string, adminId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.update(statusUpdates).set({ removedAt: new Date(), removedBy: adminId }).where(eq(statusUpdates.id, id));
+}
+
+// ---------------------------------------------------------------- channels
+
+export async function createChannel(ownerId: number, name: string, description: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const id = `chn_${crypto.randomUUID()}`;
+  await db.transaction(async (tx) => {
+    await tx.insert(channels).values({ id, ownerId, name, description });
+    // The owner follows their own channel so it appears under "Following" like any other.
+    await tx.insert(channelFollowers).values({ channelId: id, userId: ownerId });
+  });
+  return id;
+}
+
+export async function getChannel(id: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(channels).where(eq(channels.id, id)).limit(1);
+  return rows[0];
+}
+
+type ChannelRow = { id: string; ownerId: number; name: string; description: string | null; createdAt: Date; suspendedAt: Date | null };
+
+/** Adds follower/post counts, the newest post time, and whether this user follows it. */
+async function decorateChannels<T extends ChannelRow>(rows: T[], userId: number) {
+  const db = await getDb();
+  if (!db || rows.length === 0) return [];
+  const ids = rows.map((row) => row.id);
+  const followers = await db.select({ channelId: channelFollowers.channelId, userId: channelFollowers.userId }).from(channelFollowers).where(inArray(channelFollowers.channelId, ids));
+  const posts = await db.select({ channelId: channelPosts.channelId, createdAt: channelPosts.createdAt }).from(channelPosts).where(and(inArray(channelPosts.channelId, ids), isNull(channelPosts.removedAt)));
+  return rows.map((row) => {
+    const mine = posts.filter((post) => post.channelId === row.id);
+    const newest = mine.reduce((latest, post) => Math.max(latest, post.createdAt.getTime()), 0);
+    return { ...row, followerCount: followers.filter((f) => f.channelId === row.id).length, postCount: mine.length, lastPostAt: newest > 0 ? new Date(newest) : null, isFollowing: followers.some((f) => f.channelId === row.id && f.userId === userId), isOwner: row.ownerId === userId };
+  });
+}
+
+export async function listChannelsForUser(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select({ id: channels.id, ownerId: channels.ownerId, name: channels.name, description: channels.description, createdAt: channels.createdAt, suspendedAt: channels.suspendedAt }).from(channels).orderBy(desc(channels.createdAt)).limit(200);
+  return decorateChannels(rows, userId);
+}
+
+export async function searchChannels(query: string, userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select({ id: channels.id, ownerId: channels.ownerId, name: channels.name, description: channels.description, createdAt: channels.createdAt, suspendedAt: channels.suspendedAt }).from(channels).where(ilike(channels.name, `%${query}%`)).orderBy(desc(channels.createdAt)).limit(60);
+  return decorateChannels(rows, userId);
+}
+
+export async function isChannelFollower(channelId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db.select({ userId: channelFollowers.userId }).from(channelFollowers).where(and(eq(channelFollowers.channelId, channelId), eq(channelFollowers.userId, userId))).limit(1);
+  return rows.length > 0;
+}
+
+export async function followChannel(channelId: string, userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.insert(channelFollowers).values({ channelId, userId }).onConflictDoNothing();
+}
+
+export async function unfollowChannel(channelId: string, userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.delete(channelFollowers).where(and(eq(channelFollowers.channelId, channelId), eq(channelFollowers.userId, userId)));
+}
+
+export async function listChannelFollowers(channelId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select({ userId: users.id, name: users.name, username: users.username, followedAt: channelFollowers.followedAt }).from(channelFollowers).innerJoin(users, eq(users.id, channelFollowers.userId)).where(eq(channelFollowers.channelId, channelId)).orderBy(desc(channelFollowers.followedAt)).limit(200);
+}
+
+export async function markChannelRead(channelId: string, userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.update(channelFollowers).set({ lastReadAt: new Date() }).where(and(eq(channelFollowers.channelId, channelId), eq(channelFollowers.userId, userId)));
+}
+
+export async function listChannelPosts(channelId: string, limit = 50) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({ id: channelPosts.id, channelId: channelPosts.channelId, authorId: channelPosts.authorId, body: channelPosts.body, mediaUrl: channelPosts.mediaUrl, createdAt: channelPosts.createdAt, authorName: users.name, authorUsername: users.username })
+    .from(channelPosts)
+    .innerJoin(users, eq(users.id, channelPosts.authorId))
+    .where(and(eq(channelPosts.channelId, channelId), isNull(channelPosts.removedAt)))
+    .orderBy(desc(channelPosts.createdAt))
+    .limit(limit);
+}
+
+export async function createChannelPost(input: { id: string; channelId: string; authorId: number; body: string; mediaUrl: string | null }) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.transaction(async (tx) => {
+    await tx.insert(channelPosts).values(input);
+    await tx.update(channels).set({ updatedAt: new Date() }).where(eq(channels.id, input.channelId));
+  });
+  return input.id;
+}
+
+export async function removeChannelPost(postId: string, removedBy: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.update(channelPosts).set({ removedAt: new Date(), removedBy }).where(eq(channelPosts.id, postId));
+}
+
+export async function getChannelPost(postId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(channelPosts).where(eq(channelPosts.id, postId)).limit(1);
+  return rows[0];
+}
+
+export async function listChannelsForAdmin(limit = 200) {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db.select({ id: channels.id, ownerId: channels.ownerId, name: channels.name, description: channels.description, createdAt: channels.createdAt, suspendedAt: channels.suspendedAt, suspendedReason: channels.suspendedReason, ownerName: users.name, ownerUsername: users.username }).from(channels).innerJoin(users, eq(users.id, channels.ownerId)).orderBy(desc(channels.createdAt)).limit(limit);
+  const decorated = await decorateChannels(rows, -1);
+  return rows.map((row, index) => ({ ...row, followerCount: decorated[index]?.followerCount ?? 0, postCount: decorated[index]?.postCount ?? 0, lastPostAt: decorated[index]?.lastPostAt ?? null }));
+}
+
+/** Suspending keeps the channel and its posts; it only blocks new posts. */
+export async function setChannelSuspended(id: string, suspended: boolean, reason: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.update(channels).set({ suspendedAt: suspended ? new Date() : null, suspendedReason: suspended ? reason : null }).where(eq(channels.id, id));
+}
+
+export async function deleteChannel(id: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.transaction(async (tx) => {
+    await tx.delete(channelPosts).where(eq(channelPosts.channelId, id));
+    await tx.delete(channelFollowers).where(eq(channelFollowers.channelId, id));
+    await tx.delete(channels).where(eq(channels.id, id));
+  });
+}
+
+export async function listChannelPostsForAdmin(limit = 100) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({ id: channelPosts.id, channelId: channelPosts.channelId, authorId: channelPosts.authorId, body: channelPosts.body, createdAt: channelPosts.createdAt, removedAt: channelPosts.removedAt, channelName: channels.name, authorUsername: users.username })
+    .from(channelPosts)
+    .innerJoin(channels, eq(channels.id, channelPosts.channelId))
+    .innerJoin(users, eq(users.id, channelPosts.authorId))
+    .orderBy(desc(channelPosts.createdAt))
+    .limit(limit);
+}
+
+/** A single channel with its counts, for the channel screen header. */
+export async function getChannelDetail(id: string, userId: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select({ id: channels.id, ownerId: channels.ownerId, name: channels.name, description: channels.description, createdAt: channels.createdAt, suspendedAt: channels.suspendedAt, suspendedReason: channels.suspendedReason }).from(channels).where(eq(channels.id, id)).limit(1);
+  if (rows.length === 0) return undefined;
+  const [decorated] = await decorateChannels(rows, userId);
+  return decorated;
 }
