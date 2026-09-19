@@ -1,0 +1,46 @@
+# Render blueprint for the Varnox Chat API, built from THIS repository.
+#
+# The API is not a separate codebase - server/, shared/ and drizzle/ live here beside the web app.
+# Deploying it from here means one source of truth: a change to a router reaches the web app and
+# the API together, with nothing to mirror by hand.
+#
+# Deploy: Render dashboard -> New -> Blueprint -> pick this repo.
+#
+# Note: this repository is also the Expo project, so the install pulls the web toolchain too.
+# That makes the Render build slower than an API-only repo would be. It is the price of not
+# having two copies of the server code.
+
+services:
+  - type: web
+    name: varnox-chat-api
+    runtime: node
+    # `starter` or above: the free tier sleeps after ~15 minutes idle, which drops every open
+    # event stream and makes the next request wait for a cold start.
+    plan: starter
+    region: singapore
+    branch: main
+    autoDeploy: true
+    # `pnpm build` here is the server bundle (server-dist/index.mjs); the web app is exported
+    # separately by `pnpm build:web` for Vercel.
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
+    # Applies pending migrations before the new version takes traffic.
+    preDeployCommand: pnpm db:migrate
+    startCommand: node server-dist/index.mjs
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: OWNER_OPEN_ID
+        value: blacklorddev
+      # sync: false means "prompt me in the dashboard" - no value is stored in this file, which
+      # matters because this repository is public.
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      # Not a secret, and it must match a domain verified in Resend or sends are rejected.
+      # Pinned so it is not mis-typed; varnoxapp.blacklord.tech is verified.
+      - key: RESEND_FROM
+        value: "Varnox Chat <no-reply@varnoxapp.blacklord.tech>"
