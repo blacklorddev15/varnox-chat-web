@@ -1,0 +1,92 @@
+{
+    "_comment": "Varnox Chat API. Pterodactyl injects the allocation as SERVER_PORT and the server reads it, so the panel's address works with no extra configuration. Egg variables are exported into the container environment, so DATABASE_URL and friends reach the app without appearing in the startup command.",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-09-20T00:00:00+00:00",
+    "name": "Varnox Chat API",
+    "author": "blacklorddev15",
+    "description": "The Varnox Chat backend: tRPC over Express, plus a Server-Sent Events channel for realtime delivery.\r\n\r\nInstalls from github.com/blacklorddev15/varnox-chat-web and builds the API bundle. Requires a PostgreSQL database - the connection string is a variable below.\r\n\r\nRun ONE instance only: the event bus lives inside the process, so a second instance would deliver realtime events to nobody. Everything still works, it just falls back to polling.\r\n\r\nSet BUILD_WEB to 1 to also export the web app, so this server renders the site as well as serving the API. It roughly doubles install time.",
+    "features": null,
+    "docker_images": {
+        "Node.js 20": "ghcr.io/pterodactyl/yolks:nodejs_20"
+    },
+    "file_denylist": [],
+    "startup": "NODE_ENV=production node server-dist/index.mjs",
+    "config": {
+        "files": "{}",
+        "startup": "{\"done\": \"server listening on port\"}",
+        "logs": "{}",
+        "stop": "^C"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/bash\nset -e\n\ncd /mnt/server\n\necho \"==> Installing curl if the image lacks it\"\nif ! command -v curl >/dev/null 2>&1; then\n    apt-get update -qq\n    apt-get install -y -qq curl\nfi\n\necho \"==> Downloading Varnox Chat\"\ncurl -fsSL \"https://codeload.github.com/blacklorddev15/varnox-chat-web/tar.gz/refs/heads/main\" -o /tmp/varnox.tar.gz\ntar -xzf /tmp/varnox.tar.gz --strip-components=1\nrm -f /tmp/varnox.tar.gz\n\necho \"==> Activating pnpm\"\ncorepack enable\ncorepack prepare pnpm@9.12.0 --activate\n\necho \"==> Installing dependencies (several minutes)\"\npnpm install --frozen-lockfile\n\necho \"==> Building the API bundle\"\npnpm build\n\nif [ \"${BUILD_WEB}\" = \"true\" ] || [ \"${BUILD_WEB}\" = \"1\" ]; then\n    echo \"==> BUILD_WEB is on, exporting the web app as well\"\n    pnpm build:web:selfhost\nfi\n\nif [ -f pnpm-lock.yaml ] && [ ! -f node_modules/.bin/tsx ]; then\n    echo \"==> Warning: devDependencies look missing; the API build may be incomplete\"\nfi\n\necho \"==> Applying database migrations\"\nif [ -n \"${DATABASE_URL}\" ]; then\n    if ! pnpm db:migrate; then\n        echo \"!! Migration failed. The API will still start, but features needing newer tables stay switched off.\"\n        echo \"!! Re-run it from this server's console with: pnpm db:migrate\"\n    fi\nelse\n    echo \"!! DATABASE_URL is empty, so migrations were skipped. Set it and re-run the installer, or migrate from elsewhere.\"\nfi\n\necho \"==> Done. Press Start. The server listens on SERVER_PORT automatically.\"",
+            "container": "node:22-bookworm",
+            "entrypoint": "bash"
+        }
+    },
+    "variables": [
+        {
+            "name": "PostgreSQL connection string",
+            "description": "The database the API uses. Include sslmode=require for hosted Postgres, e.g.\r\npostgresql://user:password@host:5432/dbname?sslmode=require",
+            "env_variable": "DATABASE_URL",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string",
+            "field_type": "text"
+        },
+        {
+            "name": "Session signing secret",
+            "description": "Signs session tokens. Use a long random string. Changing it signs everyone out.",
+            "env_variable": "JWT_SECRET",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|min:32",
+            "field_type": "text"
+        },
+        {
+            "name": "Admin username",
+            "description": "The first account, which gets admin rights.",
+            "env_variable": "OWNER_OPEN_ID",
+            "default_value": "blacklorddev",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:64",
+            "field_type": "text"
+        },
+        {
+            "name": "Resend API key",
+            "description": "For verification and password-reset email. Leave blank and those emails are logged instead of sent.",
+            "env_variable": "RESEND_API_KEY",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string",
+            "field_type": "text"
+        },
+        {
+            "name": "Email sender",
+            "description": "Must be on a domain verified in Resend, or sends are rejected.",
+            "env_variable": "RESEND_FROM",
+            "default_value": "Varnox Chat <no-reply@varnoxapp.blacklord.tech>",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string",
+            "field_type": "text"
+        },
+        {
+            "name": "Also build the web app",
+            "description": "1 = export the frontend too, so this server renders the site at its address as well as serving the API. Leave 0 if the frontend is on Vercel.",
+            "env_variable": "BUILD_WEB",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        }
+    ]
+}
