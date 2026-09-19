@@ -7,7 +7,9 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
+import android.content.Context;
 import android.os.Bundle;
+import android.os.PowerManager;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -27,6 +29,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.ArrayList;
+import java.util.Locale;
 import java.util.Scanner;
 
 /**
@@ -49,7 +52,15 @@ public class MainActivity extends Activity {
 
     private static final String START_URL = "https://varnox-chat-web.vercel.app/";
     private static final String APP_HOST = "varnox-chat-web.vercel.app";
-    private static final String UA_SUFFIX = " VarnoxAndroid/1.3";
+    private static final String UA_SUFFIX = " VarnoxAndroid/1.4";
+
+    /**
+     * The system Photo Picker. API 33, backported to Android 11 (API 30) through SDK
+     * extension 2, so the literal action is enough - no MediaStore constant and no
+     * AndroidX dependency. MODE_OPEN_MULTIPLE stays on the general chooser: multi-select
+     * behaviour of the backported picker varies too much by device to rely on.
+     */
+    private static final String ACTION_PICK_IMAGES = "android.provider.action.PICK_IMAGES";
 
     private static final int REQ_FILE = 1001;
     private static final int REQ_WEB_PERM = 1002;
@@ -342,6 +353,24 @@ public class MainActivity extends Activity {
             requestPermissions(needed.toArray(new String[0]), REQ_WEB_PERM);
         }
 
+        /**
+         * True only when the page asked for images and nothing else. The Photo Picker returns
+         * images and videos; a chat input that also accepts PDFs or audio must keep the general
+         * chooser. A capture-enabled input also stays where it is - the picker cannot take a photo.
+         */
+        private boolean imagesOnly(FileChooserParams params) {
+            if (params.isCaptureEnabled()) return false;
+            if (params.getMode() != FileChooserParams.MODE_OPEN) return false;
+            String[] accept = params.getAcceptTypes();
+            if (accept == null || accept.length == 0) return false;
+            for (String type : accept) {
+                if (type == null) return false;
+                String trimmed = type.trim().toLowerCase(Locale.US);
+                if (!trimmed.isEmpty() && !trimmed.startsWith("image/")) return false;
+            }
+            return true;
+        }
+
         @Override
         public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> filePathCallback,
                                          FileChooserParams fileChooserParams) {
@@ -349,6 +378,20 @@ public class MainActivity extends Activity {
                 pendingFileCallback.onReceiveValue(null);
             }
             pendingFileCallback = filePathCallback;
+
+            // Images only: prefer the system Photo Picker, so the user gets Photos rather than a
+            // file browser. ACTION_GET_CONTENT below already needs no storage permission either -
+            // this is a UX change, not a permission fix.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && imagesOnly(fileChooserParams)) {
+                Intent photoPicker = new Intent(ACTION_PICK_IMAGES);
+                photoPicker.setType("image/*");
+                try {
+                    startActivityForResult(photoPicker, REQ_FILE);
+                    return true;
+                } catch (ActivityNotFoundException noPicker) {
+                    // Device without the backport - fall through to the general chooser.
+                }
+            }
 
             Intent intent;
             try {
@@ -446,6 +489,52 @@ public class MainActivity extends Activity {
         web.saveState(outState);
     }
 
+    /** Held only while a call runs, so the CPU does not suspend audio with the screen off. */
+    private PowerManager.WakeLock callWakeLock;
+
+    /**
+     * Reported by the page when a call starts and again when it ends. Two jobs: keep a partial
+     * wake lock so audio survives the screen going off, and tell the foreground service what
+     * kind of work is happening, because Android 14+ will not let a dataSync service hold the
+     * microphone. Both are best effort: promoting to a microphone service from the background
+     * is not permitted, and the answer path retries it once the app is in front.
+     */
+    void setCallActive(final boolean active) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (active) {
+                        if (callWakeLock == null) {
+                            PowerManager power = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                            if (power != null) {
+                                callWakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "varnox:call");
+                                callWakeLock.setReferenceCounted(false);
+                            }
+                        }
+                        if (callWakeLock != null && !callWakeLock.isHeld()) callWakeLock.acquire();
+                    } else if (callWakeLock != null && callWakeLock.isHeld()) {
+                        callWakeLock.release();
+                    }
+                } catch (Exception ignored) {
+                    // an unavailable wake lock must never break a call
+                }
+                try {
+                    Intent service = new Intent(MainActivity.this, VarnoxConnectionService.class);
+                    service.putExtra(VarnoxConnectionService.EXTRA_IN_CALL, active);
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(service);
+                    } else {
+                        startService(service);
+                    }
+                } catch (Exception ignored) {
+                    // Android 14+ forbids this from the background; answering brings the app
+                    // forward and the call is promoted on the next state change.
+                }
+            }
+        });
+    }
+
     @Override
     protected void onStart() {
         super.onStart();
@@ -483,6 +572,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (callWakeLock != null && callWakeLock.isHeld()) callWakeLock.release();
         stopService(new Intent(this, VarnoxConnectionService.class));
         if (web != null) {
             web.setWebChromeClient(null);

@@ -2,17 +2,18 @@
 # Build VARNOX.apk without Gradle: aapt2 -> javac -> d8 -> zipalign -> apksigner
 set -euo pipefail
 
-SDK=/tmp/apk-tools/sdk
+SDK="${ANDROID_SDK_ROOT:-/tmp/apk-tools/sdk}"
 BT="$SDK/build-tools/36.0.0"
 PLAT="$SDK/platforms/android-34/android.jar"
-export JAVA_HOME=/tmp/apk-tools/jdk
+export JAVA_HOME="${JAVA_HOME:-/tmp/apk-tools/jdk}"
 export PATH="$JAVA_HOME/bin:$PATH"
 
 PROJ="$(cd "$(dirname "$0")" && pwd)"
 OUT="$PROJ/build"
 KS="$PROJ/varnox-release.keystore"
-KS_PASS="varnox2026"
-APK_OUT="$PROJ/../VARNOX-1.3.apk"
+# The passphrase is never committed. Export VARNOX_KS_PASS before building.
+KS_PASS="${VARNOX_KS_PASS:?set VARNOX_KS_PASS before building}"
+APK_OUT="$PROJ/../VARNOX-1.4.apk"
 
 rm -rf "$OUT"
 mkdir -p "$OUT/gen" "$OUT/classes" "$OUT/dex"
@@ -32,8 +33,8 @@ echo "==> aapt2 link"
   --java "$OUT/gen" \
   --min-sdk-version 24 \
   --target-sdk-version 34 \
-  --version-code 4 \
-  --version-name 1.3 \
+  --version-code 5 \
+  --version-name 1.4 \
   --no-version-vectors
 
 echo "==> javac"
@@ -56,10 +57,12 @@ PY
 
 echo "==> keystore"
 if [ ! -f "$KS" ]; then
-  keytool -genkeypair -v \
-    -keystore "$KS" -alias varnox -keyalg RSA -keysize 2048 -validity 10950 \
-    -storepass "$KS_PASS" -keypass "$KS_PASS" \
-    -dname "CN=VARNOX, OU=Mobile, O=VARNOX, L=NA, ST=NA, C=NA"
+  echo "ERROR: $KS not found - refusing to generate a replacement." >&2
+  echo "This is the release signing key. A freshly generated key signs an APK that" >&2
+  echo "Android will not install over an existing VARNOX install, and it cannot be" >&2
+  echo "rotated afterwards: every user would have to uninstall first." >&2
+  echo "Restore apk/varnox-release.keystore (alias 'varnox') and re-run." >&2
+  exit 1
 fi
 
 echo "==> zipalign"

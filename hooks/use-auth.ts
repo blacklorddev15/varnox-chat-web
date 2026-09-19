@@ -9,7 +9,8 @@ type UseAuthOptions = {
 
 export function useAuth(options?: UseAuthOptions) {
   const { autoFetch = true } = options ?? {};
-  const [user, setUser] = useState<Auth.User | null>(null);
+  // Seeded from the shared store so a screen that mounts after sign-in already knows.
+  const [user, setUser] = useState<Auth.User | null>(() => Auth.getAuthUser());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
 
@@ -107,6 +108,10 @@ export function useAuth(options?: UseAuthOptions) {
   }, []);
 
   const isAuthenticated = useMemo(() => Boolean(user), [user]);
+
+  // Sign-in, OAuth return and sign-out publish here. Deliberately only re-reads the store:
+  // re-fetching would loop, because fetchUser() writes the user back through the same path.
+  useEffect(() => Auth.subscribeToAuth(() => setUser(Auth.getAuthUser())), []);
 
   useEffect(() => {
     console.log("[useAuth] useEffect triggered, autoFetch:", autoFetch, "platform:", Platform.OS);

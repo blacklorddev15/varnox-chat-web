@@ -120,4 +120,19 @@
   };
 
   window.Notification = VarnoxNotification;
+  /**
+   * A call is not an ordinary connection: audio has to survive the screen going off, and on
+   * Android 14+ the foreground service must declare the microphone before it may capture it.
+   * The shell handles both; the page only reports when a call starts and ends.
+   */
+  window.__varnoxCall = {
+    setActive: function (active) {
+      try {
+        if (NATIVE && NATIVE.setCallActive) NATIVE.setCallActive(!!active);
+      } catch (e) {
+        /* the call itself is unaffected */
+      }
+    }
+  };
+
 })();

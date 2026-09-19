@@ -13,10 +13,15 @@ expo-env.d.ts
 .kotlin/
 *.orig.*
 *.jks
+*.keystore
 *.p8
 *.p12
 *.key
 *.mobileprovision
+
+# APK shell: signing key and intermediate build output
+apk/build/
+apk/icon-preview.png
 
 # Metro
 .metro-health-check*

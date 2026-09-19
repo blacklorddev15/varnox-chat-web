@@ -37,6 +37,12 @@ class NativeBridge {
     }
 
     @JavascriptInterface
+    public void setCallActive(final boolean active) {
+        if (!activity.isTrustedPage()) return;
+        activity.setCallActive(active);
+    }
+
+    @JavascriptInterface
     public void postNotification(final String title, final String body, final String tag) {
         if (!activity.isTrustedPage()) return;
         activity.runOnUiThread(new Runnable() {
