@@ -137,7 +137,10 @@ async function startServer() {
   // Event streams are long-lived by design, and Node's default 300s request timeout would cut
   // every one of them mid-conversation. The 25s keep-alive ping is what detects a dead peer.
   server.requestTimeout = 0;
-  const preferredPort = parseInt(process.env.PORT || "3000");
+  // Pterodactyl injects the allocated port as SERVER_PORT, not PORT. Without this the app would
+  // fall back to 3000 while the panel routes the allocated port, so the server would look like it
+  // was running while nothing answered on the address the panel gives you.
+  const preferredPort = parseInt(process.env.PORT || process.env.SERVER_PORT || "3000");
   const port = await findAvailablePort(preferredPort);
 
   if (port !== preferredPort) {

@@ -99,6 +99,50 @@ NODE_ENV=production node server-dist/index.mjs
 > package without `"type": "module"`, which Node 22 only ran by guessing and Node 20 would have
 > refused outright. Update the startup command when you deploy.
 
+## Pterodactyl panel
+
+One server hosts **both** the rendered web app and the API. They are the same process on the same
+port, so do not create a second server or split them.
+
+**Startup command** (egg → Startup tab):
+
+```text
+node server-dist/index.mjs
+```
+
+The allocated port is read from `SERVER_PORT`, which is the variable the panel injects. Being
+explicit works too:
+
+```text
+PORT={{SERVER_PORT}} node server-dist/index.mjs
+```
+
+> If the app binds anything other than the server's allocation, the panel's `IP:port` answers
+> nothing even though the console says it started. `PORT` wins when both are set.
+
+**Egg / image requirements**
+
+| | |
+|---|---|
+| Node | 20+ (22 LTS recommended) - the bundle is ESM (`.mjs`) |
+| pnpm | the image must provide it, else `npm install -g pnpm` (or `corepack enable`) once |
+| RAM | 512 MB is comfortable for a small team; each signed-in client holds one SSE connection |
+| Instance | exactly one |
+
+**Upload and install**
+
+Extract `varnox-pterodactyl-selfhost.zip` in the server root through the panel file manager, then:
+
+```bash
+pnpm install --frozen-lockfile
+```
+
+The archive ships `web-dist/` and `server-dist/` prebuilt, so the panel never runs Metro.
+
+**Why one server is enough:** API routes are registered before the static handler, and the SPA
+fallback explicitly skips `/api/`, so an API request can never be answered with `index.html`.
+Verified on a running build - `/` returns the app HTML and `/api/health` returns JSON, same port.
+
 ## Verify
 
 ```bash
