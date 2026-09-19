@@ -21,7 +21,9 @@ export async function upsertUser(user: InsertUser): Promise<void> {
   if (!db) { console.warn("[Database] Cannot upsert user: database not available"); return; }
   const values: InsertUser = { openId: user.openId };
   const updateSet: Record<string, unknown> = {};
-  const textFields = ["name", "email", "username", "passwordHash", "loginMethod", "moderationReason"] as const;
+  // Explicit allowlist: anything missing here is silently dropped on insert, which is how
+  // the phone number passed from registration used to be lost.
+  const textFields = ["name", "email", "username", "passwordHash", "loginMethod", "moderationReason", "phone"] as const;
   for (const field of textFields) {
     if (user[field] !== undefined) { values[field] = user[field] ?? null; updateSet[field] = user[field] ?? null; }
   }
