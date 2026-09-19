@@ -1,5 +1,6 @@
 // Must come first: loads .env, or env.txt when .env is absent. See the file for why.
 import "./loadEnv";
+import { runMigrationsOnBoot } from "./migrate";
 import express from "express";
 import { createServer } from "http";
 import net from "net";
@@ -147,6 +148,11 @@ async function startServer() {
   if (port !== preferredPort) {
     console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
   }
+
+  // Before taking traffic, not after: the schema should be current by the time the first request
+  // arrives. This cannot stop the server - see migrate.ts - so a database problem still leaves a
+  // process that can be inspected rather than one that never comes up.
+  await runMigrationsOnBoot();
 
   server.listen(port, () => {
     console.log(`[api] server listening on port ${port}`);

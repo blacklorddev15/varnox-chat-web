@@ -107,11 +107,21 @@ pnpm start
 
 ### Migrations
 
-Nothing applies them automatically except the egg's install step.
+On a long-lived host the server applies pending migrations as it starts, before it takes traffic.
+Drizzle records what has already run, so this is a no-op once the schema is current. It cannot stop
+the server: a failure is logged and the process continues, because refusing to boot would turn a
+schema problem into a total outage.
+
+- `RUN_MIGRATIONS=0` turns it off.
+- On Vercel it is skipped, since concurrent function instances would migrate the same database at
+  once. There, run it yourself:
 
 ```bash
 DATABASE_URL="postgresql://..." pnpm db:push
 ```
+
+The `drizzle/` folder must sit beside the server for the automatic path to work. The deployment zip
+includes it.
 
 ### Checks
 
