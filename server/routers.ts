@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { isObjectStorageConfigured } from "../storage";
+import { MAX_DB_MEDIA_BYTES } from "./_core/mediaRoutes";
 import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
@@ -39,8 +41,25 @@ export const appRouter = router({
   media: router({
     upload: protectedProcedure.input(z.object({ fileName: z.string().min(1).max(255), contentType: z.string().min(1).max(160), base64: z.string().min(1).max(30_000_000) })).mutation(async ({ ctx, input }) => {
       const safeName = input.fileName.replace(/[^a-zA-Z0-9._-]/g, "_");
-      const result = await storagePut(`varnox/${ctx.user.id}/${Date.now()}-${safeName}`, Buffer.from(input.base64, "base64"), input.contentType);
-      return { ...result, fileName: input.fileName, contentType: input.contentType };
+
+      if (isObjectStorageConfigured()) {
+        const key = `varnox/${ctx.user.id}/${Date.now()}-${safeName}`;
+        const result = await storagePut(key, Buffer.from(input.base64, "base64"), input.contentType);
+        return { ...result, fileName: input.fileName, contentType: input.contentType };
+      }
+
+      // No object storage on this deployment (no BUILT_IN_FORGE_API_*), which used to make
+      // every photo and voice note fail with "Storage config missing". Small attachments now
+      // live in the database and are served from /api/media/<id>; anything over the limit is
+      // refused with a message that says what to do about it.
+      const bytes = Buffer.from(input.base64, "base64");
+      if (bytes.length > MAX_DB_MEDIA_BYTES) {
+        throw new Error(
+          `Attachment is ${(bytes.length / 1e6).toFixed(1)} MB. Photos and voice notes up to ${MAX_DB_MEDIA_BYTES / 1e6} MB work today; larger files need object storage configured.`,
+        );
+      }
+      const id = await saveMessageMedia(ctx.user.id, input.contentType, input.fileName, input.base64);
+      return { key: `db:${id}`, url: `/api/media/${id}`, fileName: input.fileName, contentType: input.contentType };
     }),
   }),
   push: router({

@@ -10,6 +10,7 @@ import { registerPhoneAuthRoutes } from "./phoneAuth";
 import { registerPasswordAuthRoutes } from "./passwordAuth";
 import { registerStorageProxy } from "./storageProxy";
 import { registerAvatarRoutes } from "./avatarRoutes";
+import { registerMediaRoutes } from "./mediaRoutes";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 
@@ -61,6 +62,7 @@ export function createApp() {
 
   registerStorageProxy(app);
   registerAvatarRoutes(app);
+  registerMediaRoutes(app);
   registerOAuthRoutes(app);
   registerPhoneAuthRoutes(app);
   registerPasswordAuthRoutes(app);

@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, ilike, inArray, like, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, conversationMembers, conversations, InsertUser, messages, pushTokens, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, conversationMembers, conversations, InsertUser, messageMedia, messages, pushTokens, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -135,6 +135,24 @@ export async function listConversationsForUser(userId: number) {
     });
   }
   return result;
+}
+
+/** Stores attachment bytes in the database (used when object storage is not configured). */
+export async function saveMessageMedia(ownerId: number, mimeType: string, fileName: string, base64: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const rows = await db
+    .insert(messageMedia)
+    .values({ ownerId, mimeType, fileName, data: base64 })
+    .returning({ id: messageMedia.id });
+  return rows[0]?.id;
+}
+
+export async function getMessageMedia(id: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(messageMedia).where(eq(messageMedia.id, id)).limit(1);
+  return rows[0];
 }
 
 /** Searches message text inside the conversations the user is a member of. */

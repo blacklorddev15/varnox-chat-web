@@ -28,3 +28,7 @@ export type Appeal = typeof appeals.$inferSelect;
 // GET /api/avatar/:userId.
 export const userAvatars = pgTable("userAvatars", { userId: integer("userId").primaryKey(), mimeType: text("mimeType").notNull(), data: text("data").notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 export type UserAvatar = typeof userAvatars.$inferSelect;
+// Attachments (photos, voice notes) for deployments with no object storage, served by
+// GET /api/media/:id. Kept out of the messages table so message payloads stay small.
+export const messageMedia = pgTable("messageMedia", { id: serial("id").primaryKey(), ownerId: integer("ownerId").notNull(), mimeType: text("mimeType").notNull(), fileName: text("fileName"), data: text("data").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() });
+export type MessageMedia = typeof messageMedia.$inferSelect;

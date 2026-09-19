@@ -17,6 +17,14 @@ function getForgeConfig() {
   return { forgeUrl: forgeUrl.replace(/\/+$/, ""), forgeKey };
 }
 
+/**
+ * True when object storage credentials exist. When they do not, callers fall back to
+ * database-backed storage instead of failing the whole upload.
+ */
+export function isObjectStorageConfigured(): boolean {
+  return Boolean(ENV.forgeApiUrl && ENV.forgeApiKey);
+}
+
 function normalizeKey(relKey: string): string {
   return relKey.replace(/^\/+/, "");
 }

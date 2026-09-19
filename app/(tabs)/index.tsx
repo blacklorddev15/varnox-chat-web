@@ -25,6 +25,7 @@ import { ScreenContainer } from "@/components/screen-container";
 import { useColors } from "@/hooks/use-colors";
 import { useAuth } from "@/hooks/use-auth";
 import { appendMessage, filterConversations } from "@/lib/pulse-chat";
+import { prepareAttachment } from "@/lib/media-upload";
 import { getApiBaseUrl } from "@/constants/oauth";
 import { trpc } from "@/lib/trpc";
 
@@ -329,11 +330,14 @@ export default function HomeScreen() {
       const asset = result.assets[0];
       const kind = asset.type === "video" ? "video" : "image";
       if (!isAuthenticated) { await sendMessage({ text: kind === "video" ? "Video" : "Photo", kind, mediaUrl: asset.uri, mediaName: asset.fileName ?? undefined }); return; }
-      const base64 = await FileSystem.readAsStringAsync(asset.uri, { encoding: FileSystem.EncodingType.Base64 });
-      const uploaded = await uploadMedia.mutateAsync({ fileName: asset.fileName ?? `${kind}-${Date.now()}`, contentType: asset.mimeType ?? (kind === "video" ? "video/mp4" : "image/jpeg"), base64 });
+      const payload = await prepareAttachment(asset, kind);
+      if (!payload) { notify("Could not read that file"); return; }
+      const uploaded = await uploadMedia.mutateAsync(payload);
       await sendMessage({ text: kind === "video" ? "Video" : "Photo", kind, mediaUrl: uploaded.url, mediaName: uploaded.fileName });
       notify("Media sent");
-    } catch { notify("Media upload was cancelled or unavailable"); }
+    } catch (error) {
+      notify(error instanceof Error && error.message ? error.message : "Media upload was cancelled or unavailable");
+    }
   };
 
   const startVoiceNote = async () => {
