@@ -1144,9 +1144,9 @@ export async function conversationDisappearSeconds(conversationId: string) {
 
 // ---------------------------------------------------------------- presence
 /** A heartbeat stays trustworthy this long. Clients beat every 20s, so one miss is tolerated. */
-const PRESENCE_WINDOW_MS = 45_000;
+export const PRESENCE_WINDOW_MS = 45_000;
 /** How long one "typing" signal survives. The client re-sends it while the user keeps typing. */
-const TYPING_LEASE_MS = 8_000;
+export const TYPING_LEASE_MS = 8_000;
 
 export type PresenceView = {
   userId: number;
@@ -1187,6 +1187,38 @@ export async function recordPresence(userId: number, typingConversationId?: stri
  * and the reference app treats it the same way. Hiding last-seen must not silently disable the
  * indicator someone else is actively sending.
  */
+export type PresenceRow = {
+  userId: number;
+  lastSeenAt: Date | null;
+  typingConversationId: string | null;
+  typingUntil: Date | null;
+};
+
+/**
+ * Turns one stored row into what a given reader may see.
+ *
+ * Pure on purpose: the freshness window and the typing lease are exactly the kind of arithmetic
+ * that reads fine in review and shows the wrong thing in production, so both are tested without
+ * needing a database.
+ */
+export function presenceViewFor(
+  userId: number,
+  row: PresenceRow | undefined,
+  lastSeenHidden: boolean,
+  now: number,
+): PresenceView {
+  const lastSeenAt = row?.lastSeenAt ?? null;
+  const typing = Boolean(row?.typingUntil && row.typingUntil.getTime() > now && row.typingConversationId);
+  return {
+    userId,
+    // Hiding last-seen hides "online" too: they are the same disclosure.
+    online: !lastSeenHidden && Boolean(lastSeenAt && now - lastSeenAt.getTime() < PRESENCE_WINDOW_MS),
+    lastSeenAt: lastSeenHidden ? null : lastSeenAt,
+    // Typing is not gated by it - see the note above.
+    typingIn: typing ? (row?.typingConversationId ?? null) : null,
+  };
+}
+
 export async function readPresenceForUsers(userIds: number[]): Promise<PresenceView[]> {
   if (userIds.length === 0) return [];
   const db = await getDb();
@@ -1197,18 +1229,7 @@ export async function readPresenceForUsers(userIds: number[]): Promise<PresenceV
     const hidden = new Set(settings.filter((row) => row.lastSeen === 0).map((row) => row.userId));
     const byUser = new Map(rows.map((row) => [row.userId, row]));
     const now = Date.now();
-    return userIds.map((userId) => {
-      const row = byUser.get(userId);
-      const visible = !hidden.has(userId);
-      const lastSeenAt = row?.lastSeenAt ?? null;
-      const typing = Boolean(row?.typingUntil && row.typingUntil.getTime() > now && row.typingConversationId);
-      return {
-        userId,
-        online: visible && Boolean(lastSeenAt && now - lastSeenAt.getTime() < PRESENCE_WINDOW_MS),
-        lastSeenAt: visible ? lastSeenAt : null,
-        typingIn: typing ? (row?.typingConversationId ?? null) : null,
-      };
-    });
+    return userIds.map((userId) => presenceViewFor(userId, byUser.get(userId), hidden.has(userId), now));
   } catch (error) {
     console.warn("[Presence] read failed; has the presence table been migrated?", error);
     return [];
