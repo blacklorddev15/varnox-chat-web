@@ -44,8 +44,12 @@ yarn-error.*
 
 # Real secrets. Only `.env*.local` was ignored before, so a plain `.env` holding the database
 # password and JWT secret would have been committed to this public repository.
+#
+# env.txt is here too: the server reads it when .env is absent, and it is not obvious from the name
+# that it holds secrets, so it needs the same protection. Both travel inside the deployment zip.
 .env
 .env.*
+env.txt
 !.env.example
 
 # typescript

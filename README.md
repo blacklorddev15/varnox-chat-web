@@ -58,11 +58,18 @@ Both deployments read the same set. Get the values from
 
 ### Getting a filled-in file
 
-`.env` and `.env.example` both start with a dot and are hidden by many file managers and panels.
-[`env-template.txt`](env-template.txt) holds the same content under a name nothing hides. The server
-needs a file named exactly `.env`, in the same directory as `package.json`.
+The server reads **`.env`**, and if there is no `.env` it reads **`env.txt`** instead. Either name
+works, and `.env` wins when both are present.
 
-Never commit a filled-in `.env` — it holds your database password. `.gitignore` refuses it.
+`env.txt` exists because `.env` starts with a dot, and dot-files are hidden by default in many file
+managers, unzip tools and panel file browsers — which makes a file you have to edit by hand awkward
+to even find. Whichever one you end up with, it goes in the same directory as `package.json`.
+
+The deployment zip ships both, either of which you upload and fill in.
+[`.env.example`](.env.example) is the same content for reference.
+
+Never commit a filled-in copy — it holds your database password. `.gitignore` refuses `.env` and
+`env.txt` for exactly that reason.
 
 ---
 

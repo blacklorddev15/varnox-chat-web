@@ -1,4 +1,5 @@
-import "dotenv/config";
+// Must come first: loads .env, or env.txt when .env is absent. See the file for why.
+import "./loadEnv";
 import express from "express";
 import { createServer } from "http";
 import net from "net";
