@@ -1,0 +1,68 @@
+VARNOX CHAT - SERVER ENVIRONMENT
+================================
+
+This file has a normal name on purpose: `.env` and `.env.example` both start with a dot, and many
+file managers, panels and unzip tools hide those by default.
+
+THE SERVER READS A FILE NAMED EXACTLY `.env`. This one is just a visible copy.
+
+How to use it:
+  1. In the server root, create a new file named exactly:  .env
+     (In the Pterodactyl file manager: New File, type ".env", create it.)
+  2. Paste everything below the line marked CUT HERE into it.
+  3. Fill in the seven blanks.
+  4. Save, then Start the server.
+
+The same content is already in the zip as `.env` - if your tooling can see dot-files you can just
+upload that one and skip steps 1-2.
+
+Values come from: Vercel -> your project -> Settings -> Environment Variables
+
+
+------------------------------- CUT HERE -------------------------------------
+
+# ---------------------------------------------------------------- fill these in
+
+# PostgreSQL connection string, including sslmode=require for hosted providers.
+DATABASE_URL=
+
+# Signs session tokens, at least 32 characters. Use the SAME value as the Vercel deployment:
+# both servers share the database, and a different value signs out every existing user, because
+# their year-long tokens were signed with the other secret.
+JWT_SECRET=
+
+# Voice and video calls. The call screens are already built; without these three they open and
+# never connect. The server says so explicitly if they are missing.
+LIVEKIT_URL=
+LIVEKIT_API_KEY=
+LIVEKIT_API_SECRET=
+
+# Verification and password-reset email. Blank means those emails are logged instead.
+RESEND_API_KEY=
+
+# Platform OAuth sign-in only. Password and phone sign-in do not use it.
+VITE_APP_ID=
+
+# ---------------------------------------------------------------- already set
+
+# The first account, which is granted admin rights.
+OWNER_OPEN_ID=blacklorddev
+
+# Must be on a domain verified in Resend, or sends are rejected.
+RESEND_FROM=Varnox Chat <no-reply@varnoxapp.blacklord.tech>
+
+NODE_ENV=production
+
+# ---------------------------------------------------------------- optional
+
+# SMS verification. Without these, phone codes are logged rather than sent.
+VONAGE_API_KEY=
+VONAGE_API_SECRET=
+VONAGE_BRAND=
+
+# ---------------------------------------------------------------- leave alone
+
+# Pterodactyl supplies the allocated port as SERVER_PORT and the server reads it, so there is
+# nothing to set for the port. PORT wins if both are set.
+# Do NOT add VERCEL=1: when it is set the server deliberately does not listen at all, because on
+# Vercel it is loaded as a function instead of owning the port.
