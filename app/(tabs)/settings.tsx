@@ -7,6 +7,7 @@ import { ScreenContainer } from "@/components/screen-container";
 import { useColors } from "@/hooks/use-colors";
 import { useAuth } from "@/hooks/use-auth";
 import { trpc } from "@/lib/trpc";
+import { downloadAndroidApp } from "@/lib/apk";
 
 const menu = [
   { id: "account", icon: "person-outline" as const, title: "Account", subtitle: "Security notifications, change number" },
@@ -19,6 +20,7 @@ const menu = [
   { id: "blocked", icon: "block" as const, title: "Blocked contacts", subtitle: "Manage people you have blocked" },
   { id: "appeals", icon: "history" as const, title: "Appeal history", subtitle: "Track account review requests" },
   { id: "support", icon: "support-agent" as const, title: "Varnox Support Bot", subtitle: "Get help with login, privacy, and safety" },
+  { id: "download", icon: "android" as const, title: "Download Android app", subtitle: "Install the APK - message alerts included" },
   { id: "admin", icon: "admin-panel-settings" as const, title: "Admin moderation", subtitle: "Manage bans and suspensions" },
 ];
 
@@ -37,6 +39,7 @@ export default function SettingsScreen() {
     if (item.id === "verify-email") return router.push("/verify-email");
     if (item.id === "support") return router.push("/chat/support");
     if (item.id === "appeals") return router.push("/chat/appeals");
+    if (item.id === "download") return downloadAndroidApp();
     if (item.id === "admin") return router.push("/admin");
     return router.push({ pathname: "/chat/setting-detail", params: { section: item.id, title: item.title, subtitle: item.subtitle } });
   };

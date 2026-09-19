@@ -158,7 +158,17 @@ export default function HomeScreen() {
       if (Platform.OS === "web") setWebNotificationStatus("unsupported");
       return;
     }
-    setWebNotificationStatus(window.Notification.permission);
+    const syncPermission = () => setWebNotificationStatus(window.Notification.permission);
+    syncPermission();
+    // The permission can be granted outside React's lifetime - the Android shell asks
+    // through a system dialog - so re-read it whenever the page regains focus. Without
+    // this the status stays stale and alerts never start.
+    window.addEventListener("focus", syncPermission);
+    document.addEventListener("visibilitychange", syncPermission);
+    return () => {
+      window.removeEventListener("focus", syncPermission);
+      document.removeEventListener("visibilitychange", syncPermission);
+    };
   }, []);
 
   useEffect(() => {
