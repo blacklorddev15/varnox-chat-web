@@ -299,6 +299,21 @@ export function CallProvider({ children }: { children: ReactNode }) {
     };
   }, [phase, session]);
 
+  // Tell the Android shell when a call is running. It holds a wake lock so audio survives the
+  // screen going off, and promotes its foreground service so Android 14+ will let it keep the
+  // microphone. Re-runs on every phase change on purpose: if the promotion is refused while
+  // the app is backgrounded, answering brings it forward and the next transition retries.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const bridge = (window as unknown as { __varnoxCall?: { setActive: (active: boolean) => void } }).__varnoxCall;
+    if (!bridge) return;
+    try {
+      bridge.setActive(phase !== "idle");
+    } catch {
+      // native refused the promotion; the call itself is unaffected
+    }
+  }, [phase]);
+
   // Leaving the app entirely (web tab closed) should not leave a ringing call behind.
   useEffect(() => {
     if (typeof window === "undefined") return;
