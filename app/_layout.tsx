@@ -34,6 +34,14 @@ export default function RootLayout() {
   const router = useRouter();
   const segments = useSegments();
   const { user, loading } = useAuth();
+
+  // Registering the service worker is what makes the site installable as an app. Production
+  // only - in development it would sit in front of the hot-reload bundle.
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+    if (process.env.NODE_ENV !== "production") return;
+    void navigator.serviceWorker.register("/sw.js").catch(() => undefined);
+  }, []);
   const initialInsets = initialWindowMetrics?.insets ?? DEFAULT_WEB_INSETS;
   const initialFrame = initialWindowMetrics?.frame ?? DEFAULT_WEB_FRAME;
 
