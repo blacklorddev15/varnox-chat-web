@@ -28,6 +28,7 @@ import { appendMessage, filterConversations } from "@/lib/pulse-chat";
 import { prepareAttachment } from "@/lib/media-upload";
 import { getApiBaseUrl } from "@/constants/oauth";
 import { trpc } from "@/lib/trpc";
+import { useCall } from "@/lib/call-context";
 
 type Conversation = {
   id: string;
@@ -171,6 +172,8 @@ export default function HomeScreen() {
   const uploadMedia = trpc.media.upload.useMutation();
   const registerPush = trpc.push.register.useMutation();
   const peopleSearch = trpc.people.search.useQuery({ query: contactQuery }, { enabled: isAuthenticated && contactQuery.trim().length >= 2 });
+
+  const { startCall } = useCall();
 
   const notify = (message: string) => {
     setToast(message);
@@ -387,8 +390,8 @@ export default function HomeScreen() {
             <Pressable onPress={() => setSelectedId(null)} style={({ pressed }) => [styles.backButton, pressed && styles.pressed]}><MaterialIcons name="arrow-back-ios" size={20} color={colors.foreground} /></Pressable>
             <Avatar item={selectedChat} size={40} />
             <Pressable onPress={() => router.push({ pathname: "/chat/group-info", params: { conversationId: selectedChat.id } })} style={styles.chatTitleBlock}><Text style={[styles.chatTitle, { color: colors.foreground }]}>{selectedChat.name}</Text><Text style={[styles.chatSubtitle, { color: selectedChat.online ? colors.success : colors.muted }]}>{selectedChat.group ? "tap for group info" : isAuthenticated ? "syncing every few seconds" : selectedChat.online ? "active now" : "last seen recently"}</Text></Pressable>
-            <IconButton name="videocam" color={colors.primary} onPress={() => notify(`Starting a video call with ${selectedChat.name}`)} />
-            <IconButton name="call" color={colors.primary} onPress={() => notify(`Calling ${selectedChat.name}`)} />
+            <IconButton name="videocam" color={colors.primary} onPress={() => void startCall({ conversationId: selectedChat.id, kind: "video", peerName: selectedChat.name })} />
+            <IconButton name="call" color={colors.primary} onPress={() => void startCall({ conversationId: selectedChat.id, kind: "audio", peerName: selectedChat.name })} />
           </View>
           <FlatList data={chatMessages} keyExtractor={(item) => item.id} contentContainerStyle={styles.messageList} showsVerticalScrollIndicator={false} ListHeaderComponent={<View style={styles.encryptionNote}><MaterialIcons name="lock" size={13} color={colors.muted} /><Text style={[styles.encryptionText, { color: colors.muted }]}>{isAuthenticated ? "Live sync enabled" : "Messages are private and secure"}</Text></View>} renderItem={({ item }) => <Pressable onLongPress={() => setActiveMessageId(activeMessageId === item.id ? null : item.id)} style={[styles.messageRow, item.mine ? styles.messageRowMine : styles.messageRowTheirs]}><View style={[styles.bubble, item.mine ? { backgroundColor: colors.primary } : { backgroundColor: colors.surface, borderColor: colors.border, borderWidth: 1 }]}>
             {item.mediaUrl && item.kind === "image" ? <Image source={{ uri: resolveMediaUrl(item.mediaUrl) }} style={styles.messageImage} resizeMode="cover" /> : null}

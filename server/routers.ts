@@ -145,6 +145,21 @@ export const appRouter = router({
     }),
     incoming: protectedProcedure.query(async ({ ctx }) => (await getIncomingCallForUser(ctx.user.id)) ?? null),
     history: protectedProcedure.input(z.object({ limit: z.number().int().min(1).max(50).default(30) }).optional()).query(({ ctx, input }) => listRecentCalls(ctx.user.id, input?.limit ?? 30)),
+    // A shareable room. The link carries only an unguessable room name and anyone signed in
+    // who opens it gets their own token, so no row is written until somebody actually joins.
+    createLink: protectedProcedure.input(z.object({ kind: z.enum(["audio", "video"]).default("audio") })).mutation(async ({ ctx, input }) => {
+      if (!isLiveKitConfigured()) throw new Error("Calls are not configured on this server.");
+      const room = `link_${crypto.randomUUID()}`;
+      const displayName = ctx.user.name?.trim() || ctx.user.username || `User ${ctx.user.id}`;
+      const token = await createRoomToken(`user-${ctx.user.id}`, displayName, room);
+      return { room, token, url: liveKitUrl(), kind: input.kind };
+    }),
+    joinLink: protectedProcedure.input(z.object({ room: z.string().min(8).max(128) })).mutation(async ({ ctx, input }) => {
+      if (!input.room.startsWith("link_")) throw new Error("That call link is not valid.");
+      const displayName = ctx.user.name?.trim() || ctx.user.username || `User ${ctx.user.id}`;
+      const token = await createRoomToken(`user-${ctx.user.id}`, displayName, input.room);
+      return { room: input.room, token, url: liveKitUrl(), kind: "audio" as const };
+    }),
   }),
   profile: router({
     update: protectedProcedure.input(z.object({ name: z.string().trim().min(1).max(60).optional(), about: z.string().trim().max(140).optional(), phone: z.string().trim().regex(/^\+?\d{7,15}$/, "Enter a valid phone number").optional() })).mutation(({ ctx, input }) => updateUserProfile(ctx.user.id, input)),
