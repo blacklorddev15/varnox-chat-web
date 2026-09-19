@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { isObjectStorageConfigured } from "../storage";
+import { isObjectStorageConfigured } from "./storage";
 import { MAX_DB_MEDIA_BYTES } from "./_core/mediaRoutes";
 import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies";
