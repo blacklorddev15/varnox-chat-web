@@ -27,13 +27,29 @@ const EXCHANGE_TOKEN_PATH = `/webdev.v1.WebDevAuthPublicService/ExchangeToken`;
 const GET_USER_INFO_PATH = `/webdev.v1.WebDevAuthPublicService/GetUserInfo`;
 const GET_USER_INFO_WITH_JWT_PATH = `/webdev.v1.WebDevAuthPublicService/GetUserInfoWithJwt`;
 
+/**
+ * The Manus OAuth server is optional for this deployment: users sign in with a username and
+ * password, or with a code emailed to them, so the OAuth flow is never reached.
+ *
+ * A missing OAUTH_SERVER_URL used to be reported with console.error in the constructor,
+ * which put a red "ERROR" line in the production logs on every cold start for a condition
+ * that is expected here. It is only a real problem when the flow is actually invoked, so
+ * the check now lives at those call sites and gives a clear message instead of an obscure
+ * axios failure against an undefined base URL.
+ */
+function requireOAuthServerUrl(): string {
+  if (!ENV.oAuthServerUrl) {
+    throw new Error(
+      "OAUTH_SERVER_URL is not configured. This deployment signs users in with a username and password or an emailed code, so the Manus OAuth flow is unavailable.",
+    );
+  }
+  return ENV.oAuthServerUrl;
+}
+
 class OAuthService {
   constructor(private client: ReturnType<typeof axios.create>) {
-    console.log("[OAuth] Initialized with baseURL:", ENV.oAuthServerUrl);
-    if (!ENV.oAuthServerUrl) {
-      console.error(
-        "[OAuth] ERROR: OAUTH_SERVER_URL is not configured! Set OAUTH_SERVER_URL environment variable.",
-      );
+    if (ENV.oAuthServerUrl) {
+      console.log("[OAuth] Initialized with baseURL:", ENV.oAuthServerUrl);
     }
   }
 
@@ -43,6 +59,7 @@ class OAuthService {
   }
 
   async getTokenByCode(code: string, state: string): Promise<ExchangeTokenResponse> {
+    requireOAuthServerUrl();
     const payload: ExchangeTokenRequest = {
       clientId: ENV.appId,
       grantType: "authorization_code",
@@ -56,6 +73,7 @@ class OAuthService {
   }
 
   async getUserInfoByToken(token: ExchangeTokenResponse): Promise<GetUserInfoResponse> {
+    requireOAuthServerUrl();
     const { data } = await this.client.post<GetUserInfoResponse>(GET_USER_INFO_PATH, {
       accessToken: token.accessToken,
     });
@@ -216,6 +234,7 @@ class SDKServer {
   }
 
   async getUserInfoWithJwt(jwtToken: string): Promise<GetUserInfoWithJwtResponse> {
+    requireOAuthServerUrl();
     const payload: GetUserInfoWithJwtRequest = {
       jwtToken,
       projectId: ENV.appId,
