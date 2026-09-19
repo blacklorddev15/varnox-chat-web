@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, TextInput, useWindowDimensions, View } from "react-native";
+import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { ScreenContainer } from "@/components/screen-container";
@@ -20,9 +20,7 @@ export default function LoginScreen() {
   const updateProfileMutation = trpc.profile.update.useMutation();
   // Welcome landing stage first, auth form behind it. Both new and returning users land here.
   const [stage, setStage] = useState<"welcome" | "form">("welcome");
-  // Keeps the ring from crowding short screens: it scales with the viewport, never past 246.
-  const { width: windowWidth } = useWindowDimensions();
-  const doodleSize = Math.max(150, Math.min(246, Math.round(windowWidth * 0.62)));
+
   const [pendingAuth, setPendingAuth] = useState<{ sessionToken: string; user: Auth.User } | null>(null);
   const [phone, setPhone] = useState(""); const [email, setEmail] = useState(""); const [code, setCode] = useState(""); const [requestId, setRequestId] = useState<string | null>(null); const [phoneMasked, setPhoneMasked] = useState(""); const [emailMasked, setEmailMasked] = useState(""); const [devCode, setDevCode] = useState<string | null>(null);
   const [busy, setBusy] = useState(false); const [cooldown, setCooldown] = useState(0); const [error, setError] = useState<string | null>(null);
@@ -65,7 +63,11 @@ export default function LoginScreen() {
   const verifyCode = async () => { if (!requestId) return; setError(null); if (code.trim().length < 4) { setError("Enter the code sent to your email."); return; } try { setBusy(true); await finishLogin(await Api.checkPhoneVerification(phone, email, requestId, code)); } catch (cause) { handleAuthError(cause); } finally { setBusy(false); } };
   const resetPhone = () => { setRequestId(null); setCode(""); setDevCode(null); setError(null); };
 
-  const welcome = (<View style={styles.welcome}><View style={styles.brandRowCentered}><Text style={[styles.brandName, { color: colors.foreground }]}>VARNOX</Text><View style={[styles.brandTag, { borderColor: colors.primary }]}><Text style={[styles.brandTagText, { color: colors.primary }]}>APP</Text></View></View><View style={styles.doodleWrap}><DoodleCircle colors={colors} size={doodleSize} /></View><Text style={[styles.welcomeLegal, { color: colors.muted }]}>Read our <Text style={{ color: colors.primary }}>Privacy Policy</Text>. Tap “VARNOX APP” to accept the <Text style={{ color: colors.primary }}>Terms of Service</Text>.</Text><PrimaryButton label="Get started" onPress={() => { setError(null); setStage("form"); }} busy={false} colors={colors} /><Text style={[styles.welcomeFooter, { color: colors.muted }]}>License</Text></View>);
+  const openForm = () => { setError(null); setStage("form"); };
+  const openLogin = () => { setAuthMode("password"); setPasswordMode("login"); setError(null); setStage("form"); };
+
+  // Welcome landing screen: brand, promise, one CTA. The auth form sits behind "Get started".
+  const welcome = (<View style={styles.welcome}><View style={styles.premiumTop}><Text style={[styles.eyebrow, { color: colors.muted }]}>PRIVATE MESSAGING</Text><Text style={[styles.premiumWordmark, { color: colors.foreground }]}>VARNOX</Text></View><View style={styles.heroWrap}><View style={styles.haloOuter} /><View style={styles.haloMid} /><View style={[styles.medallionRing, { borderColor: "rgba(251,191,36,0.26)" }]}><View style={[styles.medallionCore, { backgroundColor: "rgba(251,191,36,0.08)", borderColor: "rgba(251,191,36,0.38)" }]}><MaterialIcons name="forum" size={44} color={colors.primary} /></View></View></View><View style={styles.copyBlock}><Text style={[styles.premiumHeadline, { color: colors.foreground }]}>Private by design.</Text><Text style={[styles.premiumSubline, { color: colors.muted }]}>Messages, calls and updates for the people you choose — and nobody else.</Text></View><PrimaryButton label="Get started" onPress={openForm} busy={false} colors={colors} tone="inverse" /><Pressable onPress={openLogin} style={styles.quietLink}><Text style={[styles.quietText, { color: colors.muted }]}>Already have an account? <Text style={{ color: colors.primary }}>Log in</Text></Text></Pressable><Text style={[styles.premiumLegal, { color: colors.muted }]}>Read our <Text style={{ color: colors.primary }}>Privacy Policy</Text> and <Text style={{ color: colors.primary }}>Terms of Service</Text>.</Text><Text style={[styles.premiumFooter, { color: colors.muted }]}>License</Text></View>);
 
   const authForm = (<View style={styles.content}><Pressable onPress={() => { setStage("welcome"); setError(null); }} hitSlop={12} style={styles.backRow}><MaterialIcons name="arrow-back" size={22} color={colors.foreground} /><Text style={[styles.backText, { color: colors.foreground }]}>Back</Text></Pressable><View style={styles.brandRow}><Text style={[styles.brandName, { color: colors.foreground }]}>VARNOX</Text><View style={[styles.brandTag, { borderColor: colors.primary }]}><Text style={[styles.brandTagText, { color: colors.primary }]}>APP</Text></View></View><Text style={[styles.title, { color: colors.foreground }]}>Your conversations, private and close.</Text><Text style={[styles.subtitle, { color: colors.muted }]}>Create an account or sign in to continue.</Text>
     <View style={[styles.modeSwitch, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => { setAuthMode("password"); setPasswordMode("login"); setError(null); }} style={[styles.modeButton, authMode === "password" && passwordMode === "login" && { backgroundColor: colors.primary }]}><Text style={[styles.modeText, { color: authMode === "password" && passwordMode === "login" ? "#fff" : colors.muted }]}>Log in</Text></Pressable><Pressable onPress={() => { setAuthMode("password"); setPasswordMode("register"); setError(null); }} style={[styles.modeButton, authMode === "password" && passwordMode === "register" && { backgroundColor: colors.primary }]}><Text style={[styles.modeText, { color: authMode === "password" && passwordMode === "register" ? "#fff" : colors.muted }]}>Register</Text></Pressable></View>
@@ -75,59 +77,7 @@ export default function LoginScreen() {
   return <ScreenContainer edges={["top", "bottom", "left", "right"]} containerClassName="bg-background"><KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === "ios" ? "padding" : undefined}>{stage === "welcome" ? welcome : authForm}</KeyboardAvoidingView></ScreenContainer>;
 }
 
-function PrimaryButton({ label, onPress, busy, colors }: { label: string; onPress: () => void; busy: boolean; colors: ReturnType<typeof useColors> }) { return <Pressable disabled={busy} onPress={onPress} style={({ pressed }) => [styles.primaryButton, { backgroundColor: colors.primary }, pressed && styles.pressed, busy && styles.disabled]}>{busy ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryText}>{label}</Text>}</Pressable>; }
+/** `tone="inverse"` is the light-on-dark button used by the welcome screen. */
+function PrimaryButton({ label, onPress, busy, colors, tone = "primary" }: { label: string; onPress: () => void; busy: boolean; colors: ReturnType<typeof useColors>; tone?: "primary" | "inverse" }) { const inverse = tone === "inverse"; return <Pressable disabled={busy} onPress={onPress} style={({ pressed }) => [styles.primaryButton, inverse ? [styles.inverseButton, { backgroundColor: colors.foreground }] : { backgroundColor: colors.primary }, pressed && styles.pressed, busy && styles.disabled]}>{busy ? <ActivityIndicator color={inverse ? colors.background : "#fff"} /> : <Text style={[styles.primaryText, inverse && { color: colors.background }]}>{label}</Text>}</Pressable>; }
 
-const styles = StyleSheet.create({ flex: { flex: 1 }, content: { flex: 1, paddingHorizontal: 24, paddingTop: 34 }, logo: { width: 62, height: 62, borderRadius: 20, alignItems: "center", justifyContent: "center", marginBottom: 20 }, brandRow: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 20 }, brandName: { fontSize: 34, fontWeight: "800", letterSpacing: 2.5 }, brandTag: { borderWidth: 1, borderRadius: 8, paddingHorizontal: 7, paddingVertical: 3 }, brandTagText: { fontSize: 11, fontWeight: "800", letterSpacing: 1 }, kicker: { fontSize: 12, fontWeight: "800", letterSpacing: 1.6, marginBottom: 10 }, title: { fontSize: 32, lineHeight: 38, fontWeight: "800", maxWidth: 340 }, subtitle: { fontSize: 16, lineHeight: 23, marginTop: 10, maxWidth: 340 }, modeSwitch: { flexDirection: "row", padding: 4, borderRadius: 16, borderWidth: 1, marginTop: 22 }, modeButton: { flex: 1, minHeight: 38, borderRadius: 12, alignItems: "center", justifyContent: "center", paddingHorizontal: 5 }, modeText: { fontSize: 14, fontWeight: "800", textAlign: "center" }, form: { marginTop: 22 }, label: { fontSize: 14, fontWeight: "700", marginBottom: 9 }, fieldGap: { marginTop: 15 }, input: { height: 52, borderWidth: 1, borderRadius: 15, paddingHorizontal: 15, fontSize: 16 }, codeInput: { letterSpacing: 7, fontWeight: "700", textAlign: "center", marginTop: 18 }, helper: { fontSize: 13, lineHeight: 18, marginTop: 9 }, devCode: { fontSize: 14, fontWeight: "800", marginTop: 12 }, primaryButton: { height: 53, borderRadius: 16, alignItems: "center", justifyContent: "center", marginTop: 20 }, primaryText: { color: "#fff", fontSize: 16, fontWeight: "800" }, secondaryButton: { alignItems: "center", paddingVertical: 10 }, secondaryText: { fontSize: 14, fontWeight: "700" }, error: { fontSize: 13, lineHeight: 18, marginTop: 17 }, statusCard: { flexDirection: "row", gap: 12, borderWidth: 1, borderRadius: 16, padding: 14, marginTop: 18 }, statusIcon: { width: 38, height: 38, borderRadius: 19, alignItems: "center", justifyContent: "center" }, statusCopy: { flex: 1 }, statusTitle: { fontSize: 15, fontWeight: "800" }, statusBody: { fontSize: 12, lineHeight: 17, marginTop: 4 }, statusHelp: { fontSize: 12, lineHeight: 17, fontWeight: "700", marginTop: 6 }, legal: { fontSize: 12, lineHeight: 17, marginTop: "auto", paddingBottom: 20, textAlign: "center" }, pressed: { transform: [{ scale: 0.98 }], opacity: 0.92 }, welcome: { flex: 1, paddingHorizontal: 24, paddingTop: 30, paddingBottom: 24 }, brandRowCentered: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 6 }, doodleWrap: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 16 }, welcomeLegal: { fontSize: 13, lineHeight: 19, textAlign: "center", marginBottom: 18 }, welcomeFooter: { fontSize: 12, fontWeight: "800", letterSpacing: 2.2, textAlign: "center", marginTop: 22 }, backRow: { flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 12 }, backText: { fontSize: 14, fontWeight: "700" }, disabled: { opacity: 0.65 } });
-
-/**
- * The welcome illustration: a ring of outline glyphs around a chat mark.
- *
- * Built from the icon font the app already ships rather than a raster asset, so it scales on
- * any screen and adds no download. Purely decorative - hidden from screen readers.
- */
-const DOODLE_ICONS = [
-  "chat-bubble-outline",
-  "favorite-border",
-  "star-border",
-  "notifications-none",
-  "photo-camera",
-  "music-note",
-  "cake",
-  "directions-bike",
-  "flight",
-  "headphones",
-  "wifi",
-  "place",
-  "local-cafe",
-  "brush",
-  "pets",
-  "sports-esports",
-  "local-pizza",
-  "event",
-] as const;
-
-function DoodleCircle({ colors, size = 246 }: { colors: ReturnType<typeof useColors>; size?: number }) {
-  const center = size / 2;
-  const orbit = size * 0.4;
-  const iconSize = Math.round(size * 0.095);
-  const core = size * 0.34;
-  return (
-    <View accessible={false} importantForAccessibility="no-hide-descendants" style={{ width: size, height: size, alignItems: "center", justifyContent: "center" }}>
-      <View style={{ width: core, height: core, borderRadius: core / 2, borderWidth: 1, borderColor: colors.border, alignItems: "center", justifyContent: "center" }}>
-        <MaterialIcons name="forum" size={core * 0.44} color={colors.muted} />
-      </View>
-      {DOODLE_ICONS.map((name, index) => {
-        const angle = (index / DOODLE_ICONS.length) * Math.PI * 2 - Math.PI / 2;
-        return (
-          <MaterialIcons
-            key={name}
-            name={name}
-            size={iconSize}
-            color={colors.muted}
-            style={{ position: "absolute", left: center + Math.cos(angle) * orbit - iconSize / 2, top: center + Math.sin(angle) * orbit - iconSize / 2, opacity: 0.7 }}
-          />
-        );
-      })}
-    </View>
-  );
-}
+const styles = StyleSheet.create({ flex: { flex: 1 }, content: { flex: 1, paddingHorizontal: 24, paddingTop: 34 }, logo: { width: 62, height: 62, borderRadius: 20, alignItems: "center", justifyContent: "center", marginBottom: 20 }, brandRow: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 20 }, brandName: { fontSize: 34, fontWeight: "800", letterSpacing: 2.5 }, brandTag: { borderWidth: 1, borderRadius: 8, paddingHorizontal: 7, paddingVertical: 3 }, brandTagText: { fontSize: 11, fontWeight: "800", letterSpacing: 1 }, kicker: { fontSize: 12, fontWeight: "800", letterSpacing: 1.6, marginBottom: 10 }, title: { fontSize: 32, lineHeight: 38, fontWeight: "800", maxWidth: 340 }, subtitle: { fontSize: 16, lineHeight: 23, marginTop: 10, maxWidth: 340 }, modeSwitch: { flexDirection: "row", padding: 4, borderRadius: 16, borderWidth: 1, marginTop: 22 }, modeButton: { flex: 1, minHeight: 38, borderRadius: 12, alignItems: "center", justifyContent: "center", paddingHorizontal: 5 }, modeText: { fontSize: 14, fontWeight: "800", textAlign: "center" }, form: { marginTop: 22 }, label: { fontSize: 14, fontWeight: "700", marginBottom: 9 }, fieldGap: { marginTop: 15 }, input: { height: 52, borderWidth: 1, borderRadius: 15, paddingHorizontal: 15, fontSize: 16 }, codeInput: { letterSpacing: 7, fontWeight: "700", textAlign: "center", marginTop: 18 }, helper: { fontSize: 13, lineHeight: 18, marginTop: 9 }, devCode: { fontSize: 14, fontWeight: "800", marginTop: 12 }, primaryButton: { height: 53, borderRadius: 16, alignItems: "center", justifyContent: "center", marginTop: 20 }, primaryText: { color: "#fff", fontSize: 16, fontWeight: "800" }, secondaryButton: { alignItems: "center", paddingVertical: 10 }, secondaryText: { fontSize: 14, fontWeight: "700" }, error: { fontSize: 13, lineHeight: 18, marginTop: 17 }, statusCard: { flexDirection: "row", gap: 12, borderWidth: 1, borderRadius: 16, padding: 14, marginTop: 18 }, statusIcon: { width: 38, height: 38, borderRadius: 19, alignItems: "center", justifyContent: "center" }, statusCopy: { flex: 1 }, statusTitle: { fontSize: 15, fontWeight: "800" }, statusBody: { fontSize: 12, lineHeight: 17, marginTop: 4 }, statusHelp: { fontSize: 12, lineHeight: 17, fontWeight: "700", marginTop: 6 }, legal: { fontSize: 12, lineHeight: 17, marginTop: "auto", paddingBottom: 20, textAlign: "center" }, pressed: { transform: [{ scale: 0.98 }], opacity: 0.92 }, welcome: { flex: 1, paddingHorizontal: 24, paddingTop: 26, paddingBottom: 22 }, premiumTop: { alignItems: "center", marginTop: 8 }, eyebrow: { fontSize: 10, fontWeight: "700", letterSpacing: 3.4, marginBottom: 12 }, premiumWordmark: { fontSize: 31, fontWeight: "800", letterSpacing: 7 }, heroWrap: { flex: 1, alignItems: "center", justifyContent: "center" }, haloOuter: { position: "absolute", width: 320, height: 320, borderRadius: 160, backgroundColor: "rgba(251,191,36,0.04)" }, haloMid: { position: "absolute", width: 228, height: 228, borderRadius: 114, backgroundColor: "rgba(251,191,36,0.05)" }, medallionRing: { width: 168, height: 168, borderRadius: 84, borderWidth: 1, alignItems: "center", justifyContent: "center" }, medallionCore: { width: 116, height: 116, borderRadius: 58, borderWidth: 1, alignItems: "center", justifyContent: "center" }, copyBlock: { alignItems: "center", marginBottom: 20 }, premiumHeadline: { fontSize: 27, lineHeight: 33, fontWeight: "800", letterSpacing: -0.4 }, premiumSubline: { fontSize: 13, lineHeight: 19, textAlign: "center", marginTop: 9 }, inverseButton: { height: 56, borderRadius: 16, shadowColor: "#000", shadowOpacity: 0.45, shadowRadius: 16, shadowOffset: { width: 0, height: 8 }, elevation: 6 }, quietLink: { alignItems: "center", paddingVertical: 12 }, quietText: { fontSize: 12 }, premiumLegal: { fontSize: 11, lineHeight: 16, textAlign: "center" }, premiumFooter: { fontSize: 10, fontWeight: "700", letterSpacing: 2.4, textAlign: "center", marginTop: 14, opacity: 0.75 }, backRow: { flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 12 }, backText: { fontSize: 14, fontWeight: "700" }, disabled: { opacity: 0.65 } });
