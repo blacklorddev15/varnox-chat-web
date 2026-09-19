@@ -19,12 +19,30 @@ export type User = {
   lastSignedIn: Date;
 };
 
+/**
+ * Browser storage for the session token.
+ *
+ * The web client used to discard the token the server returns at sign-in and rely purely on
+ * the httpOnly cookie. Any cookie policy that drops it (a public-suffix domain, WebView cookie
+ * settings, ITP, an expired session after the page was already open) then left the cached user
+ * making the UI look signed in while every authenticated request failed.
+ */
+function webStorage(): Storage | null {
+  if (Platform.OS !== "web" || typeof window === "undefined") return null;
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
 export async function getSessionToken(): Promise<string | null> {
   try {
-    // Web platform uses cookie-based auth, no manual token management needed
-    if (Platform.OS === "web") {
-      console.log("[Auth] Web platform uses cookie-based auth, skipping token retrieval");
-      return null;
+    const storage = webStorage();
+    if (storage) {
+      const stored = storage.getItem(SESSION_TOKEN_KEY);
+      console.log("[Auth] Web session token:", stored ? "present" : "missing");
+      return stored;
     }
 
     // Use SecureStore for native
@@ -43,9 +61,10 @@ export async function getSessionToken(): Promise<string | null> {
 
 export async function setSessionToken(token: string): Promise<void> {
   try {
-    // Web platform uses cookie-based auth, no manual token management needed
-    if (Platform.OS === "web") {
-      console.log("[Auth] Web platform uses cookie-based auth, skipping token storage");
+    const storage = webStorage();
+    if (storage) {
+      storage.setItem(SESSION_TOKEN_KEY, token);
+      console.log("[Auth] Web session token stored");
       return;
     }
 
@@ -61,9 +80,10 @@ export async function setSessionToken(token: string): Promise<void> {
 
 export async function removeSessionToken(): Promise<void> {
   try {
-    // Web platform uses cookie-based auth, logout is handled by server clearing cookie
-    if (Platform.OS === "web") {
-      console.log("[Auth] Web platform uses cookie-based auth, skipping token removal");
+    const storage = webStorage();
+    if (storage) {
+      storage.removeItem(SESSION_TOKEN_KEY);
+      console.log("[Auth] Web session token removed");
       return;
     }
 

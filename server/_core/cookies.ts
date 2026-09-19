@@ -64,7 +64,9 @@ export function getSessionCookieOptions(
     domain,
     httpOnly: true,
     path: "/",
-    sameSite: "none",
+    // "lax" rather than "none": the API is called same-origin from the app, and None requires
+    // Secure on every browser and is refused outright by third-party cookie policies.
+    sameSite: "lax",
     secure: isSecureRequest(req),
   };
 }
