@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
 import {
   FlatList,
   Image,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -23,12 +24,13 @@ import * as FileSystem from "expo-file-system/legacy";
 import { createAudioPlayer, RecordingPresets, requestRecordingPermissionsAsync, setAudioModeAsync, useAudioRecorder, useAudioRecorderState } from "expo-audio";
 
 import { ScreenContainer } from "@/components/screen-container";
+import { VideoMessage } from "@/components/video-message";
 import { useColors } from "@/hooks/use-colors";
 import { useAppVisible } from "@/hooks/use-app-visible";
 import { useRealtime } from "@/hooks/use-realtime";
 import { useAuth } from "@/hooks/use-auth";
 import { appendMessage, filterConversations } from "@/lib/pulse-chat";
-import { prepareAttachment } from "@/lib/media-upload";
+import { MAX_ATTACHMENT_BYTES, pickDocumentFile, prepareAttachment, prepareDocument } from "@/lib/media-upload";
 import { getApiBaseUrl } from "@/constants/oauth";
 import { trpc } from "@/lib/trpc";
 import { useCall } from "@/lib/call-context";
@@ -62,6 +64,9 @@ type Message = {
   kind?: "text" | "image" | "video" | "file" | "voice";
   mediaUrl?: string;
   mediaName?: string;
+  // Stored server-side all along; carried through so attachments can be labelled by type instead
+  // of every one of them reading "Shared media".
+  mediaMime?: string;
   voiceDurationMs?: number;
   starred?: boolean;
   viewOnce?: boolean;
@@ -155,6 +160,28 @@ function IconButton({ name, color, onPress }: { name: React.ComponentProps<typeo
   return <Pressable onPress={onPress} style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]} hitSlop={8}><MaterialIcons name={name} size={23} color={color} /></Pressable>;
 }
 
+/**
+ * Icon and human label for an attachment, from its MIME type.
+ *
+ * Falls back to a generic file rather than guessing, because a wrong icon (a spreadsheet that says
+ * "Photo") is worse than a neutral one.
+ */
+type IconName = ComponentProps<typeof MaterialIcons>["name"];
+
+function attachmentKind(mime?: string): { icon: IconName; label: string } {
+  const type = (mime ?? "").toLowerCase();
+  if (type.startsWith("image/")) return { icon: "image", label: "Photo" };
+  if (type.startsWith("video/")) return { icon: "movie", label: "Video" };
+  if (type.startsWith("audio/")) return { icon: "audiotrack", label: "Audio" };
+  if (type === "application/pdf") return { icon: "picture-as-pdf", label: "PDF document" };
+  if (/zip|compressed|tar|rar|7z/.test(type)) return { icon: "folder-zip", label: "Archive" };
+  if (/word|opendocument\.text|msword/.test(type)) return { icon: "description", label: "Document" };
+  if (/sheet|excel|csv/.test(type)) return { icon: "table-chart", label: "Spreadsheet" };
+  if (/presentation|powerpoint/.test(type)) return { icon: "slideshow", label: "Presentation" };
+  if (type.startsWith("text/")) return { icon: "article", label: "Text file" };
+  return { icon: "insert-drive-file", label: "File" };
+}
+
 function resolveMediaUrl(url?: string) {
   if (!url) return undefined;
   if (url.startsWith("http") || url.startsWith("file:") || url.startsWith("blob:")) return url;
@@ -187,6 +214,8 @@ export default function HomeScreen() {
   const [forwarding, setForwarding] = useState<Message | null>(null);
   const [rowMenuId, setRowMenuId] = useState<string | null>(null);
   const [oncePreview, setOncePreview] = useState<string | null>(null);
+  const [onceVideo, setOnceVideo] = useState<string | null>(null);
+  const [showAttach, setShowAttach] = useState(false);
   const [showTimer, setShowTimer] = useState(false);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [contactQuery, setContactQuery] = useState("");
@@ -503,7 +532,9 @@ export default function HomeScreen() {
     const localMessage: Message = { id: `new-${Date.now()}`, text: trimmed || override?.text || "Shared media", time, mine: true, read: true, viewOnce, quote: replyTo ? { id: replyTo.id, body: replyTo.text, kind: "text", senderId: user?.id ?? 0, senderName: replyTo.senderName, deleted: false } : undefined, ...override };
     if (isAuthenticated) {
       try {
-        await sendRemoteMessage.mutateAsync({ conversationId: selectedId, body: localMessage.text, kind: localMessage.kind ?? "text", mediaUrl: localMessage.mediaUrl, mediaName: localMessage.mediaName, voiceDurationMs: localMessage.voiceDurationMs, replyToId: replyTo?.id, viewOnce });
+        // mediaMime was never sent before, so every attachment was stored untyped and the UI could
+        // not tell a PDF from a zip.
+        await sendRemoteMessage.mutateAsync({ conversationId: selectedId, body: localMessage.text, kind: localMessage.kind ?? "text", mediaUrl: localMessage.mediaUrl, mediaName: localMessage.mediaName, mediaMime: localMessage.mediaMime, voiceDurationMs: localMessage.voiceDurationMs, replyToId: replyTo?.id, viewOnce });
         await liveMessagesQuery.refetch();
       } catch { notify("Message saved locally; reconnect to sync it"); }
     } else {
@@ -517,6 +548,30 @@ export default function HomeScreen() {
     if (Platform.OS !== "web") Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
   };
 
+  /** Picks a document and sends it as an attachment. */
+  const shareDocument = async () => {
+    try {
+      const asset = await pickDocumentFile();
+      if (!asset || !selectedId) return;
+
+      // Checked here so an oversized file is a clear message rather than a failed upload: the
+      // database is the store, and 4 MB is its ceiling.
+      if (asset.size && asset.size > MAX_ATTACHMENT_BYTES) {
+        notify(`That file is ${(asset.size / (1024 * 1024)).toFixed(1)} MB. The limit is 4 MB.`);
+        return;
+      }
+
+      const payload = await prepareDocument(asset);
+      if (!payload) { notify("Could not read that file"); return; }
+
+      const uploaded = await uploadMedia.mutateAsync(payload);
+      await sendMessage({ text: payload.fileName, kind: "file", mediaUrl: uploaded.url, mediaName: payload.fileName, mediaMime: payload.contentType });
+      notify("Attachment sent");
+    } catch (error) {
+      notify(error instanceof Error && error.message ? error.message : "Could not send that file");
+    }
+  };
+
   const shareMedia = async () => {
     try {
       const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, quality: 0.82, allowsEditing: false });
@@ -527,7 +582,7 @@ export default function HomeScreen() {
       const payload = await prepareAttachment(asset, kind);
       if (!payload) { notify("Could not read that file"); return; }
       const uploaded = await uploadMedia.mutateAsync(payload);
-      await sendMessage({ text: kind === "video" ? "Video" : "Photo", kind, mediaUrl: uploaded.url, mediaName: uploaded.fileName });
+      await sendMessage({ text: kind === "video" ? "Video" : "Photo", kind, mediaUrl: uploaded.url, mediaName: uploaded.fileName, mediaMime: payload.contentType });
       notify("Media sent");
     } catch (error) {
       notify(error instanceof Error && error.message ? error.message : "Media upload was cancelled or unavailable");
@@ -567,6 +622,7 @@ export default function HomeScreen() {
     kind: item.kind,
     mediaUrl: item.mediaUrl ?? undefined,
     mediaName: item.mediaName ?? undefined,
+    mediaMime: item.mediaMime ?? undefined,
     voiceDurationMs: item.voiceDurationMs ?? undefined,
     starred: item.starred,
     viewOnce: item.viewOnce === 1,
@@ -649,6 +705,31 @@ export default function HomeScreen() {
   };
 
   // The server drops the stored copy as this resolves, so it only ever displays once.
+  /** Opens an attachment in the system browser, where it can be viewed or saved. */
+  const openAttachment = async (message: Message) => {
+    const url = resolveMediaUrl(message.mediaUrl);
+    if (!url) return;
+    try {
+      await Linking.openURL(url);
+    } catch {
+      notify("Could not open that attachment");
+    }
+  };
+
+  /**
+   * View-once video. The stored copy is consumed first, exactly as for a photo, so a failure to
+   * play cannot leave the media readable afterwards.
+   */
+  const openVideoOnce = async (message: Message) => {
+    try {
+      const opened = await openViewOnce.mutateAsync({ messageId: message.id });
+      setOnceVideo(resolveMediaUrl(opened.mediaUrl) ?? null);
+      await liveMessagesQuery.refetch();
+    } catch (error) {
+      notify(error instanceof Error && error.message ? error.message : "That video has already been opened");
+    }
+  };
+
   const openOnce = async (message: Message) => {
     try {
       const opened = await openViewOnce.mutateAsync({ messageId: message.id });
@@ -706,11 +787,15 @@ export default function HomeScreen() {
             {item.deleted ? <Text style={[styles.deletedText, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>This message was deleted</Text> : null}
             {!item.deleted && item.viewOnce && item.kind === "image" ? (item.mediaUrl ? <Pressable onPress={() => void openOnce(item)} style={styles.onceTile}><MaterialIcons name="visibility" size={22} color="#FFFFFF" /><Text style={styles.onceTileText}>Tap to view once</Text></Pressable> : <View style={styles.onceGone}><MaterialIcons name="visibility-off" size={15} color={item.mine ? colors.bubbleOutgoingText : colors.muted} /><Text style={[styles.onceGoneText, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>Photo opened</Text></View>) : null}
             {!item.deleted && !item.viewOnce && item.mediaUrl && item.kind === "image" ? <Image source={{ uri: resolveMediaUrl(item.mediaUrl) }} style={styles.messageImage} resizeMode="cover" /> : null}
+            {!item.deleted && item.viewOnce && item.kind === "video" ? (item.mediaUrl ? <Pressable onPress={() => void openVideoOnce(item)} style={styles.onceTile}><MaterialIcons name="visibility" size={22} color="#FFFFFF" /><Text style={styles.onceTileText}>Tap to view once</Text></Pressable> : <View style={styles.onceGone}><MaterialIcons name="visibility-off" size={15} color={item.mine ? colors.bubbleOutgoingText : colors.muted} /><Text style={[styles.onceGoneText, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>Video opened</Text></View>) : null}
+            {!item.deleted && !item.viewOnce && item.mediaUrl && item.kind === "video" ? <VideoMessage uri={resolveMediaUrl(item.mediaUrl) ?? ""} style={styles.messageVideo} /> : null}
+            {!item.deleted && item.kind === "file" ? <Pressable onPress={() => void openAttachment(item)} style={styles.fileTile}><View style={[styles.fileIcon, { backgroundColor: item.mine ? "rgba(255,255,255,0.18)" : colors.background }]}><MaterialIcons name={attachmentKind(item.mediaMime).icon} size={20} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /></View><View style={styles.fileCopy}><Text style={[styles.fileName, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]} numberOfLines={1}>{item.mediaName ?? "Attachment"}</Text><Text style={[styles.fileMeta, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>{attachmentKind(item.mediaMime).label} · Tap to open</Text></View><MaterialIcons name="open-in-new" size={17} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /></Pressable> : null}
             {item.kind === "voice" ? <Pressable onPress={() => { if (item.mediaUrl) createAudioPlayer(resolveMediaUrl(item.mediaUrl)).play(); }} style={styles.voiceBubble}><MaterialIcons name="play-arrow" size={22} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /><View style={styles.voiceWave}><View style={[styles.voiceLine, { backgroundColor: item.mine ? colors.bubbleOutgoingText : colors.primary }]} /><View style={[styles.voiceLineShort, { backgroundColor: item.mine ? colors.bubbleOutgoingText : colors.primary }]} /><View style={[styles.voiceLine, { backgroundColor: item.mine ? colors.bubbleOutgoingText : colors.primary }]} /></View><Text style={[styles.voiceLabel, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]}>{item.text}</Text></Pressable> : null}
-            {item.kind !== "voice" && (item.kind !== "image" || !item.mediaUrl) ? <Text style={[styles.messageText, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]}>{item.text}</Text> : null}
+            {item.kind !== "voice" && item.kind !== "file" && (item.kind !== "image" || !item.mediaUrl) ? <Text style={[styles.messageText, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]}>{item.text}</Text> : null}
             <View style={styles.messageMeta}>{item.edited ? <Text style={[styles.editedTag, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>edited</Text> : null}<Text style={[styles.messageTime, { color: item.mine ? colors.bubbleOutgoingText : colors.muted, opacity: item.mine ? 0.75 : 1 }]}>{item.time}</Text>{item.starred ? <MaterialIcons name="star" size={13} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /> : null}<MessageTicks status={item.status} color={item.mine ? colors.bubbleOutgoingText : colors.muted} readColor="#53BDEB" /></View>
           </View>{item.reactions && item.reactions.length > 0 ? <View style={styles.reactionRow}>{item.reactions.map((reaction) => <View key={`${item.id}-${reaction.userId}`} style={[styles.reactionChip, { backgroundColor: colors.surface, borderColor: colors.border }]}><Text style={styles.reactionEmoji}>{reaction.emoji}</Text></View>)}</View> : null}{reactingToId === item.id ? <View style={[styles.reactionPicker, { backgroundColor: colors.surface, borderColor: colors.border }]}>{REACTION_EMOJIS.map((emoji) => <Pressable key={emoji} onPress={() => void applyReaction(item, emoji)} hitSlop={6}><Text style={styles.reactionEmoji}>{emoji}</Text></Pressable>)}</View> : null}{activeMessageId === item.id ? <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.actionsScroll} contentContainerStyle={[styles.messageActions, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => { setReplyTo({ id: item.id, text: item.text, senderName: item.mine ? "You" : selectedChat.name }); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Reply</Text></Pressable><Pressable onPress={() => { setReactingToId(item.id); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>React</Text></Pressable><Pressable onPress={() => void toggleStar(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>{item.starred ? "Unstar" : "Star"}</Text></Pressable><Pressable onPress={() => { setForwarding(item); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Forward</Text></Pressable>{item.mine && !item.deleted && item.kind === "text" ? <Pressable onPress={() => beginEdit(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>Edit</Text></Pressable> : null}<Pressable onPress={() => void deleteMessage(item, false)}><Text style={[styles.actionText, { color: colors.foreground }]}>Delete for me</Text></Pressable>{item.mine && !item.deleted ? <Pressable onPress={() => void deleteMessage(item, true)}><Text style={[styles.actionText, { color: colors.error }]}>Delete for everyone</Text></Pressable> : null}</ScrollView> : null}</Pressable>} />
-          <View style={[styles.composerArea, { borderTopColor: colors.border, backgroundColor: colors.background }]}>{editingId ? <Pressable onPress={() => { setEditingId(null); setComposerText(""); }} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>Editing message</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{composerText}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : replyTo ? <Pressable onPress={() => setReplyTo(null)} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>{replyTo.senderName}</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{replyTo.text}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : null}<View style={[styles.composer, { backgroundColor: colors.surface, borderColor: colors.border }]}><IconButton name="add" color={colors.muted} onPress={shareMedia} /><Pressable onPress={() => setViewOnce(!viewOnce)} style={[styles.viewOnce, viewOnce && { backgroundColor: colors.primary }]}><Text style={[styles.viewOnceText, { color: viewOnce ? "#FFFFFF" : colors.muted }]}>1</Text></Pressable><TextInput value={composerText} onChangeText={onComposerChange} placeholder={editingId ? "Edit message" : "Write a message"} placeholderTextColor={colors.muted} style={[styles.composerInput, { color: colors.foreground }]} multiline maxLength={500} /><IconButton name="mood" color={colors.muted} onPress={() => setComposerText((current) => `${current}${current ? " " : ""}✨`)} /></View><Pressable onPress={editingId ? () => void saveEdit() : composerText.trim() ? () => void sendMessage() : recorderState.isRecording ? () => void stopVoiceNote() : () => void startVoiceNote()} style={({ pressed }) => [styles.sendButton, { backgroundColor: recorderState.isRecording ? colors.error : colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name={editingId ? "check" : composerText.trim() ? "send" : recorderState.isRecording ? "stop" : "mic"} size={21} color="#FFFFFF" /></Pressable></View>
+          <View style={[styles.composerArea, { borderTopColor: colors.border, backgroundColor: colors.background }]}>{editingId ? <Pressable onPress={() => { setEditingId(null); setComposerText(""); }} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>Editing message</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{composerText}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : replyTo ? <Pressable onPress={() => setReplyTo(null)} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>{replyTo.senderName}</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{replyTo.text}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : null}<View style={[styles.composer, { backgroundColor: colors.surface, borderColor: colors.border }]}><IconButton name="add" color={colors.muted} onPress={() => setShowAttach((current) => !current)} /><Pressable onPress={() => setViewOnce(!viewOnce)} style={[styles.viewOnce, viewOnce && { backgroundColor: colors.primary }]}><Text style={[styles.viewOnceText, { color: viewOnce ? "#FFFFFF" : colors.muted }]}>1</Text></Pressable><TextInput value={composerText} onChangeText={onComposerChange} placeholder={editingId ? "Edit message" : "Write a message"} placeholderTextColor={colors.muted} style={[styles.composerInput, { color: colors.foreground }]} multiline maxLength={500} /><IconButton name="mood" color={colors.muted} onPress={() => setComposerText((current) => `${current}${current ? " " : ""}✨`)} /></View>{showAttach ? <View style={styles.attachSheet}><Pressable onPress={() => { setShowAttach(false); void shareMedia(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="perm-media" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Photo or video</Text></Pressable><Pressable onPress={() => { setShowAttach(false); void shareDocument(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="attach-file" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Document</Text></Pressable></View> : null}<Pressable onPress={editingId ? () => void saveEdit() : composerText.trim() ? () => void sendMessage() : recorderState.isRecording ? () => void stopVoiceNote() : () => void startVoiceNote()} style={({ pressed }) => [styles.sendButton, { backgroundColor: recorderState.isRecording ? colors.error : colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name={editingId ? "check" : composerText.trim() ? "send" : recorderState.isRecording ? "stop" : "mic"} size={21} color="#FFFFFF" /></Pressable></View>
+          {onceVideo ? <View style={styles.overlay}><VideoMessage uri={onceVideo} style={styles.overlayVideo} /><Text style={styles.overlayNote}>This video can only be opened once. The stored copy has already been removed.</Text><Pressable onPress={() => setOnceVideo(null)} style={styles.overlayClose}><Text style={styles.overlayCloseText}>Close</Text></Pressable></View> : null}
           {oncePreview ? <View style={styles.overlay}><Image source={{ uri: oncePreview }} style={styles.overlayImage} resizeMode="contain" /><Text style={styles.overlayNote}>This photo can only be opened once. The stored copy has already been removed.</Text><Pressable onPress={() => setOncePreview(null)} style={styles.overlayClose}><Text style={styles.overlayCloseText}>Close</Text></Pressable></View> : null}
         </KeyboardAvoidingView>
       </ScreenContainer>
@@ -740,7 +825,17 @@ export default function HomeScreen() {
 }
 
 const styles = StyleSheet.create({
-  flex: { flex: 1 }, header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingTop: 12, paddingBottom: 12 }, eyebrow: { fontSize: 11, fontWeight: "800", letterSpacing: 1.5, marginBottom: 5 }, heading: { fontSize: 22, lineHeight: 28, fontWeight: "800", letterSpacing: -0.4 }, headerActions: { flexDirection: "row", gap: 4 }, iconButton: { width: 38, height: 38, alignItems: "center", justifyContent: "center", borderRadius: 19 }, pressed: { opacity: 0.55 }, searchWrap: { height: 48, borderRadius: 14, marginHorizontal: 16, paddingHorizontal: 14, flexDirection: "row", alignItems: "center", borderWidth: 1 }, searchWrapFocused: { shadowColor: "#00A884", shadowOpacity: 0.25, shadowRadius: 10, shadowOffset: { width: 0, height: 0 }, elevation: 3 }, searchClear: { width: 26, height: 26, borderRadius: 13, alignItems: "center", justifyContent: "center" }, searchInput: { flex: 1, marginLeft: 10, fontSize: 15.5, paddingVertical: 0, letterSpacing: 0.1, backgroundColor: "transparent" }, listHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 22, paddingTop: 25, paddingBottom: 8 }, sectionLabel: { fontSize: 11, fontWeight: "800", letterSpacing: 1.2 }, countLabel: { fontSize: 12 }, chatList: { paddingBottom: 100 }, chatRow: { flexDirection: "row", paddingLeft: 16, minHeight: 74 }, rowPressed: { opacity: 0.68 }, avatarWrap: { width: 60, alignItems: "flex-start", paddingTop: 11 }, avatar: { alignItems: "center", justifyContent: "center" }, avatarText: { color: "#FFFFFF", fontWeight: "800", letterSpacing: 0.2 }, onlineDot: { width: 13, height: 13, borderRadius: 7, backgroundColor: "#25D366", borderWidth: 3, position: "absolute", bottom: 0, right: 5 }, chatCopy: { flex: 1, paddingRight: 16, paddingVertical: 13, borderBottomWidth: StyleSheet.hairlineWidth }, rowTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, chatName: { flex: 1, fontSize: 16.5, fontWeight: "600", letterSpacing: -0.1 }, chatTime: { fontSize: 11.5, fontWeight: "500" }, rowBottom: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 4, gap: 8 }, previewLine: { flex: 1, flexDirection: "row", alignItems: "center" }, pin: { marginRight: 4, transform: [{ rotate: "35deg" }] }, chatPreview: { flex: 1, fontSize: 13.5, lineHeight: 18 }, unread: { minWidth: 21, height: 21, borderRadius: 11, alignItems: "center", justifyContent: "center", paddingHorizontal: 5 }, unreadText: { color: "#FFFFFF", fontSize: 11, fontWeight: "800" }, fab: { position: "absolute", right: 20, bottom: 20, width: 55, height: 55, borderRadius: 28, alignItems: "center", justifyContent: "center", shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 10, shadowOffset: { width: 0, height: 5 }, elevation: 5 }, toast: { position: "absolute", bottom: 24, left: 24, right: 24, paddingVertical: 13, paddingHorizontal: 16, borderRadius: 14, alignItems: "center" }, toastText: { color: "#FFFFFF", fontSize: 13, fontWeight: "700" }, menu: { position: "absolute", zIndex: 5, right: 15, top: 70, width: 210, borderRadius: 14, borderWidth: 1, paddingVertical: 6, shadowColor: "#000", shadowOpacity: 0.12, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 6 }, menuItem: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 12 }, menuText: { fontSize: 13, fontWeight: "600" }, emptyCta: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 18, paddingVertical: 11, borderRadius: 14, marginTop: 14 }, emptyCtaText: { fontSize: 14, fontWeight: "800" }, emptyState: { alignItems: "center", paddingTop: 80, paddingHorizontal: 30 }, emptyTitle: { fontSize: 18, fontWeight: "800", marginTop: 12 }, emptyCopy: { fontSize: 13, marginTop: 5, textAlign: "center" }, chatHeader: { height: 60, flexDirection: "row", alignItems: "center", paddingHorizontal: 8, borderBottomWidth: StyleSheet.hairlineWidth }, backButton: { width: 32, height: 42, justifyContent: "center", alignItems: "center" }, chatTitleBlock: { flex: 1, paddingLeft: 8 }, chatTitle: { fontSize: 16.5, fontWeight: "600" }, chatSubtitle: { fontSize: 11, marginTop: 3, fontWeight: "600" }, messageList: { paddingHorizontal: 12, paddingBottom: 14, flexGrow: 1, justifyContent: "flex-end" }, encryptionNote: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "rgba(245, 158, 11, 0.10)", borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, marginBottom: 20 }, encryptionText: { fontSize: 10, fontWeight: "600" }, messageRow: { width: "100%", marginBottom: 5 }, messageRowMine: { alignItems: "flex-end" }, messageRowTheirs: { alignItems: "flex-start" }, bubble: { maxWidth: "82%", paddingHorizontal: 12, paddingTop: 9, paddingBottom: 6, borderRadius: 12 }, bubbleMine: { borderTopRightRadius: 3 }, bubbleTheirs: { borderTopLeftRadius: 3 }, messageText: { fontSize: 14.5, lineHeight: 20 }, messageMeta: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 4, marginTop: 3 }, messageActions: { flexDirection: "row", gap: 8, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 14, borderWidth: 1, marginTop: 4 }, actionText: { fontSize: 11, fontWeight: "800" }, replyBanner: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 12, marginBottom: 6 }, replyText: { flex: 1, fontSize: 12 }, viewOnce: { width: 25, height: 25, borderRadius: 13, alignItems: "center", justifyContent: "center", marginBottom: 10 }, viewOnceText: { fontSize: 13, fontWeight: "900" }, messageTime: { fontSize: 10 }, messageImage: { width: 190, height: 150, borderRadius: 12, marginBottom: 5 }, composerArea: { flexDirection: "row", alignItems: "flex-end", gap: 8, paddingHorizontal: 12, paddingTop: 9, paddingBottom: 9, borderTopWidth: StyleSheet.hairlineWidth }, composer: { flex: 1, minHeight: 46, maxHeight: 110, borderRadius: 23, borderWidth: 1, flexDirection: "row", alignItems: "flex-end", paddingLeft: 3, paddingRight: 4 }, composerInput: { flex: 1, fontSize: 15, maxHeight: 94, paddingHorizontal: 7, paddingVertical: 12, backgroundColor: "transparent" }, sendButton: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center" }, sendPressed: { transform: [{ scale: 0.96 }], opacity: 0.88 }, voiceBubble: { flexDirection: "row", alignItems: "center", gap: 7, minWidth: 170 }, voiceWave: { flexDirection: "row", gap: 3, alignItems: "center" }, voiceLine: { width: 3, height: 18, borderRadius: 2 }, voiceLineShort: { width: 3, height: 10, borderRadius: 2 }, voiceLabel: { flexShrink: 1, fontSize: 12, fontWeight: "700" }, contactSheet: { position: "absolute", zIndex: 10, top: 0, left: 0, right: 0, bottom: 0, paddingTop: 18, borderTopWidth: 1 }, contactHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 20, paddingBottom: 18 }, contactTitle: { fontSize: 21, fontWeight: "800" }, contactSubtitle: { fontSize: 12, marginTop: 4 }, contactSearch: { marginBottom: 12 }, contactList: { paddingBottom: 30 }, contactRow: { minHeight: 72, flexDirection: "row", alignItems: "center", paddingHorizontal: 20 }, contactAvatar: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center", marginRight: 12 },   contactCopy: { flex: 1 },
+  flex: { flex: 1 }, header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingTop: 12, paddingBottom: 12 }, eyebrow: { fontSize: 11, fontWeight: "800", letterSpacing: 1.5, marginBottom: 5 }, heading: { fontSize: 22, lineHeight: 28, fontWeight: "800", letterSpacing: -0.4 }, headerActions: { flexDirection: "row", gap: 4 }, iconButton: { width: 38, height: 38, alignItems: "center", justifyContent: "center", borderRadius: 19 }, pressed: { opacity: 0.55 }, searchWrap: { height: 48, borderRadius: 14, marginHorizontal: 16, paddingHorizontal: 14, flexDirection: "row", alignItems: "center", borderWidth: 1 }, searchWrapFocused: { shadowColor: "#00A884", shadowOpacity: 0.25, shadowRadius: 10, shadowOffset: { width: 0, height: 0 }, elevation: 3 }, searchClear: { width: 26, height: 26, borderRadius: 13, alignItems: "center", justifyContent: "center" }, searchInput: { flex: 1, marginLeft: 10, fontSize: 15.5, paddingVertical: 0, letterSpacing: 0.1, backgroundColor: "transparent" }, listHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 22, paddingTop: 25, paddingBottom: 8 }, sectionLabel: { fontSize: 11, fontWeight: "800", letterSpacing: 1.2 }, countLabel: { fontSize: 12 }, chatList: { paddingBottom: 100 }, chatRow: { flexDirection: "row", paddingLeft: 16, minHeight: 74 }, rowPressed: { opacity: 0.68 }, avatarWrap: { width: 60, alignItems: "flex-start", paddingTop: 11 }, avatar: { alignItems: "center", justifyContent: "center" }, avatarText: { color: "#FFFFFF", fontWeight: "800", letterSpacing: 0.2 }, onlineDot: { width: 13, height: 13, borderRadius: 7, backgroundColor: "#25D366", borderWidth: 3, position: "absolute", bottom: 0, right: 5 }, chatCopy: { flex: 1, paddingRight: 16, paddingVertical: 13, borderBottomWidth: StyleSheet.hairlineWidth }, rowTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, chatName: { flex: 1, fontSize: 16.5, fontWeight: "600", letterSpacing: -0.1 }, chatTime: { fontSize: 11.5, fontWeight: "500" }, rowBottom: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 4, gap: 8 }, previewLine: { flex: 1, flexDirection: "row", alignItems: "center" }, pin: { marginRight: 4, transform: [{ rotate: "35deg" }] }, chatPreview: { flex: 1, fontSize: 13.5, lineHeight: 18 }, unread: { minWidth: 21, height: 21, borderRadius: 11, alignItems: "center", justifyContent: "center", paddingHorizontal: 5 }, unreadText: { color: "#FFFFFF", fontSize: 11, fontWeight: "800" }, fab: { position: "absolute", right: 20, bottom: 20, width: 55, height: 55, borderRadius: 28, alignItems: "center", justifyContent: "center", shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 10, shadowOffset: { width: 0, height: 5 }, elevation: 5 }, toast: { position: "absolute", bottom: 24, left: 24, right: 24, paddingVertical: 13, paddingHorizontal: 16, borderRadius: 14, alignItems: "center" }, toastText: { color: "#FFFFFF", fontSize: 13, fontWeight: "700" }, menu: { position: "absolute", zIndex: 5, right: 15, top: 70, width: 210, borderRadius: 14, borderWidth: 1, paddingVertical: 6, shadowColor: "#000", shadowOpacity: 0.12, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 6 }, menuItem: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 12 }, menuText: { fontSize: 13, fontWeight: "600" }, emptyCta: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 18, paddingVertical: 11, borderRadius: 14, marginTop: 14 }, emptyCtaText: { fontSize: 14, fontWeight: "800" }, emptyState: { alignItems: "center", paddingTop: 80, paddingHorizontal: 30 }, emptyTitle: { fontSize: 18, fontWeight: "800", marginTop: 12 }, emptyCopy: { fontSize: 13, marginTop: 5, textAlign: "center" }, chatHeader: { height: 60, flexDirection: "row", alignItems: "center", paddingHorizontal: 8, borderBottomWidth: StyleSheet.hairlineWidth }, backButton: { width: 32, height: 42, justifyContent: "center", alignItems: "center" }, chatTitleBlock: { flex: 1, paddingLeft: 8 }, chatTitle: { fontSize: 16.5, fontWeight: "600" }, chatSubtitle: { fontSize: 11, marginTop: 3, fontWeight: "600" }, messageList: { paddingHorizontal: 12, paddingBottom: 14, flexGrow: 1, justifyContent: "flex-end" }, encryptionNote: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "rgba(245, 158, 11, 0.10)", borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, marginBottom: 20 }, encryptionText: { fontSize: 10, fontWeight: "600" }, messageRow: { width: "100%", marginBottom: 5 }, messageRowMine: { alignItems: "flex-end" }, messageRowTheirs: { alignItems: "flex-start" }, bubble: { maxWidth: "82%", paddingHorizontal: 12, paddingTop: 9, paddingBottom: 6, borderRadius: 12 }, bubbleMine: { borderTopRightRadius: 3 }, bubbleTheirs: { borderTopLeftRadius: 3 }, messageText: { fontSize: 14.5, lineHeight: 20 }, messageMeta: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 4, marginTop: 3 }, messageActions: { flexDirection: "row", gap: 8, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 14, borderWidth: 1, marginTop: 4 }, actionText: { fontSize: 11, fontWeight: "800" }, replyBanner: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 12, marginBottom: 6 }, replyText: { flex: 1, fontSize: 12 }, viewOnce: { width: 25, height: 25, borderRadius: 13, alignItems: "center", justifyContent: "center", marginBottom: 10 }, viewOnceText: { fontSize: 13, fontWeight: "900" }, messageTime: { fontSize: 10 }, messageImage: { width: 190, height: 150, borderRadius: 12, marginBottom: 5 },
+  messageVideo: { width: 230, height: 152, borderRadius: 12, marginBottom: 5, backgroundColor: "#000" },
+  fileTile: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 7, minWidth: 200, maxWidth: 262 },
+  fileIcon: { width: 38, height: 38, borderRadius: 10, alignItems: "center", justifyContent: "center" },
+  fileCopy: { flex: 1 },
+  fileName: { fontSize: 14, fontWeight: "600" },
+  fileMeta: { fontSize: 11.5, marginTop: 2 },
+  overlayVideo: { width: "88%", height: "70%", borderRadius: 14, backgroundColor: "#000" },
+  attachSheet: { flexDirection: "row", gap: 8, paddingHorizontal: 14, paddingBottom: 10 },
+  attachOption: { flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 12, paddingVertical: 9, borderRadius: 12, borderWidth: 1 },
+  attachLabel: { fontSize: 13, fontWeight: "600" }, composerArea: { flexDirection: "row", alignItems: "flex-end", gap: 8, paddingHorizontal: 12, paddingTop: 9, paddingBottom: 9, borderTopWidth: StyleSheet.hairlineWidth }, composer: { flex: 1, minHeight: 46, maxHeight: 110, borderRadius: 23, borderWidth: 1, flexDirection: "row", alignItems: "flex-end", paddingLeft: 3, paddingRight: 4 }, composerInput: { flex: 1, fontSize: 15, maxHeight: 94, paddingHorizontal: 7, paddingVertical: 12, backgroundColor: "transparent" }, sendButton: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center" }, sendPressed: { transform: [{ scale: 0.96 }], opacity: 0.88 }, voiceBubble: { flexDirection: "row", alignItems: "center", gap: 7, minWidth: 170 }, voiceWave: { flexDirection: "row", gap: 3, alignItems: "center" }, voiceLine: { width: 3, height: 18, borderRadius: 2 }, voiceLineShort: { width: 3, height: 10, borderRadius: 2 }, voiceLabel: { flexShrink: 1, fontSize: 12, fontWeight: "700" }, contactSheet: { position: "absolute", zIndex: 10, top: 0, left: 0, right: 0, bottom: 0, paddingTop: 18, borderTopWidth: 1 }, contactHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 20, paddingBottom: 18 }, contactTitle: { fontSize: 21, fontWeight: "800" }, contactSubtitle: { fontSize: 12, marginTop: 4 }, contactSearch: { marginBottom: 12 }, contactList: { paddingBottom: 30 }, contactRow: { minHeight: 72, flexDirection: "row", alignItems: "center", paddingHorizontal: 20 }, contactAvatar: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center", marginRight: 12 },   contactCopy: { flex: 1 },
   // ---- message menu + richer bubbles --------------------------------------------------
   quoteBlock: { borderLeftWidth: 3, paddingLeft: 8, marginBottom: 6, borderRadius: 3 },
   quoteName: { fontSize: 11.5, fontWeight: "700" },

@@ -29,6 +29,11 @@ function createAuthContext(): { ctx: TrpcContext; clearedCookies: CookieCall[] }
     createdAt: new Date(),
     updatedAt: new Date(),
     lastSignedIn: new Date(),
+    // The users table grew these after this fixture was written, which is why this file has been
+    // failing to typecheck.
+    avatarUpdatedAt: null,
+    about: null,
+    phone: null,
   };
   
   const ctx: TrpcContext = {
