@@ -397,6 +397,41 @@ export async function createConversation(conversationId: string, createdBy: numb
   await db.insert(conversationMembers).values([{ conversationId, userId: createdBy }, ...memberIds.filter((id) => id !== createdBy).map((userId) => ({ conversationId, userId }))]);
 }
 
+/**
+ * Returns the existing 1:1 conversation between two users, creating it when there is none.
+ *
+ * Tapping a person in the new-conversation sheet used to only show a toast, so there was no
+ * conversation to open and therefore no composer. This makes that tap idempotent: the second
+ * tap on the same person reuses the same conversation instead of creating a duplicate thread.
+ */
+export async function findOrCreateDirectConversation(userId: number, otherUserId: number) {
+  const db = await getDb();
+  if (!db) return null;
+
+  const rows = await db
+    .select({ id: conversationMembers.conversationId })
+    .from(conversationMembers)
+    .innerJoin(conversations, eq(conversations.id, conversationMembers.conversationId))
+    .where(and(eq(conversations.kind, "direct"), inArray(conversationMembers.userId, [userId, otherUserId])));
+
+  const memberCount = new Map<string, number>();
+  for (const row of rows) memberCount.set(row.id, (memberCount.get(row.id) ?? 0) + 1);
+  for (const [id, count] of memberCount) {
+    if (count >= 2) return { conversationId: id, created: false };
+  }
+
+  // Stable id so the same pair can never end up with two parallel threads.
+  const conversationId = `direct-${Math.min(userId, otherUserId)}-${Math.max(userId, otherUserId)}`;
+  const existing = await db.select({ id: conversations.id }).from(conversations).where(eq(conversations.id, conversationId)).limit(1);
+  if (existing.length === 0) {
+    await createConversation(conversationId, userId, undefined, [otherUserId]);
+  } else {
+    await addConversationMember(conversationId, userId);
+    await addConversationMember(conversationId, otherUserId);
+  }
+  return { conversationId, created: true };
+}
+
 export async function addConversationMember(conversationId: string, userId: number) {
   const db = await getDb();
   if (!db) return;
