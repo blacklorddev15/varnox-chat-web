@@ -88,12 +88,16 @@ export default function ProfileScreen() {
 
   const pickPhoto = async () => {
     setStatus(null);
+    // Track which step we reached: the message then says exactly where it failed instead of
+    // a generic "could not update", which is what made this undiagnosable from a screenshot.
+    let step = "asking for photo permission";
     try {
       const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!permission.granted) {
-        setStatus("Allow photo access to change your profile picture.");
+        setStatus("Photo access was refused. Allow photos for this app, then try again.");
         return;
       }
+      step = "opening the photo picker";
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ["images"],
         allowsEditing: true,
@@ -102,17 +106,22 @@ export default function ProfileScreen() {
         base64: true,
       });
       if (result.canceled || !result.assets?.length) return;
+      step = "reading the chosen image";
       const payload = await toAvatarPayload(result.assets[0]);
       if (!payload) {
-        setStatus("Could not read that image. Try a different one.");
+        setStatus("Could not read that image: the picker returned no usable data.");
         return;
       }
+      const sizeKb = Math.round(payload.base64.length / 1024);
+      step = `uploading (${sizeKb} KB as ${payload.mimeType})`;
       await setAvatar.mutateAsync(payload);
+      step = "refreshing your account";
       setImageFailed(false);
       await refresh();
-      setStatus("Profile photo updated.");
+      setStatus(`Profile photo updated (${sizeKb} KB).`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not update your photo.");
+      const detail = error instanceof Error ? error.message : String(error);
+      setStatus(`Failed while ${step}: ${detail}`);
     }
   };
 
