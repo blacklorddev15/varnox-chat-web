@@ -1,7 +1,7 @@
-import { and, desc, eq, gt, ilike, inArray, like, ne, or } from "drizzle-orm";
+import { and, desc, eq, gt, ilike, inArray, like, lt, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, conversationMembers, conversations, InsertUser, messageMedia, messages, pushTokens, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, calls, conversationMembers, conversations, InsertUser, messageMedia, messages, pushTokens, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -285,6 +285,100 @@ export async function removeConversationMember(conversationId: string, userId: n
   await db
     .delete(conversationMembers)
     .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)));
+}
+
+// ---------------------------------------------------------------- calls
+
+export async function createCallRecord(conversationId: string, initiatorId: number, room: string, kind: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const id = crypto.randomUUID();
+  await db.insert(calls).values({ id, conversationId, initiatorId, room, kind, status: "ringing" });
+  return id;
+}
+
+export async function getCallRecord(id: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(calls).where(eq(calls.id, id)).limit(1);
+  return rows[0];
+}
+
+/** A call that has been ringing for more than a minute was never answered. */
+export async function expireStaleCalls(conversationId: string) {
+  const db = await getDb();
+  if (!db) return;
+  const cutoff = new Date(Date.now() - 60_000);
+  await db
+    .update(calls)
+    .set({ status: "missed", endedAt: new Date() })
+    .where(and(eq(calls.conversationId, conversationId), eq(calls.status, "ringing"), lt(calls.startedAt, cutoff)));
+}
+
+export async function setCallStatus(id: string, status: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const patch: Record<string, unknown> = { status };
+  if (status === "active") patch.answeredAt = new Date();
+  if (status === "ended" || status === "missed" || status === "declined") patch.endedAt = new Date();
+  await db.update(calls).set(patch).where(eq(calls.id, id));
+}
+
+/** A call currently ringing for this user, started by someone else, within the last minute. */
+export async function getIncomingCallForUser(userId: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const cutoff = new Date(Date.now() - 60_000);
+  const rows = await db
+    .select({ call: calls, title: conversations.title })
+    .from(calls)
+    .innerJoin(conversations, eq(conversations.id, calls.conversationId))
+    .innerJoin(
+      conversationMembers,
+      and(eq(conversationMembers.conversationId, calls.conversationId), eq(conversationMembers.userId, userId)),
+    )
+    .where(and(eq(calls.status, "ringing"), ne(calls.initiatorId, userId), gt(calls.startedAt, cutoff)))
+    .orderBy(desc(calls.startedAt))
+    .limit(1);
+
+  const row = rows[0];
+  if (!row) return undefined;
+  return {
+    id: row.call.id,
+    conversationId: row.call.conversationId,
+    conversationTitle: row.title,
+    kind: row.call.kind,
+    initiatorId: row.call.initiatorId,
+    startedAt: row.call.startedAt,
+  };
+}
+
+/** Recent calls across the user's conversations, for the Calls tab. */
+export async function listRecentCalls(userId: number, limit = 30) {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db
+    .select({ call: calls, title: conversations.title })
+    .from(calls)
+    .innerJoin(conversations, eq(conversations.id, calls.conversationId))
+    .innerJoin(
+      conversationMembers,
+      and(eq(conversationMembers.conversationId, calls.conversationId), eq(conversationMembers.userId, userId)),
+    )
+    .orderBy(desc(calls.startedAt))
+    .limit(limit);
+
+  return rows.map((row) => ({
+    id: row.call.id,
+    conversationId: row.call.conversationId,
+    conversationTitle: row.title,
+    initiatorId: row.call.initiatorId,
+    outgoing: row.call.initiatorId === userId,
+    kind: row.call.kind,
+    status: row.call.status,
+    startedAt: row.call.startedAt,
+    endedAt: row.call.endedAt,
+  }));
 }
 
 export async function listMessages(conversationId: string, userId: number, since?: Date) {

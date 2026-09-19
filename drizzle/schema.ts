@@ -32,3 +32,7 @@ export type UserAvatar = typeof userAvatars.$inferSelect;
 // GET /api/media/:id. Kept out of the messages table so message payloads stay small.
 export const messageMedia = pgTable("messageMedia", { id: serial("id").primaryKey(), ownerId: integer("ownerId").notNull(), mimeType: text("mimeType").notNull(), fileName: text("fileName"), data: text("data").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() });
 export type MessageMedia = typeof messageMedia.$inferSelect;
+// Call records. Audio/video itself runs through LiveKit; this table carries the ringing state,
+// who started it, and the history the Calls tab shows.
+export const calls = pgTable("calls", { id: varchar("id", { length: 64 }).primaryKey(), conversationId: varchar("conversationId", { length: 64 }).notNull(), initiatorId: integer("initiatorId").notNull(), room: text("room").notNull(), kind: varchar("kind", { length: 8 }).default("audio").notNull(), status: varchar("status", { length: 12 }).default("ringing").notNull(), startedAt: timestamp("startedAt").defaultNow().notNull(), answeredAt: timestamp("answeredAt"), endedAt: timestamp("endedAt") });
+export type Call = typeof calls.$inferSelect;

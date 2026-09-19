@@ -4,7 +4,8 @@ import { MAX_DB_MEDIA_BYTES } from "./_core/mediaRoutes";
 import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
-import { addConversationMembers, clearUserAvatar, createAppeal, createGroupConversation, createMessage, createConversation, getConversationRole, getUserByUsername, getUserSettings, isConversationMember, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings } from "./db";
+import { createRoomToken, isLiveKitConfigured, liveKitUrl } from "./livekit";
+import { addConversationMembers, clearUserAvatar, createAppeal, createCallRecord, createGroupConversation, createMessage, createConversation, expireStaleCalls, getCallRecord, getConversationRole, getIncomingCallForUser, getUserByUsername, getUserSettings, isConversationMember, listRecentCalls, setCallStatus, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings } from "./db";
 import { storagePut } from "./storage";
 import { notifyConversationMembers } from "./push";
 import { messages } from "../drizzle/schema";
@@ -102,6 +103,45 @@ export const appRouter = router({
   }),
   push: router({
     register: protectedProcedure.input(z.object({ token: z.string().min(1).max(512), platform: z.string().max(32).optional() })).mutation(({ ctx, input }) => registerPushToken(ctx.user.id, input.token, input.platform)),
+  }),
+  // ---- calls: LiveKit carries the audio/video, this carries ringing state and history ---
+  calls: router({
+    config: protectedProcedure.query(() => ({ configured: isLiveKitConfigured(), url: liveKitUrl() })),
+    start: protectedProcedure.input(z.object({ conversationId: z.string().min(1), kind: z.enum(["audio", "video"]).default("audio") })).mutation(async ({ ctx, input }) => {
+      if (!(await isConversationMember(input.conversationId, ctx.user.id))) throw new Error("You are not in this conversation");
+      await expireStaleCalls(input.conversationId);
+      const room = `call_${crypto.randomUUID()}`;
+      const callId = await createCallRecord(input.conversationId, ctx.user.id, room, input.kind);
+      const displayName = ctx.user.name?.trim() || ctx.user.username || `User ${ctx.user.id}`;
+      const token = await createRoomToken(`user-${ctx.user.id}`, displayName, room);
+      return { callId, room, token, url: liveKitUrl(), kind: input.kind, status: "ringing" as const };
+    }),
+    answer: protectedProcedure.input(z.object({ callId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      const call = await getCallRecord(input.callId);
+      if (!call) throw new Error("That call has ended");
+      if (!(await isConversationMember(call.conversationId, ctx.user.id))) throw new Error("You are not in this conversation");
+      await setCallStatus(call.id, "active");
+      const displayName = ctx.user.name?.trim() || ctx.user.username || `User ${ctx.user.id}`;
+      const token = await createRoomToken(`user-${ctx.user.id}`, displayName, call.room);
+      return { callId: call.id, room: call.room, token, url: liveKitUrl(), kind: call.kind, status: "active" as const };
+    }),
+    decline: protectedProcedure.input(z.object({ callId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      const call = await getCallRecord(input.callId);
+      if (!call) return { ok: true as const };
+      if (!(await isConversationMember(call.conversationId, ctx.user.id))) throw new Error("You are not in this conversation");
+      await setCallStatus(call.id, "declined");
+      return { ok: true as const };
+    }),
+    end: protectedProcedure.input(z.object({ callId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      const call = await getCallRecord(input.callId);
+      if (!call) return { ok: true as const };
+      if (!(await isConversationMember(call.conversationId, ctx.user.id))) throw new Error("You are not in this conversation");
+      // A call that was never answered is a missed call, not an ended one.
+      await setCallStatus(call.id, call.status === "ringing" ? "missed" : "ended");
+      return { ok: true as const };
+    }),
+    incoming: protectedProcedure.query(async ({ ctx }) => (await getIncomingCallForUser(ctx.user.id)) ?? null),
+    history: protectedProcedure.input(z.object({ limit: z.number().int().min(1).max(50).default(30) }).optional()).query(({ ctx, input }) => listRecentCalls(ctx.user.id, input?.limit ?? 30)),
   }),
   profile: router({
     update: protectedProcedure.input(z.object({ name: z.string().trim().min(1).max(60).optional(), about: z.string().trim().max(140).optional() })).mutation(({ ctx, input }) => updateUserProfile(ctx.user.id, input)),
