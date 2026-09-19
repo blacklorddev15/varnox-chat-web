@@ -76,10 +76,75 @@ export async function isConversationMember(conversationId: string, userId: numbe
   return result.length > 0;
 }
 
+/**
+ * Conversations for a user, each with what a chat list and an alert needs: the other
+ * participant (direct chats), the newest message, and an unread count derived from the
+ * member's lastReadAt. The client previously rendered a hardcoded list, so this is the
+ * first real consumer of these rows.
+ */
 export async function listConversationsForUser(userId: number) {
   const db = await getDb();
   if (!db) return [];
-  return db.select({ conversation: conversations }).from(conversationMembers).innerJoin(conversations, eq(conversationMembers.conversationId, conversations.id)).where(eq(conversationMembers.userId, userId)).orderBy(desc(conversations.updatedAt));
+  const rows = await db
+    .select({ conversation: conversations })
+    .from(conversationMembers)
+    .innerJoin(conversations, eq(conversationMembers.conversationId, conversations.id))
+    .where(eq(conversationMembers.userId, userId))
+    .orderBy(desc(conversations.updatedAt));
+
+  const result = [];
+  for (const { conversation } of rows) {
+    const members = await db
+      .select({
+        userId: conversationMembers.userId,
+        lastReadAt: conversationMembers.lastReadAt,
+        name: users.name,
+        username: users.username,
+        avatarUpdatedAt: users.avatarUpdatedAt,
+      })
+      .from(conversationMembers)
+      .innerJoin(users, eq(users.id, conversationMembers.userId))
+      .where(eq(conversationMembers.conversationId, conversation.id));
+
+    const mine = members.find((m) => m.userId === userId) ?? null;
+    const other = members.find((m) => m.userId !== userId) ?? null;
+
+    const latest = await db
+      .select()
+      .from(messages)
+      .where(eq(messages.conversationId, conversation.id))
+      .orderBy(desc(messages.createdAt))
+      .limit(1);
+
+    const unreadWhere = mine?.lastReadAt
+      ? and(eq(messages.conversationId, conversation.id), ne(messages.senderId, userId), gt(messages.createdAt, mine.lastReadAt))
+      : and(eq(messages.conversationId, conversation.id), ne(messages.senderId, userId));
+    const unread = await db.select({ id: messages.id }).from(messages).where(unreadWhere);
+
+    result.push({
+      id: conversation.id,
+      title: conversation.title,
+      kind: conversation.kind,
+      updatedAt: conversation.updatedAt,
+      memberCount: members.length,
+      otherMember: other
+        ? { id: other.userId, name: other.name, username: other.username, avatarUpdatedAt: other.avatarUpdatedAt }
+        : null,
+      lastMessage: latest[0] ?? null,
+      unreadCount: unread.length,
+    });
+  }
+  return result;
+}
+
+/** Marks a conversation as read for one member, which is what drives the unread badge. */
+export async function markConversationRead(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db
+    .update(conversationMembers)
+    .set({ lastReadAt: new Date() })
+    .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)));
 }
 
 export async function listMessages(conversationId: string, userId: number, since?: Date) {

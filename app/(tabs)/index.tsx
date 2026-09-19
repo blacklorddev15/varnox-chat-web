@@ -60,7 +60,37 @@ type Message = {
 
 type ContactSuggestion = { id: string; name: string; initials: string; color: string; phone?: string; email?: string };
 
-const conversations: Conversation[] = [
+const CHAT_COLORS = ["#F59E0B", "#8B5CF6", "#10B981", "#EC4899", "#0EA5E9", "#F97316"];
+
+function chatInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+}
+
+function chatColor(seed: string): string {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) % 997;
+  return CHAT_COLORS[hash % CHAT_COLORS.length];
+}
+
+function chatTime(value?: string | Date | null): string {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) {
+    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+/** Only rendered before the auth gate redirects to /login - signed-in users see real rows. */
+const demoConversations: Conversation[] = [
   { id: "maya", name: "Maya Chen", initials: "MC", color: "#F59E0B", preview: "The new collection looks incredible.", time: "9:42 AM", unread: 2, online: true, pinned: true },
   { id: "design", name: "Design Circle", initials: "DC", color: "#8B5CF6", preview: "You: I’ll share the prototype at 3.", time: "8:17 AM", unread: 0, muted: true, pinned: true, group: true },
   { id: "noah", name: "Noah Williams", initials: "NW", color: "#10B981", preview: "Voice message", time: "Yesterday", unread: 0 },
@@ -124,6 +154,35 @@ export default function HomeScreen() {
   const [deviceContacts, setDeviceContacts] = useState<ContactSuggestion[]>(webContacts);
   const [webNotificationStatus, setWebNotificationStatus] = useState<NotificationPermission | "unsupported">("default");
   const seenRemoteMessages = useRef<Record<string, Set<string>>>({});
+
+  // Real conversations from the backend. The hardcoded list below is only a pre-login
+  // placeholder: it used to be what signed-in users saw (fake names, fake unread counts,
+  // and fake notification titles), while the backend already had the real rows.
+  const conversationListQuery = trpc.conversations.list.useQuery(undefined, {
+    enabled: isAuthenticated,
+    refetchInterval: isAuthenticated ? 8000 : false,
+  });
+  const markRead = trpc.conversations.markRead.useMutation();
+  const remoteConversations = useMemo<Conversation[]>(() => {
+    return (conversationListQuery.data ?? []).map((item) => {
+      const name = item.title?.trim() || item.otherMember?.name?.trim() || item.otherMember?.username || "Chat";
+      const last = item.lastMessage;
+      const text = last
+        ? last.body ?? last.mediaName ?? (last.kind === "voice" ? "Voice note" : last.kind === "text" ? "New message" : "Shared media")
+        : "No messages yet";
+      return {
+        id: item.id,
+        name,
+        initials: chatInitials(name),
+        color: chatColor(item.id),
+        preview: last && last.senderId === user?.id ? `You: ${text}` : text,
+        time: chatTime(last?.createdAt ?? item.updatedAt),
+        unread: item.unreadCount ?? 0,
+        group: item.kind === "group",
+      } satisfies Conversation;
+    });
+  }, [conversationListQuery.data, user?.id]);
+  const conversations = isAuthenticated && conversationListQuery.data ? remoteConversations : demoConversations;
 
   const selectedChat = conversations.find((conversation) => conversation.id === selectedId) ?? null;
   const filteredConversations = useMemo(() => filterConversations(conversations, query).filter((item) => chatFilter === "all" || (chatFilter === "unread" ? item.unread > 0 : item.group)), [chatFilter, query]);
@@ -206,6 +265,50 @@ export default function HomeScreen() {
     const notification = new window.Notification(selectedChat?.name ?? "Varnox Chat", { body, tag: `varnox-${latest.id}` });
     notification.onclick = () => window.focus();
   }, [isAuthenticated, liveMessagesQuery.data, selectedChat?.name, selectedId, user?.id, webNotificationStatus]);
+
+  // Clear the unread badge for the conversation being read.
+  useEffect(() => {
+    if (!isAuthenticated || !selectedId) return;
+    const entry = (conversationListQuery.data ?? []).find((item) => item.id === selectedId);
+    if (!entry || !entry.unreadCount) return;
+    markRead.mutate({ conversationId: selectedId }, { onSuccess: () => conversationListQuery.refetch() });
+  }, [conversationListQuery.data, isAuthenticated, selectedId]);
+
+  // Alerts for every conversation, not only the open one. The effect above sees just the
+  // selected chat, so a message arriving anywhere else used to pass in total silence.
+  const seenConversationMessages = useRef<Set<string>>(new Set());
+  const alertWatcherPrimed = useRef(false);
+  useEffect(() => {
+    if (Platform.OS !== "web" || !isAuthenticated || typeof window === "undefined" || !("Notification" in window)) return;
+    const items = conversationListQuery.data ?? [];
+    if (items.length === 0) return;
+
+    const alerts: { name: string; body: string; messageId: string; conversationId: string }[] = [];
+    for (const item of items) {
+      const last = item.lastMessage;
+      if (!last || seenConversationMessages.current.has(last.id)) continue;
+      seenConversationMessages.current.add(last.id);
+      if (!alertWatcherPrimed.current) continue; // do not replay history on first paint
+      if (last.senderId === user?.id) continue; // never alert on your own message
+      if (item.id === selectedId) continue; // the open chat is handled above
+      if (webNotificationStatus !== "granted") continue;
+      alerts.push({
+        name: item.title?.trim() || item.otherMember?.name?.trim() || item.otherMember?.username || "Varnox Chat",
+        body: last.body ?? last.mediaName ?? "You received a new message",
+        messageId: last.id,
+        conversationId: item.id,
+      });
+    }
+    alertWatcherPrimed.current = true;
+
+    for (const alert of alerts) {
+      const notification = new window.Notification(alert.name, { body: alert.body, tag: `varnox-${alert.messageId}` });
+      notification.onclick = () => {
+        window.focus();
+        setSelectedId(alert.conversationId);
+      };
+    }
+  }, [conversationListQuery.data, isAuthenticated, selectedId, user?.id, webNotificationStatus]);
 
   const discoverContacts = async () => {
     if (Platform.OS === "web") { setDeviceContacts(webContacts); setShowContacts(true); return; }

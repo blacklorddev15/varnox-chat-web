@@ -2,7 +2,7 @@ import { z } from "zod";
 import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
-import { clearUserAvatar, createAppeal, createMessage, createConversation, getUserByUsername, getUserSettings, isConversationMember, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationsForUser, listMessages, listUsersForAdmin, moderateUser, registerPushToken, reviewAppeal, searchUsers, setBlockedContact, setUserAvatar, updateUserProfile, updateUserSettings } from "./db";
+import { clearUserAvatar, createAppeal, createMessage, createConversation, getUserByUsername, getUserSettings, isConversationMember, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, reviewAppeal, searchUsers, setBlockedContact, setUserAvatar, updateUserProfile, updateUserSettings } from "./db";
 import { storagePut } from "./storage";
 import { notifyConversationMembers } from "./push";
 import { messages } from "../drizzle/schema";
@@ -21,6 +21,7 @@ export const appRouter = router({
   }),
   conversations: router({
     list: protectedProcedure.query(({ ctx }) => listConversationsForUser(ctx.user.id)),
+    markRead: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).mutation(({ ctx, input }) => markConversationRead(input.conversationId, ctx.user.id)),
     messages: protectedProcedure.input(z.object({ conversationId: z.string().min(1), since: z.string().datetime().optional() })).query(({ ctx, input }) => listMessages(input.conversationId, ctx.user.id, input.since ? new Date(input.since) : undefined)),
     ensure: protectedProcedure.input(z.object({ conversationId: z.string().min(1), title: z.string().max(255).optional() })).mutation(async ({ ctx, input }) => {
       if (!(await isConversationMember(input.conversationId, ctx.user.id))) await createConversation(input.conversationId, ctx.user.id, input.title);
