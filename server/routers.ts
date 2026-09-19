@@ -9,6 +9,20 @@ import { addConversationMembers, clearUserAvatar, createAppeal, createCallRecord
 import { storagePut } from "./storage";
 import { notifyConversationMembers } from "./push";
 import { messages } from "../drizzle/schema";
+// Message actions (reactions, stars, edits, deletes, per-chat preferences) sit with the other
+// row-level operations in db.ts; imported on their own line so the list above stays readable.
+import { consumeViewOnce, conversationDisappearSeconds, deleteMessageForEveryone, editMessageBody, getMessageById, hideMessageForUser, listStarredMessages, markConversationDelivered, reactToMessage, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setMessageStar } from "./db";
+
+/**
+ * Loads a message and proves the caller can see the conversation it lives in. Every message-level
+ * action needs exactly this, and skipping it would let anyone edit or delete any message simply by
+ * guessing an id.
+ */
+async function requireVisibleMessage(messageId: string, userId: number) {
+  const message = await getMessageById(messageId);
+  if (!message || !(await isConversationMember(message.conversationId, userId))) throw new Error("That message is not in one of your chats");
+  return message;
+}
 
 const messageKind = z.enum(["text", "image", "video", "file", "voice"]);
 
@@ -81,12 +95,78 @@ export const appRouter = router({
       if (!result) throw new Error("Could not start that conversation");
       return result;
     }),
-    send: protectedProcedure.input(z.object({ conversationId: z.string().min(1), body: z.string().max(10000).optional(), kind: messageKind.default("text"), mediaUrl: z.string().max(2000).optional(), mediaMime: z.string().max(160).optional(), mediaName: z.string().max(255).optional(), voiceDurationMs: z.number().int().min(0).max(3600000).optional() })).mutation(async ({ ctx, input }) => {
+    send: protectedProcedure.input(z.object({ conversationId: z.string().min(1), body: z.string().max(10000).optional(), kind: messageKind.default("text"), mediaUrl: z.string().max(2000).optional(), mediaMime: z.string().max(160).optional(), mediaName: z.string().max(255).optional(), voiceDurationMs: z.number().int().min(0).max(3600000).optional(), replyToId: z.string().max(64).optional(), forwardedFromId: z.string().max(64).optional(), viewOnce: z.boolean().default(false) })).mutation(async ({ ctx, input }) => {
       if (!(await isConversationMember(input.conversationId, ctx.user.id))) throw new Error("You are not a member of this conversation");
-      const message: typeof messages.$inferInsert = { id: crypto.randomUUID(), conversationId: input.conversationId, senderId: ctx.user.id, body: input.body ?? null, kind: input.kind, mediaUrl: input.mediaUrl ?? null, mediaMime: input.mediaMime ?? null, mediaName: input.mediaName ?? null, voiceDurationMs: input.voiceDurationMs ?? null };
+      // The disappearing clock is stamped at send time, so changing the setting later cannot
+      // retroactively expire messages somebody already received.
+      const disappearSeconds = await conversationDisappearSeconds(input.conversationId);
+      const message: typeof messages.$inferInsert = { id: crypto.randomUUID(), conversationId: input.conversationId, senderId: ctx.user.id, body: input.body ?? null, kind: input.kind, mediaUrl: input.mediaUrl ?? null, mediaMime: input.mediaMime ?? null, mediaName: input.mediaName ?? null, voiceDurationMs: input.voiceDurationMs ?? null, replyToId: input.replyToId ?? null, forwardedFromId: input.forwardedFromId ?? null, viewOnce: input.viewOnce ? 1 : 0, expiresAt: disappearSeconds ? new Date(Date.now() + disappearSeconds * 1000) : null };
       const created = await createMessage(message);
-      void notifyConversationMembers({ conversationId: input.conversationId, senderId: ctx.user.id, title: ctx.user.name ?? "New message", body: input.body ?? (input.kind === "voice" ? "Voice note" : "Shared media") });
+      // A view-once photo must not be described in the notification body.
+      const preview = input.viewOnce ? "Photo (view once)" : input.body ?? (input.kind === "voice" ? "Voice note" : "Shared media");
+      void notifyConversationMembers({ conversationId: input.conversationId, senderId: ctx.user.id, title: ctx.user.name ?? "New message", body: preview });
       return created;
+    }),
+
+    // ---- the message menu: react, star, edit, delete, view-once --------------------------
+    react: protectedProcedure.input(z.object({ messageId: z.string().min(1), emoji: z.string().max(16).nullable() })).mutation(async ({ ctx, input }) => {
+      const message = await requireVisibleMessage(input.messageId, ctx.user.id);
+      await reactToMessage(message.id, ctx.user.id, input.emoji);
+      return { ok: true as const };
+    }),
+    star: protectedProcedure.input(z.object({ messageId: z.string().min(1), starred: z.boolean() })).mutation(async ({ ctx, input }) => {
+      const message = await requireVisibleMessage(input.messageId, ctx.user.id);
+      await setMessageStar(message.id, ctx.user.id, input.starred);
+      return { ok: true as const, starred: input.starred };
+    }),
+    starred: protectedProcedure.query(({ ctx }) => listStarredMessages(ctx.user.id)),
+    editMessage: protectedProcedure.input(z.object({ messageId: z.string().min(1), body: z.string().trim().min(1).max(10000) })).mutation(async ({ ctx, input }) => {
+      const message = await requireVisibleMessage(input.messageId, ctx.user.id);
+      if (message.senderId !== ctx.user.id) throw new Error("You can only edit your own messages");
+      if (message.kind !== "text") throw new Error("Only text messages can be edited");
+      const ok = await editMessageBody(message.id, ctx.user.id, input.body);
+      if (!ok) throw new Error("That message can no longer be edited");
+      return { ok: true as const };
+    }),
+    deleteMessage: protectedProcedure.input(z.object({ messageId: z.string().min(1), forEveryone: z.boolean().default(false) })).mutation(async ({ ctx, input }) => {
+      const message = await requireVisibleMessage(input.messageId, ctx.user.id);
+      if (!input.forEveryone) {
+        await hideMessageForUser(message.id, ctx.user.id);
+        return { ok: true as const, forEveryone: false };
+      }
+      if (message.senderId !== ctx.user.id) throw new Error("Only the sender can delete a message for everyone");
+      const ok = await deleteMessageForEveryone(message.id, ctx.user.id);
+      if (!ok) throw new Error("That message was already deleted");
+      return { ok: true as const, forEveryone: true };
+    }),
+    openViewOnce: protectedProcedure.input(z.object({ messageId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      const message = await requireVisibleMessage(input.messageId, ctx.user.id);
+      const opened = await consumeViewOnce(message.id, ctx.user.id);
+      if (!opened) throw new Error("That photo has already been opened");
+      return opened;
+    }),
+
+    // ---- per-chat preferences and receipts ----------------------------------------------
+    setFlags: protectedProcedure.input(z.object({ conversationId: z.string().min(1), archived: z.boolean().optional(), muted: z.boolean().optional(), pinned: z.boolean().optional(), draft: z.string().max(2000).nullable().optional() })).mutation(async ({ ctx, input }) => {
+      if (!(await isConversationMember(input.conversationId, ctx.user.id))) throw new Error("You are not a member of this conversation");
+      await setConversationMemberFlags(input.conversationId, ctx.user.id, { archived: input.archived, muted: input.muted, pinned: input.pinned, draft: input.draft });
+      return { ok: true as const };
+    }),
+    markDelivered: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      if (!(await isConversationMember(input.conversationId, ctx.user.id))) throw new Error("You are not a member of this conversation");
+      await markConversationDelivered(input.conversationId, ctx.user.id);
+      return { ok: true as const };
+    }),
+    setDescription: protectedProcedure.input(z.object({ conversationId: z.string().min(1), description: z.string().trim().max(255).nullable() })).mutation(async ({ ctx, input }) => {
+      const role = await getConversationRole(input.conversationId, ctx.user.id);
+      if (role !== "owner" && role !== "admin") throw new Error("Only the group owner or an admin can change the description");
+      await setConversationDescription(input.conversationId, input.description || null);
+      return { ok: true as const };
+    }),
+    setDisappearing: protectedProcedure.input(z.object({ conversationId: z.string().min(1), seconds: z.number().int().min(0).max(7776000).nullable() })).mutation(async ({ ctx, input }) => {
+      if (!(await isConversationMember(input.conversationId, ctx.user.id))) throw new Error("You are not a member of this conversation");
+      await setConversationDisappearing(input.conversationId, input.seconds && input.seconds > 0 ? input.seconds : null);
+      return { ok: true as const };
     }),
   }),
   media: router({

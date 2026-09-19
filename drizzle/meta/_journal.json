@@ -15,6 +15,13 @@
       "when": 1789817102325,
       "tag": "0001_faithful_lady_mastermind",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789837307568,
+      "tag": "0002_flaky_red_hulk",
+      "breakpoints": true
     }
   ]
 }

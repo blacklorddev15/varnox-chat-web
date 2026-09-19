@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, ilike, inArray, isNull, like, lt, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, messageMedia, messages, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, messageHides, messageMedia, messageReactions, messageStars, messages, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -88,14 +88,18 @@ export async function listConversationsForUser(userId: number) {
   const db = await getDb();
   if (!db) return [];
   const rows = await db
-    .select({ conversation: conversations })
+    .select({ conversation: conversations, member: conversationMembers })
     .from(conversationMembers)
     .innerJoin(conversations, eq(conversationMembers.conversationId, conversations.id))
     .where(eq(conversationMembers.userId, userId))
     .orderBy(desc(conversations.updatedAt));
 
   const result = [];
-  for (const { conversation } of rows) {
+  // Messages this user hid ("delete for me") must never come back as a preview or a badge.
+  const hidden = await db.select({ messageId: messageHides.messageId }).from(messageHides).where(eq(messageHides.userId, userId));
+  const hiddenIds = new Set(hidden.map((row) => row.messageId));
+
+  for (const { conversation, member } of rows) {
     const members = await db
       .select({
         userId: conversationMembers.userId,
@@ -111,17 +115,22 @@ export async function listConversationsForUser(userId: number) {
     const mine = members.find((m) => m.userId === userId) ?? null;
     const other = members.find((m) => m.userId !== userId) ?? null;
 
-    const latest = await db
+    // Walk back a few rows rather than one: a hidden or expired message must not become the
+    // preview, and taking only the newest would leave the row looking empty while the chat is not.
+    const recent = await db
       .select()
       .from(messages)
       .where(eq(messages.conversationId, conversation.id))
       .orderBy(desc(messages.createdAt))
-      .limit(1);
+      .limit(20);
+    const nowMs = Date.now();
+    const latest = recent.filter((m) => !hiddenIds.has(m.id) && (!m.expiresAt || m.expiresAt.getTime() > nowMs));
 
     const unreadWhere = mine?.lastReadAt
       ? and(eq(messages.conversationId, conversation.id), ne(messages.senderId, userId), gt(messages.createdAt, mine.lastReadAt))
       : and(eq(messages.conversationId, conversation.id), ne(messages.senderId, userId));
-    const unread = await db.select({ id: messages.id }).from(messages).where(unreadWhere);
+    const unreadRows = await db.select({ id: messages.id, expiresAt: messages.expiresAt }).from(messages).where(unreadWhere);
+    const unread = unreadRows.filter((row) => !hiddenIds.has(row.id) && (!row.expiresAt || row.expiresAt.getTime() > nowMs));
 
     result.push({
       id: conversation.id,
@@ -132,8 +141,14 @@ export async function listConversationsForUser(userId: number) {
       otherMember: other
         ? { id: other.userId, name: other.name, username: other.username, avatarUpdatedAt: other.avatarUpdatedAt }
         : null,
+      description: conversation.description,
+      disappearSeconds: conversation.disappearSeconds,
       lastMessage: latest[0] ?? null,
       unreadCount: unread.length,
+      archived: member.archived === 1,
+      muted: member.muted === 1,
+      pinned: member.pinned === 1,
+      draft: member.draft ?? null,
     });
   }
   return result;
@@ -383,11 +398,94 @@ export async function listRecentCalls(userId: number, limit = 30) {
   }));
 }
 
+/**
+ * Messages in a conversation, enriched with everything the chat screen renders: the quoted reply,
+ * reactions, stars, edit and delete state, and the tick status of the caller's own messages.
+ *
+ * Expired (disappearing) and hidden ("delete for me") rows are filtered here rather than in the
+ * client, so a second device cannot display what the first one removed.
+ */
 export async function listMessages(conversationId: string, userId: number, since?: Date) {
   const db = await getDb();
   if (!db || !(await isConversationMember(conversationId, userId))) return [];
-  const whereClause = since ? and(eq(messages.conversationId, conversationId), gt(messages.createdAt, since)) : eq(messages.conversationId, conversationId);
-  return db.select().from(messages).where(whereClause).orderBy(messages.createdAt);
+  const whereClause = since
+    ? and(eq(messages.conversationId, conversationId), gt(messages.createdAt, since))
+    : eq(messages.conversationId, conversationId);
+
+  const rows = await db.select().from(messages).where(whereClause).orderBy(messages.createdAt);
+  if (rows.length === 0) return [];
+
+  const nowMs = Date.now();
+  const ids = rows.map((row) => row.id);
+
+  // Per-person extras, fetched in bulk so a long thread stays at a handful of queries.
+  const hidden = await db.select({ messageId: messageHides.messageId }).from(messageHides).where(and(eq(messageHides.userId, userId), inArray(messageHides.messageId, ids)));
+  const hiddenIds = new Set(hidden.map((row) => row.messageId));
+  const stars = await db.select({ messageId: messageStars.messageId }).from(messageStars).where(and(eq(messageStars.userId, userId), inArray(messageStars.messageId, ids)));
+  const starredIds = new Set(stars.map((row) => row.messageId));
+
+  const reactionRows = await db
+    .select({ messageId: messageReactions.messageId, userId: messageReactions.userId, emoji: messageReactions.emoji, name: users.name, username: users.username })
+    .from(messageReactions)
+    .leftJoin(users, eq(users.id, messageReactions.userId))
+    .where(inArray(messageReactions.messageId, ids));
+
+  const reactionsByMessage = new Map<string, Array<{ userId: number; emoji: string; name: string }>>();
+  for (const row of reactionRows) {
+    const list = reactionsByMessage.get(row.messageId) ?? [];
+    list.push({ userId: row.userId, emoji: row.emoji, name: row.name ?? row.username ?? "Someone" });
+    reactionsByMessage.set(row.messageId, list);
+  }
+
+  // Quoted messages are fetched by id, and may themselves already have been deleted.
+  const replyIds = [...new Set(rows.map((row) => row.replyToId).filter((id): id is string => Boolean(id)))];
+  const quoted = replyIds.length
+    ? await db
+        .select({ id: messages.id, body: messages.body, kind: messages.kind, mediaName: messages.mediaName, senderId: messages.senderId, deletedAt: messages.deletedAt, name: users.name, username: users.username })
+        .from(messages)
+        .leftJoin(users, eq(users.id, messages.senderId))
+        .where(inArray(messages.id, replyIds))
+    : [];
+  const quotedById = new Map(quoted.map((row) => [row.id, row]));
+
+  // Ticks: one of my messages counts as read only once every other member's cursor has passed it.
+  // Somebody who turned read receipts off never contributes a read, which is the point of the
+  // setting - otherwise the toggle would be decorative.
+  const others = await db
+    .select({ lastReadAt: conversationMembers.lastReadAt, lastDeliveredAt: conversationMembers.lastDeliveredAt, readReceipts: userSettings.readReceipts })
+    .from(conversationMembers)
+    .leftJoin(userSettings, eq(userSettings.userId, conversationMembers.userId))
+    .where(and(eq(conversationMembers.conversationId, conversationId), ne(conversationMembers.userId, userId)));
+
+  const receiptOthers = others.filter((other) => other.readReceipts !== 0 && other.lastReadAt);
+  const allReadAt = receiptOthers.length > 0 ? new Date(Math.min(...receiptOthers.map((other) => other.lastReadAt!.getTime()))) : null;
+  const deliveredOthers = others.filter((other) => other.lastDeliveredAt);
+  const allDeliveredAt = deliveredOthers.length > 0 ? new Date(Math.min(...deliveredOthers.map((other) => other.lastDeliveredAt!.getTime()))) : null;
+
+  return rows
+    .filter((row) => !hiddenIds.has(row.id) && (!row.expiresAt || row.expiresAt.getTime() > nowMs))
+    .map((row) => {
+      const quote = row.replyToId ? quotedById.get(row.replyToId) ?? null : null;
+      const mine = row.senderId === userId;
+      const status: "sent" | "delivered" | "read" | null = !mine ? null : allReadAt && allReadAt >= row.createdAt ? "read" : allDeliveredAt && allDeliveredAt >= row.createdAt ? "delivered" : "sent";
+      return {
+        ...row,
+        starred: starredIds.has(row.id),
+        reactions: reactionsByMessage.get(row.id) ?? [],
+        replyTo: quote
+          ? {
+              id: quote.id,
+              body: quote.deletedAt ? null : quote.body,
+              kind: quote.kind,
+              mediaName: quote.mediaName,
+              senderId: quote.senderId,
+              senderName: quote.name ?? quote.username ?? "Someone",
+              deleted: Boolean(quote.deletedAt),
+            }
+          : null,
+        status,
+      };
+    });
 }
 
 export async function createConversation(conversationId: string, createdBy: number, title?: string, memberIds: number[] = []) {
@@ -869,4 +967,177 @@ export async function getChannelDetail(id: string, userId: number) {
   if (rows.length === 0) return undefined;
   const [decorated] = await decorateChannels(rows, userId);
   return decorated;
+}
+
+// ---------------------------------------------------------------- message actions
+// Everything the message menu does: react, star, edit, delete, view-once. Membership and ownership
+// are checked in the router; these are the row-level operations themselves.
+
+export async function getMessageById(messageId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(messages).where(eq(messages.id, messageId)).limit(1);
+  return rows[0];
+}
+
+/** One reaction per person per message: reacting again replaces the previous emoji. */
+export async function reactToMessage(messageId: string, userId: number, emoji: string | null) {
+  const db = await getDb();
+  if (!db) return;
+  if (emoji === null) {
+    await db.delete(messageReactions).where(and(eq(messageReactions.messageId, messageId), eq(messageReactions.userId, userId)));
+    return;
+  }
+  await db
+    .insert(messageReactions)
+    .values({ messageId, userId, emoji })
+    .onConflictDoUpdate({ target: [messageReactions.messageId, messageReactions.userId], set: { emoji, createdAt: new Date() } });
+}
+
+export async function setMessageStar(messageId: string, userId: number, starred: boolean) {
+  const db = await getDb();
+  if (!db) return;
+  if (starred) {
+    await db.insert(messageStars).values({ messageId, userId }).onConflictDoNothing();
+    return;
+  }
+  await db.delete(messageStars).where(and(eq(messageStars.messageId, messageId), eq(messageStars.userId, userId)));
+}
+
+/**
+ * Only the author may edit, and only text: changing a photo would need a new upload, and letting
+ * the body change without marking editedAt would silently rewrite history.
+ */
+export async function editMessageBody(messageId: string, userId: number, body: string) {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db
+    .update(messages)
+    .set({ body, editedAt: new Date() })
+    .where(and(eq(messages.id, messageId), eq(messages.senderId, userId), isNull(messages.deletedAt)))
+    .returning({ id: messages.id });
+  return rows.length > 0;
+}
+
+/**
+ * "Delete for everyone": the row is tombstoned rather than removed, so both sides can honestly
+ * show that something was deleted instead of the message quietly vanishing mid-conversation.
+ */
+export async function deleteMessageForEveryone(messageId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db
+    .update(messages)
+    .set({ deletedAt: new Date(), body: null, mediaUrl: null, mediaName: null, mediaMime: null, voiceDurationMs: null })
+    .where(and(eq(messages.id, messageId), eq(messages.senderId, userId), isNull(messages.deletedAt)))
+    .returning({ id: messages.id });
+  if (rows.length === 0) return false;
+  // Reactions attached to a tombstone are noise.
+  await db.delete(messageReactions).where(eq(messageReactions.messageId, messageId));
+  return true;
+}
+
+/** "Delete for me": hides the row from one reader, leaving it intact for everybody else. */
+export async function hideMessageForUser(messageId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db.insert(messageHides).values({ messageId, userId }).onConflictDoNothing();
+}
+
+/**
+ * Opens a view-once attachment. The stored URL is dropped in the same request, so a second open -
+ * on this device or any other - has nothing left to show. The sender cannot consume their own.
+ */
+export async function consumeViewOnce(messageId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const rows = await db
+    .select()
+    .from(messages)
+    .where(and(eq(messages.id, messageId), ne(messages.senderId, userId), eq(messages.viewOnce, 1)))
+    .limit(1);
+  const row = rows[0];
+  if (!row || !row.mediaUrl) return null;
+  await db.update(messages).set({ mediaUrl: null }).where(eq(messages.id, messageId));
+  return { id: row.id, mediaUrl: row.mediaUrl, mediaName: row.mediaName, kind: row.kind };
+}
+
+/** Per-member chat preferences. Each one is personal, so they live on the membership row. */
+export async function setConversationMemberFlags(
+  conversationId: string,
+  userId: number,
+  flags: { archived?: boolean; muted?: boolean; pinned?: boolean; draft?: string | null },
+) {
+  const db = await getDb();
+  if (!db) return;
+  const patch: Record<string, unknown> = {};
+  if (flags.archived !== undefined) patch.archived = flags.archived ? 1 : 0;
+  if (flags.muted !== undefined) patch.muted = flags.muted ? 1 : 0;
+  if (flags.pinned !== undefined) patch.pinned = flags.pinned ? 1 : 0;
+  if (flags.draft !== undefined) patch.draft = flags.draft ? flags.draft.slice(0, 2000) : null;
+  if (Object.keys(patch).length === 0) return;
+  await db
+    .update(conversationMembers)
+    .set(patch)
+    .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)));
+}
+
+/** A separate cursor from lastReadAt: delivered does not mean read. */
+export async function markConversationDelivered(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return;
+  await db
+    .update(conversationMembers)
+    .set({ lastDeliveredAt: new Date() })
+    .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)));
+}
+
+export async function setConversationDescription(conversationId: string, description: string | null) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(conversations).set({ description, updatedAt: new Date() }).where(eq(conversations.id, conversationId));
+}
+
+/** The per-chat disappearing timer. New messages inherit it; existing ones are left alone. */
+export async function setConversationDisappearing(conversationId: string, seconds: number | null) {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(conversations).set({ disappearSeconds: seconds, updatedAt: new Date() }).where(eq(conversations.id, conversationId));
+}
+
+/** Everything this user starred, for the Starred messages screen. */
+export async function listStarredMessages(userId: number, limit = 200) {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db
+    .select({ message: messages, starredAt: messageStars.createdAt, conversationTitle: conversations.title, name: users.name, username: users.username })
+    .from(messageStars)
+    .innerJoin(messages, eq(messages.id, messageStars.messageId))
+    .innerJoin(conversationMembers, and(eq(conversationMembers.conversationId, messages.conversationId), eq(conversationMembers.userId, userId)))
+    .leftJoin(conversations, eq(conversations.id, messages.conversationId))
+    .leftJoin(users, eq(users.id, messages.senderId))
+    .where(and(eq(messageStars.userId, userId), isNull(messages.deletedAt)))
+    .orderBy(desc(messageStars.createdAt))
+    .limit(limit);
+
+  return rows.map((row) => ({
+    id: row.message.id,
+    conversationId: row.message.conversationId,
+    conversationTitle: row.conversationTitle,
+    body: row.message.body,
+    kind: row.message.kind,
+    mediaName: row.message.mediaName,
+    createdAt: row.message.createdAt,
+    starredAt: row.starredAt,
+    senderId: row.message.senderId,
+    senderName: row.name ?? row.username ?? "Someone",
+  }));
+}
+
+/** Adds the disappearing clock to an outgoing message, when the chat has a timer set. */
+export async function conversationDisappearSeconds(conversationId: string) {
+  const db = await getDb();
+  if (!db) return null;
+  const rows = await db.select({ seconds: conversations.disappearSeconds }).from(conversations).where(eq(conversations.id, conversationId)).limit(1);
+  return rows[0]?.seconds ?? null;
 }
