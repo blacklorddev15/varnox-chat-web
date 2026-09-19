@@ -1,8 +1,20 @@
-import { integer, pgEnum, pgTable, primaryKey, serial, text, timestamp, varchar } from "drizzle-orm/pg-core";
+import { integer, jsonb, pgEnum, pgTable, primaryKey, serial, text, timestamp, varchar } from "drizzle-orm/pg-core";
 
 export const roleEnum = pgEnum("role", ["user", "admin"]);
 export const conversationKindEnum = pgEnum("conversation_kind", ["direct", "group"]);
-export const messageKindEnum = pgEnum("message_kind", ["text", "image", "video", "file", "voice"]);
+export const messageKindEnum = pgEnum("message_kind", ["text", "image", "video", "file", "voice", "poll", "location", "contact"]);
+/**
+ * What a poll, location or contact message carries.
+ *
+ * These three have no file behind them like the media kinds do, so their payload rides in
+ * `messages.meta` instead of adding three sets of near-empty columns to a table every message read
+ * touches. Poll *votes* deliberately do not live here: two people answering at the same instant
+ * would overwrite each other in a JSON blob, so they get their own table.
+ */
+export type MessageMeta =
+  | { kind: "poll"; question: string; options: string[] }
+  | { kind: "location"; lat: number; lng: number; label?: string }
+  | { kind: "contact"; userId: number; name: string; username?: string; phone?: string };
 
 export const users = pgTable("users", {
   id: serial("id").primaryKey(), openId: varchar("openId", { length: 64 }).notNull().unique(), name: text("name"), email: varchar("email", { length: 320 }), emailVerifiedAt: timestamp("emailVerifiedAt"), username: varchar("username", { length: 32 }).unique(), passwordHash: text("passwordHash"), loginMethod: varchar("loginMethod", { length: 64 }), role: roleEnum("role").default("user").notNull(), moderationStatus: varchar("moderationStatus", { length: 16 }).default("active").notNull(), suspendedUntil: timestamp("suspendedUntil"), moderationReason: text("moderationReason"), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull(), lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(), about: text("about"), avatarUpdatedAt: timestamp("avatarUpdatedAt"), phone: varchar("phone", { length: 24 }),
@@ -11,7 +23,7 @@ export const conversations = pgTable("conversations", { id: varchar("id", { leng
 // Per-person state for a chat lives here rather than in shared columns: archiving, muting,
 // pinning and drafts are personal, and one member's choices must not rewrite everyone's row.
 export const conversationMembers = pgTable("conversationMembers", { conversationId: varchar("conversationId", { length: 64 }).notNull(), userId: integer("userId").notNull(), joinedAt: timestamp("joinedAt").defaultNow().notNull(), lastReadAt: timestamp("lastReadAt"), lastDeliveredAt: timestamp("lastDeliveredAt"), role: varchar("role", { length: 16 }).default("member").notNull(), archived: integer("archived").default(0).notNull(), muted: integer("muted").default(0).notNull(), pinned: integer("pinned").default(0).notNull(), draft: text("draft") }, (table) => ({ pk: primaryKey({ columns: [table.conversationId, table.userId] }) }));
-export const messages = pgTable("messages", { id: varchar("id", { length: 64 }).primaryKey(), conversationId: varchar("conversationId", { length: 64 }).notNull(), senderId: integer("senderId").notNull(), body: text("body"), kind: messageKindEnum("kind").default("text").notNull(), mediaUrl: text("mediaUrl"), mediaMime: varchar("mediaMime", { length: 160 }), mediaName: varchar("mediaName", { length: 255 }), voiceDurationMs: integer("voiceDurationMs"), replyToId: varchar("replyToId", { length: 64 }), forwardedFromId: varchar("forwardedFromId", { length: 64 }), viewOnce: integer("viewOnce").default(0).notNull(), editedAt: timestamp("editedAt"), deletedAt: timestamp("deletedAt"), expiresAt: timestamp("expiresAt"), createdAt: timestamp("createdAt").defaultNow().notNull() });
+export const messages = pgTable("messages", { id: varchar("id", { length: 64 }).primaryKey(), conversationId: varchar("conversationId", { length: 64 }).notNull(), senderId: integer("senderId").notNull(), body: text("body"), kind: messageKindEnum("kind").default("text").notNull(), mediaUrl: text("mediaUrl"), mediaMime: varchar("mediaMime", { length: 160 }), mediaName: varchar("mediaName", { length: 255 }), voiceDurationMs: integer("voiceDurationMs"), replyToId: varchar("replyToId", { length: 64 }), forwardedFromId: varchar("forwardedFromId", { length: 64 }), viewOnce: integer("viewOnce").default(0).notNull(), editedAt: timestamp("editedAt"), deletedAt: timestamp("deletedAt"), expiresAt: timestamp("expiresAt"), meta: jsonb("meta").$type<MessageMeta>(), createdAt: timestamp("createdAt").defaultNow().notNull() });
 export const pushTokens = pgTable("pushTokens", { id: serial("id").primaryKey(), userId: integer("userId").notNull(), token: varchar("token", { length: 512 }).notNull().unique(), platform: varchar("platform", { length: 32 }), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 // ---------------------------------------------------------------- message extras
 // Reactions, stars and per-user hides are separate tables rather than columns on `messages`.
@@ -21,6 +33,11 @@ export const messageReactions = pgTable("messageReactions", { messageId: varchar
 export const messageStars = pgTable("messageStars", { messageId: varchar("messageId", { length: 64 }).notNull(), userId: integer("userId").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.messageId, table.userId] }) }));
 // "Delete for me": the message row survives for everybody else, it is only hidden from one reader.
 export const messageHides = pgTable("messageHides", { messageId: varchar("messageId", { length: 64 }).notNull(), userId: integer("userId").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.messageId, table.userId] }) }));
+// One vote per person per poll, replaced when they change their answer. `optionIndex` is kept
+// rather than a foreign key to an option row, because the options are part of the message and never
+// change after it is sent - editing a poll is not supported, and a stale index simply lands out of
+// range and is ignored when the tally is built.
+export const pollVotes = pgTable("pollVotes", { messageId: varchar("messageId", { length: 64 }).notNull(), userId: integer("userId").notNull(), optionIndex: integer("optionIndex").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.messageId, table.userId] }) }));
 export const userSettings = pgTable("userSettings", { userId: integer("userId").primaryKey(), readReceipts: integer("readReceipts").default(1).notNull(), lastSeen: integer("lastSeen").default(1).notNull(), darkTheme: integer("darkTheme").default(0).notNull(), notificationsMessages: integer("notificationsMessages").default(1).notNull(), notificationsGroups: integer("notificationsGroups").default(1).notNull(), notificationsCalls: integer("notificationsCalls").default(1).notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 // ---------------------------------------------------------------- presence
 // "Is this person reachable right now." One upserted row per user rather than an append-only log,

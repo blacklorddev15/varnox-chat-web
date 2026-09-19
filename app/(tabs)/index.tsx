@@ -58,13 +58,19 @@ type Conversation = {
 /** The message a reply points at, resolved by the server. */
 type MessageQuote = { id: string; body: string | null; kind: string; mediaName?: string | null; senderId: number; senderName: string; deleted: boolean };
 
+/** Content of the message kinds that carry no file, mirroring the union in drizzle/schema.ts. */
+type MessageMeta =
+  | { kind: "poll"; question: string; options: string[] }
+  | { kind: "location"; lat: number; lng: number; label?: string }
+  | { kind: "contact"; userId: number; name: string; username?: string; phone?: string };
+
 type Message = {
   id: string;
   text: string;
   time: string;
   mine?: boolean;
   read?: boolean;
-  kind?: "text" | "image" | "video" | "file" | "voice";
+  kind?: "text" | "image" | "video" | "file" | "voice" | "poll" | "location" | "contact";
   mediaUrl?: string;
   mediaName?: string;
   // Stored server-side all along; carried through so attachments can be labelled by type instead
@@ -82,6 +88,9 @@ type Message = {
   expiresAt?: string;
   reactions?: Array<{ userId: number; emoji: string; name: string }>;
   quote?: MessageQuote;
+  /** Poll answers, one row per person. The tally is built here, from the rows the server sends. */
+  votes?: Array<{ userId: number; optionIndex: number; name: string }>;
+  meta?: MessageMeta;
 };
 
 // `userId` is only present for real Varnox accounts (people.search); device contacts have none,
@@ -206,6 +215,41 @@ function MessageText({
   );
 }
 
+/**
+ * A poll: the question, one row per answer with a share bar, and the count behind each row.
+ *
+ * The bars are computed from the per-person rows the server sends rather than from a stored total,
+ * so two people voting at the same moment can never leave the UI showing a tally that adds up to
+ * more answers than there are voters. Tapping a row votes; tapping another changes the answer.
+ */
+function PollBubble({ meta, votes, myUserId, mine, colors, onVote }: { meta: { question: string; options: string[] }; votes: Array<{ userId: number; optionIndex: number; name: string }>; myUserId?: number; mine: boolean; colors: ReturnType<typeof useColors>; onVote: (optionIndex: number) => void }) {
+  const textColor = mine ? colors.bubbleOutgoingText : colors.foreground;
+  const mutedColor = mine ? colors.bubbleOutgoingText : colors.muted;
+  const total = votes.length;
+  const myVote = votes.find((vote) => vote.userId === myUserId)?.optionIndex ?? -1;
+  return (
+    <View style={styles.pollCard}>
+      <Text style={[styles.pollQuestion, { color: textColor }]}>{meta.question}</Text>
+      {meta.options.map((option, index) => {
+        const count = votes.filter((vote) => vote.optionIndex === index).length;
+        const share = total > 0 ? Math.round((count / total) * 100) : 0;
+        const chosen = myVote === index;
+        return (
+          <Pressable key={`${index}-${option}`} onPress={() => onVote(index)} style={[styles.pollOption, { borderColor: chosen ? colors.primary : colors.border }]}>
+            <View style={[styles.pollBar, { width: `${share}%`, backgroundColor: chosen ? colors.primary : colors.border }]} />
+            <View style={styles.pollOptionRow}>
+              <MaterialIcons name={chosen ? "radio-button-checked" : "radio-button-unchecked"} size={16} color={chosen ? colors.primary : mutedColor} />
+              <Text style={[styles.pollOptionText, { color: textColor }]} numberOfLines={2}>{option}</Text>
+              <Text style={[styles.pollCount, { color: mutedColor }]}>{count}</Text>
+            </View>
+          </Pressable>
+        );
+      })}
+      <Text style={[styles.pollFootnote, { color: mutedColor }]}>{total === 0 ? "No votes yet · tap an answer" : `${total} ${total === 1 ? "vote" : "votes"} · tap an answer to vote`}</Text>
+    </View>
+  );
+}
+
 function attachmentKind(mime?: string): { icon: IconName; label: string } {
   const type = (mime ?? "").toLowerCase();
   if (type.startsWith("image/")) return { icon: "image", label: "Photo" };
@@ -254,6 +298,9 @@ export default function HomeScreen() {
   const [oncePreview, setOncePreview] = useState<string | null>(null);
   const [onceVideo, setOnceVideo] = useState<string | null>(null);
   const [showAttach, setShowAttach] = useState(false);
+  // The poll being composed, or null while the builder is closed. Deliberately not part of the
+  // composer text: a poll is a structured message, not a line of text with options glued on.
+  const [pollDraft, setPollDraft] = useState<{ question: string; options: string[] } | null>(null);
   const [showTimer, setShowTimer] = useState(false);
   const draftTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [contactQuery, setContactQuery] = useState("");
@@ -297,6 +344,7 @@ export default function HomeScreen() {
   const editMessage = trpc.conversations.editMessage.useMutation();
   const removeMessage = trpc.conversations.deleteMessage.useMutation();
   const openViewOnce = trpc.conversations.openViewOnce.useMutation();
+  const votePoll = trpc.conversations.votePoll.useMutation();
   const setDisappearing = trpc.conversations.setDisappearing.useMutation();
   const remoteConversations = useMemo<Conversation[]>(() => {
     return (conversationListQuery.data ?? []).map((item) => {
@@ -583,9 +631,36 @@ export default function HomeScreen() {
     } catch { notify("Could not access contacts right now"); }
   };
 
+  /**
+   * Sends the poll being composed.
+   *
+   * Blank answers are dropped, and a question with fewer than two answers left is refused here as
+   * well as on the server: tapping "Add answer" by accident should not produce a poll nobody can
+   * meaningfully answer.
+   */
+  const sendPoll = async () => {
+    if (!pollDraft || !selectedId) return;
+    const question = pollDraft.question.trim();
+    const options = pollDraft.options.map((option) => option.trim()).filter(Boolean);
+    if (!question) { notify("A poll needs a question"); return; }
+    if (options.length < 2) { notify("A poll needs at least two answers"); return; }
+    setPollDraft(null);
+    await sendMessage({ text: question, kind: "poll", meta: { kind: "poll", question, options } });
+  };
+
+  /** Records my answer to a poll. Changing my mind is the same call; the server replaces the row. */
+  const castVote = async (message: Message, optionIndex: number) => {
+    try {
+      await votePoll.mutateAsync({ messageId: message.id, optionIndex });
+      await liveMessagesQuery.refetch();
+    } catch (error) {
+      notify(error instanceof Error && error.message ? error.message : "Could not record that vote");
+    }
+  };
+
   const sendMessage = async (override?: Partial<Message>) => {
     const trimmed = composerText.trim();
-    if ((!trimmed && !override?.mediaUrl) || !selectedId) return;
+    if ((!trimmed && !override?.mediaUrl && !override?.text) || !selectedId) return;
     const now = new Date();
     const time = now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
     const localMessage: Message = { id: `new-${Date.now()}`, text: trimmed || override?.text || "Shared media", time, mine: true, read: true, viewOnce, quote: replyTo ? { id: replyTo.id, body: replyTo.text, kind: "text", senderId: user?.id ?? 0, senderName: replyTo.senderName, deleted: false } : undefined, ...override };
@@ -593,7 +668,7 @@ export default function HomeScreen() {
       try {
         // mediaMime was never sent before, so every attachment was stored untyped and the UI could
         // not tell a PDF from a zip.
-        await sendRemoteMessage.mutateAsync({ conversationId: selectedId, body: localMessage.text, kind: localMessage.kind ?? "text", mediaUrl: localMessage.mediaUrl, mediaName: localMessage.mediaName, mediaMime: localMessage.mediaMime, voiceDurationMs: localMessage.voiceDurationMs, replyToId: replyTo?.id, viewOnce });
+        await sendRemoteMessage.mutateAsync({ conversationId: selectedId, body: localMessage.text, kind: localMessage.kind ?? "text", mediaUrl: localMessage.mediaUrl, mediaName: localMessage.mediaName, mediaMime: localMessage.mediaMime, voiceDurationMs: localMessage.voiceDurationMs, replyToId: replyTo?.id, viewOnce, meta: localMessage.meta });
         await liveMessagesQuery.refetch();
       } catch { notify("Message saved locally; reconnect to sync it"); }
     } else {
@@ -674,7 +749,7 @@ export default function HomeScreen() {
 
   const backendMessages: Message[] = (liveMessagesQuery.data ?? []).map((item) => ({
     id: item.id,
-    text: item.deletedAt ? "This message was deleted" : item.body ?? item.mediaName ?? (item.kind === "voice" ? "Voice note" : "Shared media"),
+    text: item.deletedAt ? "This message was deleted" : item.body ?? item.mediaName ?? (item.kind === "voice" ? "Voice note" : item.kind === "poll" ? "Poll" : item.kind === "location" ? "Location" : item.kind === "contact" ? "Contact" : "Shared media"),
     time: new Date(item.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
     mine: item.senderId === user?.id,
     read: item.status === "read",
@@ -692,6 +767,8 @@ export default function HomeScreen() {
     expiresAt: item.expiresAt ? new Date(item.expiresAt).toISOString() : undefined,
     reactions: item.reactions,
     quote: item.replyTo ?? undefined,
+    votes: item.votes,
+    meta: item.meta ?? undefined,
   }));
 
   // ---- the message menu ---------------------------------------------------------------
@@ -850,11 +927,13 @@ export default function HomeScreen() {
             {!item.deleted && !item.viewOnce && item.mediaUrl && item.kind === "video" ? <VideoMessage uri={resolveMediaUrl(item.mediaUrl) ?? ""} style={styles.messageVideo} /> : null}
             {!item.deleted && item.kind === "file" ? <Pressable onPress={() => void openAttachment(item)} style={styles.fileTile}><View style={[styles.fileIcon, { backgroundColor: item.mine ? "rgba(255,255,255,0.18)" : colors.background }]}><MaterialIcons name={attachmentKind(item.mediaMime).icon} size={20} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /></View><View style={styles.fileCopy}><Text style={[styles.fileName, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]} numberOfLines={1}>{item.mediaName ?? "Attachment"}</Text><Text style={[styles.fileMeta, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>{attachmentKind(item.mediaMime).label} · Tap to open</Text></View><MaterialIcons name="open-in-new" size={17} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /></Pressable> : null}
             {item.kind === "voice" ? <Pressable onPress={() => { if (item.mediaUrl) createAudioPlayer(resolveMediaUrl(item.mediaUrl)).play(); }} style={styles.voiceBubble}><MaterialIcons name="play-arrow" size={22} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /><View style={styles.voiceWave}><View style={[styles.voiceLine, { backgroundColor: item.mine ? colors.bubbleOutgoingText : colors.primary }]} /><View style={[styles.voiceLineShort, { backgroundColor: item.mine ? colors.bubbleOutgoingText : colors.primary }]} /><View style={[styles.voiceLine, { backgroundColor: item.mine ? colors.bubbleOutgoingText : colors.primary }]} /></View><Text style={[styles.voiceLabel, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]}>{item.text}</Text></Pressable> : null}
-            {item.kind !== "voice" && item.kind !== "file" && (item.kind !== "image" || !item.mediaUrl) ? <MessageText text={item.text} names={mentionNames} style={[styles.messageText, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]} mentionStyle={[styles.mention, { color: colors.primary }]} /> : null}
+            {!item.deleted && item.kind === "poll" && item.meta?.kind === "poll" ? <PollBubble meta={item.meta} votes={item.votes ?? []} myUserId={user?.id} mine={Boolean(item.mine)} colors={colors} onVote={(index) => void castVote(item, index)} /> : null}
+            {item.kind !== "voice" && item.kind !== "file" && item.kind !== "poll" && (item.kind !== "image" || !item.mediaUrl) ? <MessageText text={item.text} names={mentionNames} style={[styles.messageText, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]} mentionStyle={[styles.mention, { color: colors.primary }]} /> : null}
             <View style={styles.messageMeta}>{item.edited ? <Text style={[styles.editedTag, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>edited</Text> : null}<Text style={[styles.messageTime, { color: item.mine ? colors.bubbleOutgoingText : colors.muted, opacity: item.mine ? 0.75 : 1 }]}>{item.time}</Text>{item.starred ? <MaterialIcons name="star" size={13} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /> : null}<MessageTicks status={item.status} color={item.mine ? colors.bubbleOutgoingText : colors.muted} readColor="#53BDEB" /></View>
           </View>{item.reactions && item.reactions.length > 0 ? <View style={styles.reactionRow}>{item.reactions.map((reaction) => <View key={`${item.id}-${reaction.userId}`} style={[styles.reactionChip, { backgroundColor: colors.surface, borderColor: colors.border }]}><Text style={styles.reactionEmoji}>{reaction.emoji}</Text></View>)}</View> : null}{reactingToId === item.id ? <View style={[styles.reactionPicker, { backgroundColor: colors.surface, borderColor: colors.border }]}>{REACTION_EMOJIS.map((emoji) => <Pressable key={emoji} onPress={() => void applyReaction(item, emoji)} hitSlop={6}><Text style={styles.reactionEmoji}>{emoji}</Text></Pressable>)}</View> : null}{activeMessageId === item.id ? <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.actionsScroll} contentContainerStyle={[styles.messageActions, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => { setReplyTo({ id: item.id, text: item.text, senderName: item.mine ? "You" : selectedChat.name }); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Reply</Text></Pressable><Pressable onPress={() => { setReactingToId(item.id); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>React</Text></Pressable><Pressable onPress={() => void toggleStar(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>{item.starred ? "Unstar" : "Star"}</Text></Pressable><Pressable onPress={() => { setForwarding(item); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Forward</Text></Pressable>{item.mine && !item.deleted && item.kind === "text" ? <Pressable onPress={() => beginEdit(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>Edit</Text></Pressable> : null}<Pressable onPress={() => void deleteMessage(item, false)}><Text style={[styles.actionText, { color: colors.foreground }]}>Delete for me</Text></Pressable>{item.mine && !item.deleted ? <Pressable onPress={() => void deleteMessage(item, true)}><Text style={[styles.actionText, { color: colors.error }]}>Delete for everyone</Text></Pressable> : null}</ScrollView> : null}</Pressable>} />
-          <View style={[styles.composerArea, { borderTopColor: colors.border, backgroundColor: colors.background }]}>{editingId ? <Pressable onPress={() => { setEditingId(null); setComposerText(""); }} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>Editing message</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{composerText}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : replyTo ? <Pressable onPress={() => setReplyTo(null)} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>{replyTo.senderName}</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{replyTo.text}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : null}{mentionSuggestions.length > 0 ? <View style={[styles.mentionBar, { backgroundColor: colors.surface, borderColor: colors.border }]}>{mentionSuggestions.map((name) => <Pressable key={name} onPress={() => setComposerText((current) => completeMention(current, name))} style={[styles.mentionChip, { borderColor: colors.border }]}><Text style={[styles.mentionChipText, { color: colors.primary }]}>{name}</Text></Pressable>)}</View> : null}<View style={[styles.composer, { backgroundColor: colors.surface, borderColor: colors.border }]}><IconButton name="add" color={colors.muted} onPress={() => setShowAttach((current) => !current)} /><Pressable onPress={() => setViewOnce(!viewOnce)} style={[styles.viewOnce, viewOnce && { backgroundColor: colors.primary }]}><Text style={[styles.viewOnceText, { color: viewOnce ? "#FFFFFF" : colors.muted }]}>1</Text></Pressable><TextInput value={composerText} onChangeText={onComposerChange} placeholder={editingId ? "Edit message" : "Write a message"} placeholderTextColor={colors.muted} style={[styles.composerInput, { color: colors.foreground }]} multiline maxLength={500} /><IconButton name="mood" color={colors.muted} onPress={() => setComposerText((current) => `${current}${current ? " " : ""}✨`)} /></View>{showAttach ? <View style={styles.attachSheet}><Pressable onPress={() => { setShowAttach(false); void shareMedia(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="perm-media" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Photo or video</Text></Pressable><Pressable onPress={() => { setShowAttach(false); void shareDocument(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="attach-file" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Document</Text></Pressable></View> : null}<Pressable onPress={editingId ? () => void saveEdit() : composerText.trim() ? () => void sendMessage() : recorderState.isRecording ? () => void stopVoiceNote() : () => void startVoiceNote()} style={({ pressed }) => [styles.sendButton, { backgroundColor: recorderState.isRecording ? colors.error : colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name={editingId ? "check" : composerText.trim() ? "send" : recorderState.isRecording ? "stop" : "mic"} size={21} color="#FFFFFF" /></Pressable></View>
+          <View style={[styles.composerArea, { borderTopColor: colors.border, backgroundColor: colors.background }]}>{editingId ? <Pressable onPress={() => { setEditingId(null); setComposerText(""); }} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>Editing message</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{composerText}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : replyTo ? <Pressable onPress={() => setReplyTo(null)} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>{replyTo.senderName}</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{replyTo.text}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : null}{mentionSuggestions.length > 0 ? <View style={[styles.mentionBar, { backgroundColor: colors.surface, borderColor: colors.border }]}>{mentionSuggestions.map((name) => <Pressable key={name} onPress={() => setComposerText((current) => completeMention(current, name))} style={[styles.mentionChip, { borderColor: colors.border }]}><Text style={[styles.mentionChipText, { color: colors.primary }]}>{name}</Text></Pressable>)}</View> : null}<View style={[styles.composer, { backgroundColor: colors.surface, borderColor: colors.border }]}><IconButton name="add" color={colors.muted} onPress={() => setShowAttach((current) => !current)} /><Pressable onPress={() => setViewOnce(!viewOnce)} style={[styles.viewOnce, viewOnce && { backgroundColor: colors.primary }]}><Text style={[styles.viewOnceText, { color: viewOnce ? "#FFFFFF" : colors.muted }]}>1</Text></Pressable><TextInput value={composerText} onChangeText={onComposerChange} placeholder={editingId ? "Edit message" : "Write a message"} placeholderTextColor={colors.muted} style={[styles.composerInput, { color: colors.foreground }]} multiline maxLength={500} /><IconButton name="mood" color={colors.muted} onPress={() => setComposerText((current) => `${current}${current ? " " : ""}✨`)} /></View>{showAttach ? <View style={styles.attachSheet}><Pressable onPress={() => { setShowAttach(false); void shareMedia(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="perm-media" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Photo or video</Text></Pressable><Pressable onPress={() => { setShowAttach(false); void shareDocument(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="attach-file" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Document</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setPollDraft({ question: "", options: ["", ""] }); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="poll" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Poll</Text></Pressable></View> : null}<Pressable onPress={editingId ? () => void saveEdit() : composerText.trim() ? () => void sendMessage() : recorderState.isRecording ? () => void stopVoiceNote() : () => void startVoiceNote()} style={({ pressed }) => [styles.sendButton, { backgroundColor: recorderState.isRecording ? colors.error : colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name={editingId ? "check" : composerText.trim() ? "send" : recorderState.isRecording ? "stop" : "mic"} size={21} color="#FFFFFF" /></Pressable></View>
           {onceVideo ? <View style={styles.overlay}><VideoMessage uri={onceVideo} style={styles.overlayVideo} /><Text style={styles.overlayNote}>This video can only be opened once. The stored copy has already been removed.</Text><Pressable onPress={() => setOnceVideo(null)} style={styles.overlayClose}><Text style={styles.overlayCloseText}>Close</Text></Pressable></View> : null}
+          {pollDraft ? <View style={[styles.contactSheet, { backgroundColor: colors.background, borderColor: colors.border }]}><View style={styles.contactHeader}><View><Text style={[styles.contactTitle, { color: colors.foreground }]}>New poll</Text><Text style={[styles.contactSubtitle, { color: colors.muted }]}>One question, at least two answers</Text></View><IconButton name="close" color={colors.foreground} onPress={() => setPollDraft(null)} /></View><ScrollView contentContainerStyle={styles.pollBuilder} keyboardShouldPersistTaps="handled"><TextInput value={pollDraft.question} onChangeText={(question) => setPollDraft((current) => (current ? { ...current, question } : current))} placeholder="Question" placeholderTextColor={colors.muted} style={[styles.pollInput, { color: colors.foreground, borderColor: colors.border, backgroundColor: colors.surface }]} maxLength={300} />{pollDraft.options.map((option, index) => <TextInput key={`poll-option-${index}`} value={option} onChangeText={(value) => setPollDraft((current) => (current ? { ...current, options: current.options.map((existing, position) => (position === index ? value : existing)) } : current))} placeholder={`Answer ${index + 1}`} placeholderTextColor={colors.muted} style={[styles.pollInput, { color: colors.foreground, borderColor: colors.border, backgroundColor: colors.surface }]} maxLength={120} />)}{pollDraft.options.length < 12 ? <Pressable onPress={() => setPollDraft((current) => (current ? { ...current, options: [...current.options, ""] } : current))} style={({ pressed }) => [styles.pollAddOption, pressed && styles.rowPressed]}><MaterialIcons name="add" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.primary }]}>Add answer</Text></Pressable> : null}<Pressable onPress={() => void sendPoll()} style={({ pressed }) => [styles.pollSend, { backgroundColor: colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name="send" size={18} color="#FFFFFF" /><Text style={styles.pollSendText}>Create poll</Text></Pressable></ScrollView></View> : null}
           {oncePreview ? <View style={styles.overlay}><Image source={{ uri: oncePreview }} style={styles.overlayImage} resizeMode="contain" /><Text style={styles.overlayNote}>This photo can only be opened once. The stored copy has already been removed.</Text><Pressable onPress={() => setOncePreview(null)} style={styles.overlayClose}><Text style={styles.overlayCloseText}>Close</Text></Pressable></View> : null}
         </KeyboardAvoidingView>
       </ScreenContainer>
@@ -898,7 +977,21 @@ const styles = StyleSheet.create({
   mentionChipText: { fontSize: 12.5, fontWeight: "700" },
   attachSheet: { flexDirection: "row", gap: 8, paddingHorizontal: 14, paddingBottom: 10 },
   attachOption: { flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 12, paddingVertical: 9, borderRadius: 12, borderWidth: 1 },
-  attachLabel: { fontSize: 13, fontWeight: "600" }, composerArea: { flexDirection: "row", alignItems: "flex-end", gap: 8, paddingHorizontal: 12, paddingTop: 9, paddingBottom: 9, borderTopWidth: StyleSheet.hairlineWidth }, composer: { flex: 1, minHeight: 46, maxHeight: 110, borderRadius: 23, borderWidth: 1, flexDirection: "row", alignItems: "flex-end", paddingLeft: 3, paddingRight: 4 }, composerInput: { flex: 1, fontSize: 15, maxHeight: 94, paddingHorizontal: 7, paddingVertical: 12, backgroundColor: "transparent" }, sendButton: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center" }, sendPressed: { transform: [{ scale: 0.96 }], opacity: 0.88 }, voiceBubble: { flexDirection: "row", alignItems: "center", gap: 7, minWidth: 170 }, voiceWave: { flexDirection: "row", gap: 3, alignItems: "center" }, voiceLine: { width: 3, height: 18, borderRadius: 2 }, voiceLineShort: { width: 3, height: 10, borderRadius: 2 }, voiceLabel: { flexShrink: 1, fontSize: 12, fontWeight: "700" }, contactSheet: { position: "absolute", zIndex: 10, top: 0, left: 0, right: 0, bottom: 0, paddingTop: 18, borderTopWidth: 1 }, contactHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 20, paddingBottom: 18 }, contactTitle: { fontSize: 21, fontWeight: "800" }, contactSubtitle: { fontSize: 12, marginTop: 4 }, contactSearch: { marginBottom: 12 }, contactList: { paddingBottom: 30 }, contactRow: { minHeight: 72, flexDirection: "row", alignItems: "center", paddingHorizontal: 20 }, contactAvatar: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center", marginRight: 12 },   contactCopy: { flex: 1 },
+  attachLabel: { fontSize: 13, fontWeight: "600" },
+  // ---- polls ------------------------------------------------------------------------------
+  pollCard: { minWidth: 224 },
+  pollQuestion: { fontSize: 14.5, fontWeight: "700", marginBottom: 8 },
+  pollOption: { borderWidth: 1, borderRadius: 10, marginBottom: 6, overflow: "hidden" },
+  pollBar: { position: "absolute", left: 0, top: 0, bottom: 0, opacity: 0.18 },
+  pollOptionRow: { flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 9, paddingVertical: 8 },
+  pollOptionText: { flex: 1, fontSize: 13.5 },
+  pollCount: { fontSize: 12, fontWeight: "700" },
+  pollFootnote: { fontSize: 11.5, marginTop: 2 },
+  pollBuilder: { paddingHorizontal: 20, paddingBottom: 40, gap: 10 },
+  pollInput: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 11, fontSize: 14.5 },
+  pollAddOption: { flexDirection: "row", alignItems: "center", gap: 6, paddingVertical: 6 },
+  pollSend: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, borderRadius: 12, paddingVertical: 13, marginTop: 6 },
+  pollSendText: { color: "#FFFFFF", fontSize: 14, fontWeight: "700" }, composerArea: { flexDirection: "row", alignItems: "flex-end", gap: 8, paddingHorizontal: 12, paddingTop: 9, paddingBottom: 9, borderTopWidth: StyleSheet.hairlineWidth }, composer: { flex: 1, minHeight: 46, maxHeight: 110, borderRadius: 23, borderWidth: 1, flexDirection: "row", alignItems: "flex-end", paddingLeft: 3, paddingRight: 4 }, composerInput: { flex: 1, fontSize: 15, maxHeight: 94, paddingHorizontal: 7, paddingVertical: 12, backgroundColor: "transparent" }, sendButton: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center" }, sendPressed: { transform: [{ scale: 0.96 }], opacity: 0.88 }, voiceBubble: { flexDirection: "row", alignItems: "center", gap: 7, minWidth: 170 }, voiceWave: { flexDirection: "row", gap: 3, alignItems: "center" }, voiceLine: { width: 3, height: 18, borderRadius: 2 }, voiceLineShort: { width: 3, height: 10, borderRadius: 2 }, voiceLabel: { flexShrink: 1, fontSize: 12, fontWeight: "700" }, contactSheet: { position: "absolute", zIndex: 10, top: 0, left: 0, right: 0, bottom: 0, paddingTop: 18, borderTopWidth: 1 }, contactHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 20, paddingBottom: 18 }, contactTitle: { fontSize: 21, fontWeight: "800" }, contactSubtitle: { fontSize: 12, marginTop: 4 }, contactSearch: { marginBottom: 12 }, contactList: { paddingBottom: 30 }, contactRow: { minHeight: 72, flexDirection: "row", alignItems: "center", paddingHorizontal: 20 }, contactAvatar: { width: 46, height: 46, borderRadius: 23, alignItems: "center", justifyContent: "center", marginRight: 12 },   contactCopy: { flex: 1 },
   // ---- message menu + richer bubbles --------------------------------------------------
   quoteBlock: { borderLeftWidth: 3, paddingLeft: 8, marginBottom: 6, borderRadius: 3 },
   quoteName: { fontSize: 11.5, fontWeight: "700" },

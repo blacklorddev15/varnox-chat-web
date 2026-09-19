@@ -11,7 +11,7 @@ import { notifyConversationMembers } from "./push";
 import { messages } from "../drizzle/schema";
 // Message actions (reactions, stars, edits, deletes, per-chat preferences) sit with the other
 // row-level operations in db.ts; imported on their own line so the list above stays readable.
-import { consumeViewOnce, conversationDisappearSeconds, deleteMessageForEveryone, editMessageBody, getMessageById, hideMessageForUser, listStarredMessages, markConversationDelivered, reactToMessage, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setMessageStar } from "./db";
+import { castPollVote, consumeViewOnce, conversationDisappearSeconds, deleteMessageForEveryone, editMessageBody, getMessageById, hideMessageForUser, listStarredMessages, markConversationDelivered, reactToMessage, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setMessageStar } from "./db";
 // Presence: who is around right now, and who is mid-sentence. Also in db.ts, for the same reason.
 import { getConversationSummary, leaveGroup, listConversationMemberIds, listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
 // Server-Sent Events nudge channel; see nudgeConversation below.
@@ -46,7 +46,40 @@ async function nudgeConversation(conversationId: string, actorId: number, type: 
   }
 }
 
-const messageKind = z.enum(["text", "image", "video", "file", "voice"]);
+const messageKind = z.enum(["text", "image", "video", "file", "voice", "poll", "location", "contact"]);
+
+// ---- poll / location / contact payloads --------------------------------------------------------
+// These three kinds carry no file, so their content rides in `messages.meta`. It is validated here
+// rather than trusted from the client: a poll with a single option, or a latitude of 900, would be
+// a row that every other client then has to defend itself against.
+const pollMetaSchema = z.object({ question: z.string().trim().min(1).max(300), options: z.array(z.string().trim().min(1).max(120)).min(2).max(12) });
+const locationMetaSchema = z.object({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180), label: z.string().trim().max(120).optional() });
+const contactMetaSchema = z.object({ userId: z.number().int().positive(), name: z.string().trim().min(1).max(120), username: z.string().trim().max(32).optional(), phone: z.string().trim().max(24).optional() });
+
+/** Narrows a payload to the kind it claims to be, and returns null for the kinds that carry none. */
+function normalizeMessageMeta(kind: string, raw: unknown) {
+  if (kind === "poll") {
+    const parsed = pollMetaSchema.parse(raw);
+    // Two options differing only in case or spacing are the same answer offered twice, which makes
+    // the result meaningless. Rejected outright rather than silently merged.
+    const seen = new Set<string>();
+    for (const option of parsed.options) {
+      const key = option.toLowerCase().replace(/\s+/g, " ");
+      if (seen.has(key)) throw new Error("A poll cannot offer the same answer twice");
+      seen.add(key);
+    }
+    return { kind: "poll" as const, question: parsed.question, options: parsed.options };
+  }
+  if (kind === "location") { const parsed = locationMetaSchema.parse(raw); return { kind: "location" as const, ...parsed }; }
+  if (kind === "contact") { const parsed = contactMetaSchema.parse(raw); return { kind: "contact" as const, ...parsed }; }
+  return null;
+}
+
+/** Options of a stored poll, read defensively: `meta` is JSON that an older or newer build wrote. */
+function pollOptionsOf(meta: unknown): string[] {
+  const options = (meta as { options?: unknown } | null)?.options;
+  return Array.isArray(options) ? options.filter((option): option is string => typeof option === "string") : [];
+}
 
 /** One row of listActiveStatusesByAuthors, used to type the grouped feed. */
 type StatusRow = Awaited<ReturnType<typeof listActiveStatusesByAuthors>>[number];
@@ -125,18 +158,36 @@ export const appRouter = router({
       if (!result) throw new Error("Could not start that conversation");
       return result;
     }),
-    send: protectedProcedure.input(z.object({ conversationId: z.string().min(1), body: z.string().max(10000).optional(), kind: messageKind.default("text"), mediaUrl: z.string().max(2000).optional(), mediaMime: z.string().max(160).optional(), mediaName: z.string().max(255).optional(), voiceDurationMs: z.number().int().min(0).max(3600000).optional(), replyToId: z.string().max(64).optional(), forwardedFromId: z.string().max(64).optional(), viewOnce: z.boolean().default(false) })).mutation(async ({ ctx, input }) => {
+    send: protectedProcedure.input(z.object({ conversationId: z.string().min(1), body: z.string().max(10000).optional(), kind: messageKind.default("text"), mediaUrl: z.string().max(2000).optional(), mediaMime: z.string().max(160).optional(), mediaName: z.string().max(255).optional(), voiceDurationMs: z.number().int().min(0).max(3600000).optional(), replyToId: z.string().max(64).optional(), forwardedFromId: z.string().max(64).optional(), viewOnce: z.boolean().default(false), meta: z.unknown().optional() })).mutation(async ({ ctx, input }) => {
       if (!(await isConversationMember(input.conversationId, ctx.user.id))) throw new Error("You are not a member of this conversation");
       // The disappearing clock is stamped at send time, so changing the setting later cannot
       // retroactively expire messages somebody already received.
       const disappearSeconds = await conversationDisappearSeconds(input.conversationId);
-      const message: typeof messages.$inferInsert = { id: crypto.randomUUID(), conversationId: input.conversationId, senderId: ctx.user.id, body: input.body ?? null, kind: input.kind, mediaUrl: input.mediaUrl ?? null, mediaMime: input.mediaMime ?? null, mediaName: input.mediaName ?? null, voiceDurationMs: input.voiceDurationMs ?? null, replyToId: input.replyToId ?? null, forwardedFromId: input.forwardedFromId ?? null, viewOnce: input.viewOnce ? 1 : 0, expiresAt: disappearSeconds ? new Date(Date.now() + disappearSeconds * 1000) : null };
+      // Polls, locations and contacts carry their content in `meta`; the media kinds carry none.
+      const meta = normalizeMessageMeta(input.kind, input.meta);
+      if (!meta && (input.kind === "poll" || input.kind === "location" || input.kind === "contact")) throw new Error("That message arrived without its content");
+      const message: typeof messages.$inferInsert = { id: crypto.randomUUID(), conversationId: input.conversationId, senderId: ctx.user.id, body: input.body ?? null, kind: input.kind, mediaUrl: input.mediaUrl ?? null, mediaMime: input.mediaMime ?? null, mediaName: input.mediaName ?? null, voiceDurationMs: input.voiceDurationMs ?? null, replyToId: input.replyToId ?? null, forwardedFromId: input.forwardedFromId ?? null, viewOnce: input.viewOnce ? 1 : 0, meta, expiresAt: disappearSeconds ? new Date(Date.now() + disappearSeconds * 1000) : null };
       const created = await createMessage(message);
       // A view-once photo must not be described in the notification body.
-      const preview = input.viewOnce ? "Photo (view once)" : input.body ?? (input.kind === "voice" ? "Voice note" : "Shared media");
+      const preview = input.viewOnce ? "Photo (view once)" : input.body ?? (input.kind === "voice" ? "Voice note" : meta?.kind === "poll" ? `Poll: ${meta.question}` : meta?.kind === "location" ? "Location" : meta?.kind === "contact" ? `Contact: ${meta.name}` : "Shared media");
       void notifyConversationMembers({ conversationId: input.conversationId, senderId: ctx.user.id, title: ctx.user.name ?? "New message", body: preview });
       void nudgeConversation(input.conversationId, ctx.user.id, "message");
       return created;
+    }),
+
+    // ---- polls ---------------------------------------------------------------------------
+    /**
+     * Answers a poll, or replaces an earlier answer. One row per person is enforced by the primary
+     * key rather than by this code, so two taps racing each other cannot produce two votes.
+     */
+    votePoll: protectedProcedure.input(z.object({ messageId: z.string().min(1), optionIndex: z.number().int().min(0).max(63) })).mutation(async ({ ctx, input }) => {
+      const message = await requireVisibleMessage(input.messageId, ctx.user.id);
+      if (message.kind !== "poll") throw new Error("That message is not a poll");
+      if (message.deletedAt) throw new Error("That poll was deleted");
+      if (input.optionIndex >= pollOptionsOf(message.meta).length) throw new Error("That answer is not part of this poll");
+      await castPollVote(message.id, ctx.user.id, input.optionIndex);
+      void nudgeConversation(message.conversationId, ctx.user.id, "message-updated");
+      return { ok: true as const };
     }),
 
     // ---- the message menu: react, star, edit, delete, view-once --------------------------

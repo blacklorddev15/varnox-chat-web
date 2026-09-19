@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, ilike, inArray, isNull, like, lt, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, messageHides, messageMedia, messageReactions, messageStars, messages, presence, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, messageHides, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -437,6 +437,25 @@ export async function listMessages(conversationId: string, userId: number, since
     reactionsByMessage.set(row.messageId, list);
   }
 
+  // Poll answers, same shape of bulk fetch as reactions and only for the polls on this page, so a
+  // chat with no polls costs no extra query. The tally itself is built by the client, which already
+  // knows how to group per-person rows for reactions.
+  const pollIds = rows.filter((row) => row.kind === "poll").map((row) => row.id);
+  const voteRows = pollIds.length
+    ? await db
+        .select({ messageId: pollVotes.messageId, userId: pollVotes.userId, optionIndex: pollVotes.optionIndex, name: users.name, username: users.username })
+        .from(pollVotes)
+        .leftJoin(users, eq(users.id, pollVotes.userId))
+        .where(inArray(pollVotes.messageId, pollIds))
+    : [];
+
+  const votesByMessage = new Map<string, Array<{ userId: number; optionIndex: number; name: string }>>();
+  for (const row of voteRows) {
+    const list = votesByMessage.get(row.messageId) ?? [];
+    list.push({ userId: row.userId, optionIndex: row.optionIndex, name: row.name ?? row.username ?? "Someone" });
+    votesByMessage.set(row.messageId, list);
+  }
+
   // Quoted messages are fetched by id, and may themselves already have been deleted.
   const replyIds = [...new Set(rows.map((row) => row.replyToId).filter((id): id is string => Boolean(id)))];
   const quoted = replyIds.length
@@ -472,6 +491,7 @@ export async function listMessages(conversationId: string, userId: number, since
         ...row,
         starred: starredIds.has(row.id),
         reactions: reactionsByMessage.get(row.id) ?? [],
+        votes: votesByMessage.get(row.id) ?? [],
         replyTo: quote
           ? {
               id: quote.id,
@@ -981,6 +1001,24 @@ export async function getMessageById(messageId: string) {
 }
 
 /** One reaction per person per message: reacting again replaces the previous emoji. */
+/**
+ * Records a poll answer, replacing whatever that person answered before.
+ *
+ * The upsert is keyed on the primary key rather than on a lookup, so "one answer per person" is a
+ * database rule instead of something the UI has to remember, and changing your mind is the same
+ * call as answering the first time. Answers are changed, never withdrawn - matching the apps this
+ * follows, where a poll answer is a choice rather than a toggle.
+ */
+export async function castPollVote(messageId: string, userId: number, optionIndex: number) {
+  const db = await getDb();
+  if (!db) return false;
+  await db
+    .insert(pollVotes)
+    .values({ messageId, userId, optionIndex })
+    .onConflictDoUpdate({ target: [pollVotes.messageId, pollVotes.userId], set: { optionIndex } });
+  return true;
+}
+
 export async function reactToMessage(messageId: string, userId: number, emoji: string | null) {
   const db = await getDb();
   if (!db) return;
