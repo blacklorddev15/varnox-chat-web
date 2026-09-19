@@ -55,9 +55,41 @@ That produces two things:
 | Output | What it is |
 |---|---|
 | `web-dist/` | the exported Expo web app, served statically by the API |
-| `server-dist/index.mjs` | the API bundle |
+| `server-dist/index.cjs` | the API bundle, with every dependency inlined |
 
 `pnpm build:selfhost` is the same as `pnpm build:pterodactyl`.
+
+### The bundle has no dependencies
+
+`server-dist/index.cjs` inlines express, pg, drizzle and the rest into one ~2.6 MB file, so the
+server runs with **no `node_modules` directory at all**. That matters on a panel where you have no
+admin rights: you can upload three things and start, without an install step or a build.
+
+Why CommonJS rather than the ES module it used to be: several dependencies call `require()` for Node
+builtins at runtime, and an ES module bundle cannot shim that - it dies at boot with
+`Dynamic require of "fs" is not supported`. CommonJS has `require` natively.
+
+### Upload-only deployment (no admin, no install)
+
+If your server's startup command is `npm start`, it runs the `start` script from `package.json`,
+which points at this bundle. Nothing else is needed.
+
+1. Upload to the server root, keeping the paths:
+
+   ```text
+   package.json               (or just a package.json containing the start script)
+   server-dist/index.cjs
+   web-dist/                  (only if you want this server to render the site)
+   ```
+
+2. If the panel gives you no `DATABASE_URL` variable, upload a `.env` file beside them - the server
+   loads `dotenv/config`, and that is where the secrets come from.
+3. Start the server.
+
+`SERVER_PORT` is provided by the panel automatically, so nothing needs configuring for the port.
+
+Migrations are the one thing that still needs a full install (`drizzle-kit` is a dev dependency), so
+run `pnpm db:migrate` from a machine that has the repo, against the same `DATABASE_URL`.
 
 ## Environment variables
 
@@ -89,10 +121,10 @@ DATABASE_URL="your-connection-string" pnpm drizzle-kit migrate
 ```bash
 pnpm start
 # or explicitly:
-NODE_ENV=production node server-dist/index.mjs
+NODE_ENV=production node server-dist/index.cjs
 ```
 
-**Pterodactyl / panel startup command:** `node server-dist/index.mjs`
+**Pterodactyl / panel startup command:** `node server-dist/index.cjs`
 
 > If your panel was configured for the old build, its command pointed at `server-dist/index.js`.
 > The filename changed to `.mjs` deliberately - the previous `.js` bundle was ES-module syntax in a
@@ -107,14 +139,14 @@ port, so do not create a second server or split them.
 **Startup command** (egg → Startup tab):
 
 ```text
-node server-dist/index.mjs
+node server-dist/index.cjs
 ```
 
 The allocated port is read from `SERVER_PORT`, which is the variable the panel injects. Being
 explicit works too:
 
 ```text
-PORT={{SERVER_PORT}} node server-dist/index.mjs
+PORT={{SERVER_PORT}} node server-dist/index.cjs
 ```
 
 > If the app binds anything other than the server's allocation, the panel's `IP:port` answers

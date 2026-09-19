@@ -13,7 +13,7 @@
         "Node.js 20": "ghcr.io/pterodactyl/yolks:nodejs_20"
     },
     "file_denylist": [],
-    "startup": "NODE_ENV=production node server-dist/index.mjs",
+    "startup": "NODE_ENV=production node server-dist/index.cjs",
     "config": {
         "files": "{}",
         "startup": "{\"done\": \"server listening on port\"}",
