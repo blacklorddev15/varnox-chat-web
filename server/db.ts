@@ -545,12 +545,13 @@ export async function updatePasswordHash(userId: number, passwordHash: string) {
   await db.update(users).set({ passwordHash, updatedAt: new Date() }).where(eq(users.id, userId));
 }
 
-export async function updateUserProfile(userId: number, patch: { name?: string; about?: string }) {
+export async function updateUserProfile(userId: number, patch: { name?: string; about?: string; phone?: string }) {
   const db = await getDb();
   if (!db) throw new Error("Account storage is not available");
   const set: Record<string, unknown> = { updatedAt: new Date() };
   if (patch.name !== undefined) set.name = patch.name;
   if (patch.about !== undefined) set.about = patch.about;
+  if (patch.phone !== undefined) set.phone = patch.phone;
   await db.update(users).set(set).where(eq(users.id, userId));
   return getUserById(userId);
 }

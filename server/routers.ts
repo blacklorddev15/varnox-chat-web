@@ -144,7 +144,7 @@ export const appRouter = router({
     history: protectedProcedure.input(z.object({ limit: z.number().int().min(1).max(50).default(30) }).optional()).query(({ ctx, input }) => listRecentCalls(ctx.user.id, input?.limit ?? 30)),
   }),
   profile: router({
-    update: protectedProcedure.input(z.object({ name: z.string().trim().min(1).max(60).optional(), about: z.string().trim().max(140).optional() })).mutation(({ ctx, input }) => updateUserProfile(ctx.user.id, input)),
+    update: protectedProcedure.input(z.object({ name: z.string().trim().min(1).max(60).optional(), about: z.string().trim().max(140).optional(), phone: z.string().trim().regex(/^\+?\d{7,15}$/, "Enter a valid phone number").optional() })).mutation(({ ctx, input }) => updateUserProfile(ctx.user.id, input)),
     setAvatar: protectedProcedure.input(z.object({ base64: z.string().min(1).max(4_000_000), mimeType: z.string().regex(/^image\/(png|jpe?g|webp)$/) })).mutation(async ({ ctx, input }) => {
       const updatedAt = await setUserAvatar(ctx.user.id, input.mimeType, input.base64);
       return { avatarUpdatedAt: updatedAt.toISOString() };
