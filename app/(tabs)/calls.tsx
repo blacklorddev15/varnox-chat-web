@@ -17,7 +17,7 @@ export default function CallsScreen() {
 
   return (
     <ScreenContainer className="bg-background" edges={["top", "left", "right"]}>
-      <StatusBar style="dark" />
+      <StatusBar style="light" />
       <View style={styles.header}><View><Text style={[styles.eyebrow, { color: colors.primary }]}>KEEP IN TOUCH</Text><Text style={[styles.heading, { color: colors.foreground }]}>Calls</Text></View><Pressable onPress={() => notify("New call link created")} style={({ pressed }) => [styles.newCallButton, { backgroundColor: colors.primary }, pressed && styles.pressed]}><MaterialIcons name="add-link" size={18} color="#FFFFFF"/><Text style={styles.newCallText}>Create link</Text></Pressable></View>
       <View style={[styles.callCard, { backgroundColor: colors.surface, borderColor: colors.border }]}><View style={[styles.callCardIcon, { backgroundColor: "rgba(16,185,129,0.14)" }]}><MaterialIcons name="link" size={23} color={colors.success}/></View><View style={styles.callCardCopy}><Text style={[styles.callCardTitle, { color: colors.foreground }]}>Share a call link</Text><Text style={[styles.callCardSubtitle, { color: colors.muted }]}>Anyone can join with a link</Text></View><MaterialIcons name="chevron-right" size={22} color={colors.muted}/></View>
       <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Recent</Text>

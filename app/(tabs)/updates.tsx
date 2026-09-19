@@ -25,7 +25,7 @@ export default function UpdatesScreen() {
 
   return (
     <ScreenContainer className="bg-background" edges={["top", "left", "right"]}>
-      <StatusBar style="dark" />
+      <StatusBar style="light" />
       <View style={styles.header}><View><Text style={[styles.eyebrow, { color: colors.primary }]}>STAY IN THE LOOP</Text><Text style={[styles.heading, { color: colors.foreground }]}>Updates</Text></View><Pressable onPress={() => notify("Update options opened")} style={({ pressed }) => [styles.headerIcon, pressed && styles.pressed]}><MaterialIcons name="more-horiz" size={24} color={colors.foreground}/></Pressable></View>
       <FlatList
         data={channels}

@@ -9,3 +9,22 @@ html,
 body {
   background-color: #171717;
 }
+
+/* Web inputs: the browser otherwise paints form fields with its own light background, which
+   shows up as a white box inside the dark search bar and composer. Chrome's autofill styling
+   is overridden too, since it otherwise flashes a pale background over the login fields. */
+input,
+textarea {
+  background-color: transparent;
+}
+
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px #242424 inset;
+  -webkit-text-fill-color: #f8f6f0;
+  caret-color: #f8f6f0;
+}
