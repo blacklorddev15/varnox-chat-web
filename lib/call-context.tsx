@@ -67,6 +67,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const phaseRef = useRef<CallPhase>("idle");
   const ringTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tick = useRef<ReturnType<typeof setInterval> | null>(null);
+  const notificationRef = useRef<Notification | null>(null);
 
   const setPhaseBoth = useCallback((next: CallPhase) => {
     phaseRef.current = next;
@@ -238,6 +239,65 @@ export function CallProvider({ children }: { children: ReactNode }) {
     setSession(next);
     setPhaseBoth("ringing-in");
   }, [incoming.data, setPhaseBoth]);
+
+  // While the app is hidden the ringing overlay is invisible, so the call has to surface
+  // outside the page. The Android shell maps window.Notification onto NotificationManager and
+  // taps reopen the app, where the overlay is already ringing - so answering from the
+  // background needs no native change. The tag is fixed so a new call replaces the old alert
+  // rather than stacking, since the native bridge has no way to cancel one.
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof document === "undefined") return;
+    if (!("Notification" in window)) return;
+
+    const clear = () => {
+      const posted = notificationRef.current;
+      notificationRef.current = null;
+      try {
+        posted?.close();
+      } catch {
+        // the bridge has no cancel; the ring is simply replaced by the next one
+      }
+    };
+
+    if (phase !== "ringing-in" || !session) {
+      clear();
+      return;
+    }
+
+    const post = () => {
+      if (notificationRef.current) return;
+      if (document.visibilityState !== "hidden") return;
+      try {
+        if (window.Notification.permission !== "granted") return;
+        const alert = new window.Notification(`Incoming ${session.kind === "video" ? "video" : "voice"} call`, { body: session.peerName, tag: "varnox-incoming-call" });
+        alert.onclick = () => {
+          try {
+            window.focus();
+          } catch {
+            // the shell has already brought the activity forward
+          }
+          alert.close();
+          notificationRef.current = null;
+        };
+        notificationRef.current = alert;
+        try {
+          navigator.vibrate?.([300, 150, 300]);
+        } catch {
+          // no VIBRATE permission yet; harmless
+        }
+      } catch {
+        // a failed alert must never take a call down
+      }
+    };
+
+    post();
+    // The call can also arrive while the app is visible and then be backgrounded mid-ring.
+    document.addEventListener("visibilitychange", post);
+    return () => {
+      document.removeEventListener("visibilitychange", post);
+      clear();
+    };
+  }, [phase, session]);
 
   // Leaving the app entirely (web tab closed) should not leave a ringing call behind.
   useEffect(() => {
