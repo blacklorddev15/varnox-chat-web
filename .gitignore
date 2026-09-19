@@ -42,6 +42,12 @@ yarn-error.*
 # local env files
 .env*.local
 
+# Real secrets. Only `.env*.local` was ignored before, so a plain `.env` holding the database
+# password and JWT secret would have been committed to this public repository.
+.env
+.env.*
+!.env.example
+
 # typescript
 *.tsbuildinfo
 
