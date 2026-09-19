@@ -7,12 +7,8 @@ import { ScreenContainer } from "@/components/screen-container";
 import { useColors } from "@/hooks/use-colors";
 
 type Call = { id: string; name: string; initials: string; color: string; direction: "incoming" | "outgoing"; kind: "video" | "audio"; time: string; missed?: boolean };
-const calls: Call[] = [
-  { id: "maya", name: "Maya Chen", initials: "MC", color: "#F59E0B", direction: "outgoing", kind: "video", time: "Today, 9:48 AM" },
-  { id: "noah", name: "Noah Williams", initials: "NW", color: "#10B981", direction: "incoming", kind: "audio", time: "Yesterday, 6:24 PM", missed: true },
-  { id: "priya", name: "Priya Shah", initials: "PS", color: "#EC4899", direction: "incoming", kind: "video", time: "Yesterday, 2:02 PM" },
-  { id: "luca", name: "Luca Moretti", initials: "LM", color: "#0EA5E9", direction: "outgoing", kind: "audio", time: "Monday, 11:16 AM" },
-];
+// Call history has no backend yet, so this stays empty instead of showing demo people.
+const calls: Call[] = [];
 
 export default function CallsScreen() {
   const colors = useColors();
@@ -26,6 +22,7 @@ export default function CallsScreen() {
       <View style={[styles.callCard, { backgroundColor: colors.surface, borderColor: colors.border }]}><View style={[styles.callCardIcon, { backgroundColor: "rgba(16,185,129,0.14)" }]}><MaterialIcons name="link" size={23} color={colors.success}/></View><View style={styles.callCardCopy}><Text style={[styles.callCardTitle, { color: colors.foreground }]}>Share a call link</Text><Text style={[styles.callCardSubtitle, { color: colors.muted }]}>Anyone can join with a link</Text></View><MaterialIcons name="chevron-right" size={22} color={colors.muted}/></View>
       <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Recent</Text>
       <FlatList data={calls} keyExtractor={(item) => item.id} showsVerticalScrollIndicator={false} contentContainerStyle={styles.list} renderItem={({ item }) => <Pressable onPress={() => notify(`${item.kind === "video" ? "Video" : "Audio"} calling ${item.name}`)} style={({ pressed }) => [styles.callRow, pressed && styles.pressed]}><View style={[styles.avatar, { backgroundColor: item.color }]}><Text style={styles.avatarText}>{item.initials}</Text></View><View style={[styles.callCopy, { borderBottomColor: colors.border }]}><Text style={[styles.callName, { color: item.missed ? colors.error : colors.foreground }]}>{item.name}</Text><View style={styles.callMeta}><MaterialIcons name={item.direction === "incoming" ? "call-received" : "call-made"} size={15} color={item.missed ? colors.error : colors.success}/><Text style={[styles.callTime, { color: colors.muted }]}>{item.time}</Text></View></View><MaterialIcons name={item.kind === "video" ? "videocam" : "call"} size={22} color={colors.primary}/></Pressable>} />
+      {calls.length === 0 ? <Text style={[styles.empty, { color: colors.muted }]}>No calls yet.</Text> : null}
       {toast ? <View style={[styles.toast, { backgroundColor: colors.foreground }]}><Text style={styles.toastText}>{toast}</Text></View> : null}
     </ScreenContainer>
   );
@@ -52,6 +49,7 @@ const styles = StyleSheet.create({
   callName: { fontSize: 15, fontWeight: "750" as any },
   callMeta: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 5 },
   callTime: { fontSize: 12 },
+  empty: { textAlign: "center", marginTop: 26, fontSize: 13 },
   toast: { position: "absolute", bottom: 24, left: 24, right: 24, paddingVertical: 13, borderRadius: 14, alignItems: "center" },
   toastText: { color: "#FFFFFF", fontSize: 13, fontWeight: "700" },
 });

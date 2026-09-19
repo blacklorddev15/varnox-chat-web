@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, inArray, like, ne, or } from "drizzle-orm";
+import { and, desc, eq, gt, ilike, inArray, like, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { appeals, authTokens, blockedContacts, conversationMembers, conversations, InsertUser, messages, pushTokens, userAvatars, userSettings, users } from "../drizzle/schema";
@@ -135,6 +135,37 @@ export async function listConversationsForUser(userId: number) {
     });
   }
   return result;
+}
+
+/** Searches message text inside the conversations the user is a member of. */
+export async function searchMessages(userId: number, query: string, limit = 50) {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db
+    .select({ message: messages, conversation: conversations, senderName: users.name, senderUsername: users.username })
+    .from(messages)
+    .innerJoin(conversations, eq(conversations.id, messages.conversationId))
+    .innerJoin(
+      conversationMembers,
+      and(eq(conversationMembers.conversationId, messages.conversationId), eq(conversationMembers.userId, userId)),
+    )
+    .leftJoin(users, eq(users.id, messages.senderId))
+    .where(ilike(messages.body, `%${query}%`))
+    .orderBy(desc(messages.createdAt))
+    .limit(limit);
+
+  return rows.map((row) => ({
+    id: row.message.id,
+    conversationId: row.message.conversationId,
+    conversationTitle: row.conversation.title,
+    body: row.message.body,
+    kind: row.message.kind,
+    mediaName: row.message.mediaName,
+    createdAt: row.message.createdAt,
+    senderId: row.message.senderId,
+    senderName: row.senderName,
+    senderUsername: row.senderUsername,
+  }));
 }
 
 /** Marks a conversation as read for one member, which is what drives the unread badge. */

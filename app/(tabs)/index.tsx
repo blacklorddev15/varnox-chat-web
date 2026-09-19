@@ -89,35 +89,10 @@ function chatTime(value?: string | Date | null): string {
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-/** Only rendered before the auth gate redirects to /login - signed-in users see real rows. */
-const demoConversations: Conversation[] = [
-  { id: "maya", name: "Maya Chen", initials: "MC", color: "#F59E0B", preview: "The new collection looks incredible.", time: "9:42 AM", unread: 2, online: true, pinned: true },
-  { id: "design", name: "Design Circle", initials: "DC", color: "#8B5CF6", preview: "You: I’ll share the prototype at 3.", time: "8:17 AM", unread: 0, muted: true, pinned: true, group: true },
-  { id: "noah", name: "Noah Williams", initials: "NW", color: "#10B981", preview: "Voice message", time: "Yesterday", unread: 0 },
-  { id: "weekend", name: "Weekend plans", initials: "WP", color: "#EC4899", preview: "Priya: Brunch at 11 works for me", time: "Yesterday", unread: 4, group: true },
-  { id: "luca", name: "Luca Moretti", initials: "LM", color: "#0EA5E9", preview: "See you soon!", time: "Monday", unread: 0 },
-  { id: "family", name: "Family lounge", initials: "FL", color: "#F97316", preview: "Mom: Don’t forget Sunday dinner", time: "Sunday", unread: 0, muted: true, group: true },
-];
+// The demo conversation fixtures are gone: the list is built from conversations.list.
 
-const initialMessages: Record<string, Message[]> = {
-  maya: [
-    { id: "m1", text: "Hey! Are you free to review the launch screens?", time: "9:28 AM" },
-    { id: "m2", text: "Absolutely. I’m looking at them now — the new collection looks incredible.", time: "9:31 AM" },
-    { id: "m3", text: "That’s great to hear. I’ll polish the last two states before our sync.", time: "9:35 AM", mine: true, read: true },
-    { id: "m4", text: "Perfect. Let’s keep the softer shadows on the cards.", time: "9:42 AM" },
-  ],
-  design: [{ id: "d1", text: "Quick check: do we prefer the compact nav?", time: "8:04 AM" }, { id: "d2", text: "You: I’ll share the prototype at 3.", time: "8:17 AM", mine: true, read: true }],
-  noah: [{ id: "n1", text: "Voice message · 0:24", time: "Yesterday", kind: "voice", voiceDurationMs: 24000 }],
-  weekend: [{ id: "w1", text: "Brunch at 11 works for me", time: "Yesterday" }],
-  luca: [{ id: "l1", text: "See you soon!", time: "Monday" }],
-  family: [{ id: "f1", text: "Don’t forget Sunday dinner", time: "Sunday" }],
-};
-
-const webContacts: ContactSuggestion[] = [
-  { id: "maya", name: "Maya Chen", initials: "MC", color: "#F59E0B", email: "maya@example.com" },
-  { id: "noah", name: "Noah Williams", initials: "NW", color: "#10B981", email: "noah@example.com" },
-  { id: "priya", name: "Priya Shah", initials: "PS", color: "#EC4899", email: "priya@example.com" },
-];
+// Demo message and contact fixtures deleted - messages come from conversations.messages
+// and people come from people.search.
 
 function Avatar({ item, size = 52 }: { item: Pick<Conversation, "initials" | "color">; size?: number }) {
   return <View style={[styles.avatar, { width: size, height: size, borderRadius: size / 2, backgroundColor: item.color }]}><Text style={[styles.avatarText, { fontSize: size * 0.31 }]}>{item.initials}</Text></View>;
@@ -142,7 +117,7 @@ export default function HomeScreen() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [composerText, setComposerText] = useState("");
-  const [messages, setMessages] = useState(initialMessages);
+  const [messages, setMessages] = useState<Record<string, Message[]>>({});
   const [toast, setToast] = useState<string | null>(null);
   const [showMenu, setShowMenu] = useState(false);
   const [showContacts, setShowContacts] = useState(false);
@@ -151,7 +126,7 @@ export default function HomeScreen() {
   const [viewOnce, setViewOnce] = useState(false);
   const [replyTo, setReplyTo] = useState<string | null>(null);
   const [contactQuery, setContactQuery] = useState("");
-  const [deviceContacts, setDeviceContacts] = useState<ContactSuggestion[]>(webContacts);
+  const [deviceContacts, setDeviceContacts] = useState<ContactSuggestion[]>([]);
   const [webNotificationStatus, setWebNotificationStatus] = useState<NotificationPermission | "unsupported">("default");
   const seenRemoteMessages = useRef<Record<string, Set<string>>>({});
 
@@ -182,7 +157,7 @@ export default function HomeScreen() {
       } satisfies Conversation;
     });
   }, [conversationListQuery.data, user?.id]);
-  const conversations = isAuthenticated && conversationListQuery.data ? remoteConversations : demoConversations;
+  const conversations = remoteConversations;
 
   const selectedChat = conversations.find((conversation) => conversation.id === selectedId) ?? null;
   const filteredConversations = useMemo(() => filterConversations(conversations, query).filter((item) => chatFilter === "all" || (chatFilter === "unread" ? item.unread > 0 : item.group)), [chatFilter, query]);
@@ -311,7 +286,8 @@ export default function HomeScreen() {
   }, [conversationListQuery.data, isAuthenticated, selectedId, user?.id, webNotificationStatus]);
 
   const discoverContacts = async () => {
-    if (Platform.OS === "web") { setDeviceContacts(webContacts); setShowContacts(true); return; }
+    // Web has no device address book, so the sheet simply lists people from people.search.
+    if (Platform.OS === "web") { setShowContacts(true); return; }
     try {
       const permission = await Contacts.requestPermissionsAsync();
       if (permission.status !== "granted") { notify("Contacts permission is needed to find friends"); return; }
@@ -424,7 +400,7 @@ export default function HomeScreen() {
       {showMenu ? <View style={[styles.menu, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => { setChatFilter("all"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="forum" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>All chats</Text></Pressable><Pressable onPress={() => { setChatFilter("unread"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="mark-chat-unread" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Unread</Text></Pressable><Pressable onPress={() => { setChatFilter("groups"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="groups" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Groups</Text></Pressable><Pressable onPress={() => { setShowMenu(false); router.push("/chat/search"); }} style={styles.menuItem}><MaterialIcons name="manage-search" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Search messages</Text></Pressable><Pressable onPress={() => { setShowMenu(false); router.push("/chat/starred"); }} style={styles.menuItem}><MaterialIcons name="star-border" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Starred messages</Text></Pressable><Pressable onPress={() => { setShowMenu(false); router.push("/chat/new-group"); }} style={styles.menuItem}><MaterialIcons name="group-add" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>New group</Text></Pressable><Pressable onPress={() => { setShowMenu(false); Platform.OS === "web" ? requestWebNotifications() : notify(isAuthenticated ? "Push notifications are registered" : "Sign in to enable push notifications"); }} style={styles.menuItem}><MaterialIcons name="notifications-active" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Notification setup</Text></Pressable></View> : null}
       <View style={[styles.searchWrap, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="search" size={21} color={colors.muted} /><TextInput value={query} onChangeText={setQuery} placeholder="Search conversations" placeholderTextColor={colors.muted} style={[styles.searchInput, { color: colors.foreground }]} returnKeyType="search" />{query ? <Pressable onPress={() => setQuery("")}><MaterialIcons name="close" size={19} color={colors.muted} /></Pressable> : null}</View>
       <View style={styles.listHeader}><Text style={[styles.sectionLabel, { color: colors.muted }]}>RECENT</Text><Text style={[styles.countLabel, { color: colors.muted }]}>{filteredConversations.length} chats</Text></View>
-      <FlatList data={filteredConversations} keyExtractor={(item) => item.id} contentContainerStyle={styles.chatList} showsVerticalScrollIndicator={false} ListEmptyComponent={<View style={styles.emptyState}><MaterialIcons name="search-off" size={34} color={colors.muted}/><Text style={[styles.emptyTitle, { color: colors.foreground }]}>No matches</Text><Text style={[styles.emptyCopy, { color: colors.muted }]}>Try a different name or message.</Text></View>} renderItem={({ item }) => <Pressable onPress={() => setSelectedId(item.id)} style={({ pressed }) => [styles.chatRow, pressed && styles.rowPressed]}><View style={styles.avatarWrap}><Avatar item={item}/>{item.online ? <View style={[styles.onlineDot, { borderColor: colors.background }]} /> : null}</View><View style={[styles.chatCopy, { borderBottomColor: colors.border }]}><View style={styles.rowTop}><Text style={[styles.chatName, { color: colors.foreground }]} numberOfLines={1}>{item.name}</Text><Text style={[styles.chatTime, { color: item.unread ? colors.primary : colors.muted }]}>{item.time}</Text></View><View style={styles.rowBottom}><View style={styles.previewLine}>{item.pinned ? <MaterialIcons name="push-pin" size={13} color={colors.muted} style={styles.pin}/> : null}<Text style={[styles.chatPreview, { color: item.unread ? colors.foreground : colors.muted }]} numberOfLines={1}>{item.preview}</Text></View>{item.muted ? <MaterialIcons name="volume-off" size={15} color={colors.muted} /> : item.unread ? <View style={[styles.unread, { backgroundColor: colors.primary }]}><Text style={styles.unreadText}>{item.unread}</Text></View> : null}</View></View></Pressable>} />
+      <FlatList data={filteredConversations} keyExtractor={(item) => item.id} contentContainerStyle={styles.chatList} showsVerticalScrollIndicator={false} ListEmptyComponent={<View style={styles.emptyState}><MaterialIcons name={query.trim() || chatFilter !== "all" ? "search-off" : "forum"} size={34} color={colors.muted}/><Text style={[styles.emptyTitle, { color: colors.foreground }]}>{query.trim() || chatFilter !== "all" ? "No matches" : "No conversations yet"}</Text><Text style={[styles.emptyCopy, { color: colors.muted }]}>{query.trim() || chatFilter !== "all" ? "Try a different name or message." : "Tap the compose button to start one."}</Text></View>} renderItem={({ item }) => <Pressable onPress={() => setSelectedId(item.id)} style={({ pressed }) => [styles.chatRow, pressed && styles.rowPressed]}><View style={styles.avatarWrap}><Avatar item={item}/>{item.online ? <View style={[styles.onlineDot, { borderColor: colors.background }]} /> : null}</View><View style={[styles.chatCopy, { borderBottomColor: colors.border }]}><View style={styles.rowTop}><Text style={[styles.chatName, { color: colors.foreground }]} numberOfLines={1}>{item.name}</Text><Text style={[styles.chatTime, { color: item.unread ? colors.primary : colors.muted }]}>{item.time}</Text></View><View style={styles.rowBottom}><View style={styles.previewLine}>{item.pinned ? <MaterialIcons name="push-pin" size={13} color={colors.muted} style={styles.pin}/> : null}<Text style={[styles.chatPreview, { color: item.unread ? colors.foreground : colors.muted }]} numberOfLines={1}>{item.preview}</Text></View>{item.muted ? <MaterialIcons name="volume-off" size={15} color={colors.muted} /> : item.unread ? <View style={[styles.unread, { backgroundColor: colors.primary }]}><Text style={styles.unreadText}>{item.unread}</Text></View> : null}</View></View></Pressable>} />
       <Pressable onPress={discoverContacts} style={({ pressed }) => [styles.fab, { backgroundColor: colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name="person-add-alt-1" size={22} color="#FFFFFF" /></Pressable>
       {showContacts ? <View style={[styles.contactSheet, { backgroundColor: colors.background, borderColor: colors.border }]}><View style={styles.contactHeader}><View><Text style={[styles.contactTitle, { color: colors.foreground }]}>New conversation</Text><Text style={[styles.contactSubtitle, { color: colors.muted }]}>Find people from your contacts</Text></View><IconButton name="close" color={colors.foreground} onPress={() => setShowContacts(false)} /></View><View style={[styles.searchWrap, styles.contactSearch, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="search" size={20} color={colors.muted}/><TextInput value={contactQuery} onChangeText={setContactQuery} placeholder="Search people" placeholderTextColor={colors.muted} style={[styles.searchInput, { color: colors.foreground }]}/></View><FlatList data={discoveredPeople} keyExtractor={(item) => item.id.toString()} contentContainerStyle={styles.contactList} ListEmptyComponent={<Text style={[styles.emptyCopy, { color: colors.muted }]}>No contacts found yet.</Text>} renderItem={({ item }) => <Pressable onPress={() => { const existing = conversations.find((conversation) => conversation.name === item.name || conversation.id === item.id); setShowContacts(false); setContactQuery(""); if (existing) setSelectedId(existing.id); else notify(`Invite link ready for ${item.name}`); }} style={({ pressed }) => [styles.contactRow, pressed && styles.rowPressed]}><View style={[styles.contactAvatar, { backgroundColor: item.color }]}><Text style={styles.avatarText}>{item.initials}</Text></View><View style={styles.contactCopy}><Text style={[styles.chatName, { color: colors.foreground }]}>{item.name}</Text><Text style={[styles.chatPreview, { color: colors.muted }]}>{item.phone ?? item.email ?? "From your contacts"}</Text></View><MaterialIcons name="chevron-right" size={21} color={colors.muted}/></Pressable>} /></View> : null}
       {toast ? <View style={[styles.toast, { backgroundColor: colors.foreground }]}><Text style={styles.toastText}>{toast}</Text></View> : null}

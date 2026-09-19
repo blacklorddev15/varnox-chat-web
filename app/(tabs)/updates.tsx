@@ -9,19 +9,10 @@ import { useColors } from "@/hooks/use-colors";
 type Story = { id: string; name: string; initials: string; color: string; seen?: boolean };
 type Channel = { id: string; name: string; description: string; initials: string; color: string; followers: string; time: string };
 
-const stories: Story[] = [
-  { id: "you", name: "Your story", initials: "YO", color: "#F59E0B" },
-  { id: "maya", name: "Maya", initials: "MC", color: "#8B5CF6" },
-  { id: "noah", name: "Noah", initials: "NW", color: "#10B981", seen: true },
-  { id: "priya", name: "Priya", initials: "PS", color: "#EC4899" },
-  { id: "luca", name: "Luca", initials: "LM", color: "#0EA5E9", seen: true },
-];
-
-const channels: Channel[] = [
-  { id: "design", name: "Product design daily", description: "Ideas, patterns, and product craft", initials: "PD", color: "#8B5CF6", followers: "18.4K followers", time: "10:12 AM" },
-  { id: "studio", name: "Studio notes", description: "A quieter look behind the scenes", initials: "SN", color: "#F97316", followers: "6.2K followers", time: "Yesterday" },
-  { id: "wellness", name: "The good list", description: "Small rituals for better days", initials: "GL", color: "#10B981", followers: "12.8K followers", time: "Monday" },
-];
+// Status and channels have no backend yet, so these stay empty rather than showing demo
+// people and demo channels.
+const stories: Story[] = [];
+const channels: Channel[] = [];
 
 function StoryAvatar({ story }: { story: Story }) {
   return <View style={[styles.storyRing, { borderColor: story.seen ? "#D7DCE2" : "#F59E0B" }]}><View style={[styles.storyAvatar, { backgroundColor: story.color }]}><Text style={styles.storyInitials}>{story.initials}</Text></View>{story.id === "you" ? <View style={styles.plusBadge}><MaterialIcons name="add" size={12} color="#FFFFFF" /></View> : null}</View>;
@@ -44,8 +35,10 @@ export default function UpdatesScreen() {
         ListHeaderComponent={<>
           <View style={styles.sectionHeader}><Text style={[styles.sectionTitle, { color: colors.foreground }]}>Status</Text><Pressable onPress={() => notify("Status privacy opened")}><Text style={[styles.action, { color: colors.primary }]}>Privacy</Text></Pressable></View>
           <FlatList data={stories} keyExtractor={(item) => item.id} horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.storyList} renderItem={({ item }) => <Pressable onPress={() => notify(item.id === "you" ? "Create a new status" : `Opening ${item.name}'s status`)} style={({ pressed }) => [styles.storyItem, pressed && styles.pressed]}><StoryAvatar story={item}/><Text style={[styles.storyName, { color: colors.foreground }]} numberOfLines={1}>{item.name}</Text></Pressable>} />
-          <View style={styles.sectionHeader}><Text style={[styles.sectionTitle, { color: colors.foreground }]}>Channels</Text><Pressable onPress={() => notify("Discovering channels")}><Text style={[styles.action, { color: colors.primary }]}>Explore</Text></Pressable></View>
+                     {stories.length === 0 ? <Text style={[styles.empty, { color: colors.muted }]}>No status updates yet.</Text> : null}
+           <View style={styles.sectionHeader}><Text style={[styles.sectionTitle, { color: colors.foreground }]}>Channels</Text><Pressable onPress={() => notify("Discovering channels")}><Text style={[styles.action, { color: colors.primary }]}>Explore</Text></Pressable></View>
         </>}
+        ListEmptyComponent={<Text style={[styles.empty, { color: colors.muted }]}>No channels yet.</Text>}
         renderItem={({ item }) => <Pressable onPress={() => notify(`Following ${item.name}`)} style={({ pressed }) => [styles.channelRow, pressed && styles.pressed]}><View style={[styles.channelAvatar, { backgroundColor: item.color }]}><Text style={styles.channelInitials}>{item.initials}</Text></View><View style={[styles.channelCopy, { borderBottomColor: colors.border }]}><View style={styles.channelTop}><Text style={[styles.channelName, { color: colors.foreground }]}>{item.name}</Text><Text style={[styles.channelTime, { color: colors.muted }]}>{item.time}</Text></View><Text style={[styles.channelDescription, { color: colors.muted }]} numberOfLines={1}>{item.description}</Text><Text style={[styles.channelFollowers, { color: colors.muted }]}>{item.followers}</Text></View><MaterialIcons name="chevron-right" size={21} color={colors.muted}/></Pressable>}
       />
       {toast ? <View style={[styles.toast, { backgroundColor: colors.foreground }]}><Text style={styles.toastText}>{toast}</Text></View> : null}
@@ -60,6 +53,7 @@ const styles = StyleSheet.create({
   headerIcon: { width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center", marginBottom: 3 },
   pressed: { opacity: 0.55 },
   content: { paddingBottom: 34 },
+  empty: { textAlign: "center", fontSize: 13, marginTop: 4, marginBottom: 18, paddingHorizontal: 20 },
   sectionHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 20, marginTop: 9, marginBottom: 14 },
   sectionTitle: { fontSize: 18, fontWeight: "800" },
   action: { fontSize: 13, fontWeight: "700" },
