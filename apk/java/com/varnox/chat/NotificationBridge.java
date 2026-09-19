@@ -2,11 +2,13 @@ package com.varnox.chat;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -69,17 +71,33 @@ public class NotificationBridge {
         nm.createNotificationChannel(channel);
     }
 
-    /** Asks for POST_NOTIFICATIONS once, on the first cold start. */
+    /**
+     * Asks for POST_NOTIFICATIONS once, on the first cold start, behind an explanation.
+     *
+     * The OS dialog alone gives the user no reason to say yes, and a refusal is sticky - so the
+     * rationale comes first, and "Not now" leaves the decision to the in-app settings screen.
+     */
     void requestOnFirstLaunch() {
+        if (Build.VERSION.SDK_INT < 33 || "granted".equals(currentPermission())) {
+            return;
+        }
         SharedPreferences prefs = activity.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         if (prefs.getBoolean(PREF_PERMISSION_ASKED, false)) {
             return;
         }
         prefs.edit().putBoolean(PREF_PERMISSION_ASKED, true).apply();
-        if (Build.VERSION.SDK_INT >= 33
-                && !"granted".equals(currentPermission())) {
-            requestOsPermission();
-        }
+
+        new AlertDialog.Builder(activity)
+                .setTitle("Message notifications")
+                .setMessage("Allow Varnox to notify you when someone messages you, including while the app is closed.")
+                .setNegativeButton("Not now", null)
+                .setPositiveButton("Continue", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        requestOsPermission();
+                    }
+                })
+                .show();
     }
 
     // ------------------------------------------------------------------

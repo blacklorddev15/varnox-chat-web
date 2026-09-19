@@ -7,7 +7,7 @@ the shipped Android app is always the deployed site — no second codebase to ke
 |---|---|
 | App name | Varnox Chat |
 | Package ID | `com.varnox.chat` |
-| Version | 1.1 (versionCode 2) |
+| Version | 1.2 (versionCode 3) |
 | Min Android | 7.0 (API 24) |
 | Target Android | 14 (API 34) |
 | Launched URL | `START_URL` in `java/com/varnox/chat/MainActivity.java` |
@@ -54,10 +54,29 @@ app's feature detection would report "not supported" and its notification toggle
 - Tapping a notification reopens the activity on the page it came from.
 - `ServiceWorkerRegistration.prototype.showNotification` is patched to the same path.
 
-Works for anything the page raises itself. **True push (a notification with the app closed) is not
-possible from a WebView shell** — that needs native FCM plus a backend sender, or a polling
-foreground service. The site is not set up for it either: `public/sw.js` has no `push` listener and
-no VAPID key is configured.
+Works for anything the page raises itself, and `MessageWatcherService` covers the rest.
+
+### Background message checking
+
+Web Push cannot reach a WebView, so with the app closed there is no way for a server to wake it.
+`MessageWatcherService` is a `dataSync` foreground service that polls the app's own
+`conversations.list` every 30 seconds using the WebView's session cookie and raises a real
+notification for any conversation whose unread count grew since the previous poll. Tapping one
+opens the app.
+
+- Runs only while signed in **and** allowed to notify; signing out or denying the permission stops
+  it, so it never polls for a session nobody can see.
+- The first poll only records a baseline, so existing unread messages do not arrive as a burst.
+- Its own foreground notification uses a separate `IMPORTANCE_MIN` channel and is silent.
+- Costs one small request every 30 seconds. Replacing it with real push means native FCM plus a
+  backend sender — a server-side project, not a shell change.
+
+### Permission timing
+
+`POST_NOTIFICATIONS` is requested behind an explanation ("Allow Varnox to notify you when someone
+messages you, including while the app is closed"), with *Not now* leaving the decision to the
+in-app settings screen. A cold system prompt gives people no reason to say yes, and a refusal is
+sticky.
 
 ## Source layout
 

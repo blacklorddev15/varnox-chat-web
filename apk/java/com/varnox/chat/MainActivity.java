@@ -139,6 +139,7 @@ public class MainActivity extends Activity {
             public void onPageFinished(WebView view, String url) {
                 progressBar.setVisibility(View.GONE);
                 injectNotificationShim(view); // idempotent safety net
+                syncMessageWatcher();
             }
 
             @Override
@@ -430,6 +431,30 @@ public class MainActivity extends Activity {
         if (notificationBridge != null) {
             // The user may have enabled notifications in system settings while away.
             notificationBridge.onActivityResume();
+        }
+        syncMessageWatcher();
+    }
+
+    /**
+     * Keeps the background message watcher running exactly when it can be useful: signed in and
+     * allowed to notify. Signing out or denying notifications stops it, so it never polls for a
+     * session that cannot be seen or a notification that cannot be shown.
+     */
+    private void syncMessageWatcher() {
+        if (notificationBridge == null) {
+            return;
+        }
+        boolean signedIn = false;
+        try {
+            String cookie = CookieManager.getInstance().getCookie(START_URL);
+            signedIn = cookie != null && !cookie.isEmpty();
+        } catch (Exception ignored) {
+            // Treat an unreadable cookie store as signed out.
+        }
+        if (signedIn && "granted".equals(notificationBridge.currentPermission())) {
+            MessageWatcherService.start(this);
+        } else {
+            MessageWatcherService.stop(this);
         }
     }
 
