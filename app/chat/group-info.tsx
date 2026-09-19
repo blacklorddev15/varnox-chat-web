@@ -32,6 +32,8 @@ export default function GroupInfoScreen() {
 
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<string | null>(null);
+  const [editingDescription, setEditingDescription] = useState(false);
+  const [descriptionDraft, setDescriptionDraft] = useState("");
 
   const membersQuery = trpc.conversations.members.useQuery(
     { conversationId },
@@ -44,14 +46,40 @@ export default function GroupInfoScreen() {
   const setRole = trpc.conversations.setRole.useMutation();
   const removeMember = trpc.conversations.removeMember.useMutation();
   const addMembers = trpc.conversations.addMembers.useMutation();
+  const setDescription = trpc.conversations.setDescription.useMutation();
+  const leave = trpc.conversations.leave.useMutation();
 
   const myRole = membersQuery.data?.role ?? "member";
   const members = (membersQuery.data?.members ?? []) as Member[];
   const isOwner = myRole === "owner";
   const canManage = isOwner || myRole === "admin";
-  const busy = setRole.isPending || removeMember.isPending || addMembers.isPending;
+  const busy = setRole.isPending || removeMember.isPending || addMembers.isPending || setDescription.isPending || leave.isPending;
+  const description = membersQuery.data?.description ?? null;
 
   const refresh = () => membersQuery.refetch();
+
+  const saveDescription = async () => {
+    try {
+      await setDescription.mutateAsync({ conversationId, description: descriptionDraft.trim() || null });
+      setEditingDescription(false);
+      setStatus("Description updated.");
+      refresh();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not update the description");
+    }
+  };
+
+  const leaveGroup = async () => {
+    try {
+      const outcome = await leave.mutateAsync({ conversationId });
+      // Ownership passing to someone else is worth saying out loud: the leaver was the only one who
+      // could manage the group until that moment.
+      setStatus(outcome.transferredTo ? "You left the group. Ownership passed to another member." : "You left the group.");
+      router.replace("/");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not leave the group");
+    }
+  };
 
   const confirmThen = (message: string, action: () => Promise<void>) => {
     const run = async () => {
@@ -85,7 +113,7 @@ export default function GroupInfoScreen() {
         <Pressable onPress={() => router.back()}>
           <MaterialIcons name="arrow-back-ios" size={20} color={colors.foreground} />
         </Pressable>
-        <Text style={[styles.title, { color: colors.foreground }]}>Group info</Text>
+        <Text style={[styles.title, { color: colors.foreground }]} numberOfLines={1}>{membersQuery.data?.title?.trim() || "Group info"}</Text>
         {busy ? <ActivityIndicator color={colors.primary} /> : null}
       </View>
 
@@ -94,6 +122,43 @@ export default function GroupInfoScreen() {
         {membersQuery.error ? (
           <Text style={[styles.error, { color: "#EF4444" }]}>{membersQuery.error.message}</Text>
         ) : null}
+
+        <Text style={[styles.section, { color: colors.muted }]}>DESCRIPTION</Text>
+        {editingDescription ? (
+          <>
+            <TextInput
+              value={descriptionDraft}
+              onChangeText={setDescriptionDraft}
+              placeholder="What is this group about?"
+              placeholderTextColor={colors.muted}
+              multiline
+              maxLength={255}
+              style={[styles.descriptionInput, { color: colors.foreground, backgroundColor: colors.surface, borderColor: colors.border }]}
+            />
+            <View style={styles.descriptionActions}>
+              <Pressable onPress={() => setEditingDescription(false)} style={[styles.action, { borderColor: colors.border }]}>
+                <Text style={[styles.actionText, { color: colors.muted }]}>Cancel</Text>
+              </Pressable>
+              <Pressable onPress={() => void saveDescription()} style={[styles.action, { borderColor: colors.border }]}>
+                <Text style={[styles.actionText, { color: colors.primary }]}>Save</Text>
+              </Pressable>
+            </View>
+          </>
+        ) : (
+          <Pressable
+            onPress={() => {
+              if (!canManage) return;
+              setDescriptionDraft(description ?? "");
+              setEditingDescription(true);
+            }}
+            style={[styles.descriptionBox, { backgroundColor: colors.surface, borderColor: colors.border }]}
+          >
+            <Text style={[styles.descriptionText, { color: description ? colors.foreground : colors.muted }]}>
+              {description || (canManage ? "Add a description" : "No description yet")}
+            </Text>
+            {canManage ? <MaterialIcons name="edit" size={16} color={colors.muted} /> : null}
+          </Pressable>
+        )}
 
         <Text style={[styles.section, { color: colors.muted }]}>
           {members.length} {members.length === 1 ? "MEMBER" : "MEMBERS"}
@@ -204,6 +269,14 @@ export default function GroupInfoScreen() {
           </Text>
         )}
 
+        <Pressable
+          onPress={() => confirmThen("Leave this group? You will stop receiving its messages.", leaveGroup)}
+          style={styles.leaveButton}
+        >
+          <MaterialIcons name="logout" size={18} color="#EF4444" />
+          <Text style={styles.leaveText}>Leave group</Text>
+        </Pressable>
+
         {status ? <Text style={[styles.error, { color: colors.muted }]}>{status}</Text> : null}
       </ScrollView>
     </ScreenContainer>
@@ -225,6 +298,12 @@ const styles = StyleSheet.create({
   actionText: { fontSize: 12, fontWeight: "800" },
   searchWrap: { height: 48, borderRadius: 16, paddingHorizontal: 14, flexDirection: "row", alignItems: "center", borderWidth: 1 },
   searchInput: { flex: 1, marginLeft: 9, fontSize: 15 },
+  descriptionBox: { flexDirection: "row", alignItems: "center", gap: 10, borderWidth: 1, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 12 },
+  descriptionText: { flex: 1, fontSize: 14, lineHeight: 20 },
+  descriptionInput: { borderWidth: 1, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 12, fontSize: 14, minHeight: 76, textAlignVertical: "top" },
+  descriptionActions: { flexDirection: "row", justifyContent: "flex-end", gap: 8, marginTop: 8 },
+  leaveButton: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, marginTop: 34, borderWidth: 1, borderColor: "#EF4444", borderRadius: 14, paddingVertical: 13 },
+  leaveText: { color: "#EF4444", fontSize: 14, fontWeight: "800" },
   hint: { fontSize: 12, lineHeight: 18, marginTop: 16, textAlign: "center" },
   error: { fontSize: 13, fontWeight: "700", marginTop: 16, textAlign: "center" },
 });

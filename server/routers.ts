@@ -13,7 +13,7 @@ import { messages } from "../drizzle/schema";
 // row-level operations in db.ts; imported on their own line so the list above stays readable.
 import { consumeViewOnce, conversationDisappearSeconds, deleteMessageForEveryone, editMessageBody, getMessageById, hideMessageForUser, listStarredMessages, markConversationDelivered, reactToMessage, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setMessageStar } from "./db";
 // Presence: who is around right now, and who is mid-sentence. Also in db.ts, for the same reason.
-import { listConversationMemberIds, listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
+import { getConversationSummary, leaveGroup, listConversationMemberIds, listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
 // Server-Sent Events nudge channel; see nudgeConversation below.
 import { isRealtimeEnabled, publishToUsers } from "./realtime";
 
@@ -79,7 +79,10 @@ export const appRouter = router({
       const role = await getConversationRole(input.conversationId, ctx.user.id);
       if (!role) throw new Error("You are not a member of this group");
       const members = await listConversationMembersDetailed(input.conversationId);
-      return { role, members };
+      // The description column and the mutation that writes it both existed, but nothing ever read
+      // it back, so a group description could be set and never seen.
+      const summary = await getConversationSummary(input.conversationId);
+      return { role, members, title: summary?.title ?? null, description: summary?.description ?? null };
     }),
     addMembers: protectedProcedure.input(z.object({ conversationId: z.string().min(1), userIds: z.array(z.number().int().positive()).min(1).max(256) })).mutation(async ({ ctx, input }) => {
       const role = await getConversationRole(input.conversationId, ctx.user.id);
@@ -187,6 +190,20 @@ export const appRouter = router({
       if (!(await isConversationMember(input.conversationId, ctx.user.id))) throw new Error("You are not a member of this conversation");
       await markConversationDelivered(input.conversationId, ctx.user.id);
       return { ok: true as const };
+    }),
+    /**
+     * Leave a group.
+     *
+     * There was no way out before this: `removeMember` refuses to remove yourself, so anyone added
+     * by someone else was stuck in the group permanently.
+     */
+    leave: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      const role = await getConversationRole(input.conversationId, ctx.user.id);
+      if (!role) throw new Error("You are not a member of this group");
+      const outcome = await leaveGroup(input.conversationId, ctx.user.id);
+      // Tell the others, so their member list is right without waiting for a poll.
+      void nudgeConversation(input.conversationId, ctx.user.id, "members");
+      return outcome;
     }),
     setDescription: protectedProcedure.input(z.object({ conversationId: z.string().min(1), description: z.string().trim().max(255).nullable() })).mutation(async ({ ctx, input }) => {
       const role = await getConversationRole(input.conversationId, ctx.user.id);

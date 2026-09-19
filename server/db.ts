@@ -1142,6 +1142,70 @@ export async function conversationDisappearSeconds(conversationId: string) {
   return rows[0]?.seconds ?? null;
 }
 
+/** Title, kind and description for a single conversation. */
+export async function getConversationSummary(conversationId: string) {
+  const db = await getDb();
+  if (!db) return null;
+  const rows = await db
+    .select({ id: conversations.id, title: conversations.title, kind: conversations.kind, description: conversations.description })
+    .from(conversations)
+    .where(eq(conversations.id, conversationId))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
+export type LeaveGroupOutcome = { remaining: number; transferredTo: number | null };
+
+/**
+ * Removes a member from a group, handing ownership on if they were the owner.
+ *
+ * Ownership has to transfer rather than leave with the leaver: every management action checks the
+ * caller's role, so a group with no owner is frozen - nobody can promote, remove or rename anyone
+ * ever again. Admins are preferred as successors, then whoever has been in the group longest.
+ *
+ * Direct chats are refused on purpose. Leaving one would mean hiding it per member, which needs a
+ * per-member flag that does not exist yet, and pretending to leave while it reappears would be
+ * worse than saying so.
+ */
+export async function leaveGroup(conversationId: string, userId: number): Promise<LeaveGroupOutcome> {
+  const db = await getDb();
+  if (!db) throw new Error("Database not available");
+
+  return db.transaction(async (tx) => {
+    const conversation = await tx.select({ kind: conversations.kind }).from(conversations).where(eq(conversations.id, conversationId)).limit(1);
+    if (!conversation[0]) throw new Error("That group no longer exists");
+    if (conversation[0].kind !== "group") throw new Error("Only groups can be left");
+
+    const before = await tx
+      .select({ role: conversationMembers.role })
+      .from(conversationMembers)
+      .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)))
+      .limit(1);
+    if (!before[0]) throw new Error("You are not a member of this group");
+    const wasOwner = before[0].role === "owner";
+
+    await tx.delete(conversationMembers).where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)));
+
+    const remaining = await tx
+      .select({ userId: conversationMembers.userId, role: conversationMembers.role })
+      .from(conversationMembers)
+      .where(eq(conversationMembers.conversationId, conversationId))
+      .orderBy(conversationMembers.joinedAt);
+
+    let transferredTo: number | null = null;
+    if (wasOwner && remaining.length > 0) {
+      const successor = remaining.find((row) => row.role === "admin") ?? remaining[0];
+      await tx
+        .update(conversationMembers)
+        .set({ role: "owner" })
+        .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, successor.userId)));
+      transferredTo = successor.userId;
+    }
+
+    return { remaining: remaining.length, transferredTo };
+  });
+}
+
 // ---------------------------------------------------------------- presence
 /** A heartbeat stays trustworthy this long. Clients beat every 20s, so one miss is tolerated. */
 export const PRESENCE_WINDOW_MS = 45_000;
