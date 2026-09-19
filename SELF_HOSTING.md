@@ -221,3 +221,56 @@ notification watcher polls `START_URL`'s API, so it follows automatically.
 | Calls ringing | next poll | immediate |
 | Requests while idle in a chat | ~24/min | ~2/min (keep-alives) |
 | Backgrounded app | 0 | 0 |
+
+---
+
+## Split deployment: frontend on Vercel, API here
+
+Both hosts must sit under the **same registrable domain**:
+
+```text
+app.yourdomain.com  ->  Vercel          (renders the web app)
+api.yourdomain.com  ->  this server     (behind a TLS proxy)
+```
+
+### Why the domains have to match
+
+The session cookie is `SameSite=Lax`. Those two hostnames are different origins but the *same
+site*, so the cookie is sent and everything works unchanged. Put the API on a different registrable
+domain - or a bare `IP:port` - and the cookie is dropped:
+
+- Ordinary API calls still work: the client also sends a `Bearer` token from `localStorage`, and the
+  server prefers that over the cookie.
+- **The event stream does not.** `EventSource` cannot set an `Authorization` header, so it would
+  401, back off, and silently fall back to polling - you would keep the split and lose the real-time
+  you self-hosted for.
+
+### Steps
+
+1. **DNS**
+   - `app` → CNAME `cname.vercel-dns.com`
+   - `api` → A / CNAME to your node
+2. **Vercel** → project → Settings → Domains: add `app.yourdomain.com`.
+3. **Vercel** → Environment Variables: `EXPO_PUBLIC_API_BASE_URL=https://api.yourdomain.com` for
+   Production, then **redeploy**. Expo inlines `EXPO_PUBLIC_*` at build time, so setting it without
+   a rebuild changes nothing.
+4. **TLS on the API host.** The frontend is HTTPS, so a plain HTTP `IP:port` will be blocked by the
+   browser as mixed content. Terminate TLS for `api.yourdomain.com` and proxy to the allocated port,
+   forwarding `Host` and `X-Forwarded-Proto: https` (the `Secure` flag on the session cookie is
+   derived from that header - no `trust proxy` setting is needed).
+5. Leave `PORT` / `SERVER_PORT` and the startup command as documented above.
+
+CORS needs no configuration: the server reflects the request origin, allows the `Authorization`
+header, and answers the preflight.
+
+### Notes
+
+- **The API host still renders the app too.** `web-dist/` is served by the same process, so
+  `https://api.yourdomain.com` is also a working copy. Harmless, and a useful fallback - delete
+  `web-dist/` from the panel if you would rather it did not.
+- **Android.** The APK loads the frontend and its background watcher calls the API on that same
+  origin, so with the frontend on Vercel the watcher talks to Vercel's API rather than this one. Both
+  can run against the same database; if you retire the Vercel API, the watcher needs repointing at
+  `api.yourdomain.com` as well.
+- **Signing out on storage clear.** Cross-origin means no cookie is stored for the frontend's own
+  origin, so clearing site data signs the user out until they sign in again.
