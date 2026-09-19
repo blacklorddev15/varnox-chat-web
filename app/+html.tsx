@@ -1,13 +1,23 @@
+import { ScrollViewStyleReset } from "expo-router/html";
 import type { PropsWithChildren } from "react";
 
 /**
  * The document shell for the static export. Expo Router renders each route into this, which is
  * why the app's mounted content is passed straight through as `children`.
  *
- * Everything here exists to make the site installable as an app on a phone: the web app
- * manifest, the theme colour, and the Apple equivalents, since iOS ignores WebKit's
- * equivalents of the manifest fields and needs its own meta tags and touch icon.
+ * ScrollViewStyleReset is not optional. It injects
+ *   `#root,body,html{height:100%} body{overflow:hidden} #root{display:flex}`
+ * and without it #root has no height, so a bottom tab bar collapses to the top of the viewport
+ * instead of sitting at the bottom. It is part of Expo's built-in document shell, so replacing
+ * that shell means carrying it over.
  */
+
+/** Matches theme.config.js, so the page does not flash white before the app paints. */
+const background = `
+html, body { background-color: #FFFDF8; }
+@media (prefers-color-scheme: dark) { html, body { background-color: #171717; } }
+`;
+
 export default function Root({ children }: PropsWithChildren) {
   return (
     <html lang="en">
@@ -18,8 +28,11 @@ export default function Root({ children }: PropsWithChildren) {
 
         <title>Varnox Chat</title>
 
+        <ScrollViewStyleReset />
+        <style dangerouslySetInnerHTML={{ __html: background }} />
+
         <link rel="manifest" href="/manifest.json" />
-        <meta name="theme-color" content="#0B0B0F" />
+        <meta name="theme-color" content="#171717" />
         <link rel="icon" href="/favicon.ico" />
         <link rel="apple-touch-icon" href="/icon-192.png" />
 
