@@ -7,6 +7,10 @@ node_modules/
 .expo/
 dist/
 web-build/
+
+# Self-hosted build output (`pnpm build:selfhost`)
+server-dist/
+web-dist/
 expo-env.d.ts
 
 # Native

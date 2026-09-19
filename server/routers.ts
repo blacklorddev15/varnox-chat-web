@@ -13,7 +13,9 @@ import { messages } from "../drizzle/schema";
 // row-level operations in db.ts; imported on their own line so the list above stays readable.
 import { consumeViewOnce, conversationDisappearSeconds, deleteMessageForEveryone, editMessageBody, getMessageById, hideMessageForUser, listStarredMessages, markConversationDelivered, reactToMessage, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setMessageStar } from "./db";
 // Presence: who is around right now, and who is mid-sentence. Also in db.ts, for the same reason.
-import { listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
+import { listConversationMemberIds, listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
+// Server-Sent Events nudge channel; see nudgeConversation below.
+import { isRealtimeEnabled, publishToUsers } from "./realtime";
 
 /**
  * Loads a message and proves the caller can see the conversation it lives in. Every message-level
@@ -24,6 +26,24 @@ async function requireVisibleMessage(messageId: string, userId: number) {
   const message = await getMessageById(messageId);
   if (!message || !(await isConversationMember(message.conversationId, userId))) throw new Error("That message is not in one of your chats");
   return message;
+}
+
+/**
+ * Pokes the other members of a conversation over the realtime stream, so their client can refetch
+ * immediately instead of waiting for its next poll.
+ *
+ * Fire-and-forget on purpose: a failed nudge must never fail the write that caused it. Events are a
+ * latency optimisation, not a delivery guarantee - every client keeps a slow safety-net poll, so a
+ * dropped event costs a few seconds rather than the message.
+ */
+async function nudgeConversation(conversationId: string, actorId: number, type: string) {
+  if (!isRealtimeEnabled()) return;
+  try {
+    const members = (await listConversationMemberIds(conversationId)).filter((id) => id !== actorId);
+    publishToUsers(members, { type, conversationId });
+  } catch (error) {
+    console.warn("[Realtime] nudge failed", error);
+  }
 }
 
 const messageKind = z.enum(["text", "image", "video", "file", "voice"]);
@@ -43,7 +63,12 @@ export const appRouter = router({
   }),
   conversations: router({
     list: protectedProcedure.query(({ ctx }) => listConversationsForUser(ctx.user.id)),
-    markRead: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).mutation(({ ctx, input }) => markConversationRead(input.conversationId, ctx.user.id)),
+    markRead: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      const result = await markConversationRead(input.conversationId, ctx.user.id);
+      // Lets the sender's ticks turn blue without waiting for their next poll.
+      void nudgeConversation(input.conversationId, ctx.user.id, "read");
+      return result;
+    }),
     search: protectedProcedure.input(z.object({ query: z.string().trim().min(1).max(100) })).query(({ ctx, input }) => searchMessages(ctx.user.id, input.query)),
     // ---- groups: the creator owns the group, and only the owner manages admins ----------
     createGroup: protectedProcedure.input(z.object({ title: z.string().trim().min(1).max(80), memberIds: z.array(z.number().int().positive()).max(256).default([]) })).mutation(async ({ ctx, input }) => {
@@ -107,6 +132,7 @@ export const appRouter = router({
       // A view-once photo must not be described in the notification body.
       const preview = input.viewOnce ? "Photo (view once)" : input.body ?? (input.kind === "voice" ? "Voice note" : "Shared media");
       void notifyConversationMembers({ conversationId: input.conversationId, senderId: ctx.user.id, title: ctx.user.name ?? "New message", body: preview });
+      void nudgeConversation(input.conversationId, ctx.user.id, "message");
       return created;
     }),
 
@@ -114,6 +140,7 @@ export const appRouter = router({
     react: protectedProcedure.input(z.object({ messageId: z.string().min(1), emoji: z.string().max(16).nullable() })).mutation(async ({ ctx, input }) => {
       const message = await requireVisibleMessage(input.messageId, ctx.user.id);
       await reactToMessage(message.id, ctx.user.id, input.emoji);
+      void nudgeConversation(message.conversationId, ctx.user.id, "message-updated");
       return { ok: true as const };
     }),
     star: protectedProcedure.input(z.object({ messageId: z.string().min(1), starred: z.boolean() })).mutation(async ({ ctx, input }) => {
@@ -128,6 +155,7 @@ export const appRouter = router({
       if (message.kind !== "text") throw new Error("Only text messages can be edited");
       const ok = await editMessageBody(message.id, ctx.user.id, input.body);
       if (!ok) throw new Error("That message can no longer be edited");
+      void nudgeConversation(message.conversationId, ctx.user.id, "message-updated");
       return { ok: true as const };
     }),
     deleteMessage: protectedProcedure.input(z.object({ messageId: z.string().min(1), forEveryone: z.boolean().default(false) })).mutation(async ({ ctx, input }) => {
@@ -139,6 +167,7 @@ export const appRouter = router({
       if (message.senderId !== ctx.user.id) throw new Error("Only the sender can delete a message for everyone");
       const ok = await deleteMessageForEveryone(message.id, ctx.user.id);
       if (!ok) throw new Error("That message was already deleted");
+      void nudgeConversation(message.conversationId, ctx.user.id, "message-updated");
       return { ok: true as const, forEveryone: true };
     }),
     openViewOnce: protectedProcedure.input(z.object({ messageId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
@@ -180,6 +209,9 @@ export const appRouter = router({
       .input(z.object({ typingConversationId: z.string().min(1).max(64).nullish() }))
       .mutation(async ({ ctx, input }) => {
         await recordPresence(ctx.user.id, input.typingConversationId ?? null);
+        // Only typing is nudged. Heartbeats happen every 20s for every user, and announcing those
+        // would put a constant stream of pointless wake-ups on the wire.
+        if (input.typingConversationId) void nudgeConversation(input.typingConversationId, ctx.user.id, "presence");
         return { ok: true } as const;
       }),
     /** Presence for the other members of one chat, which the conversation header reads. */
@@ -227,6 +259,8 @@ export const appRouter = router({
       await expireStaleCalls(input.conversationId);
       const room = `call_${crypto.randomUUID()}`;
       const callId = await createCallRecord(input.conversationId, ctx.user.id, room, input.kind);
+      // Ring the other side now rather than at their next poll.
+      void nudgeConversation(input.conversationId, ctx.user.id, "call");
       const displayName = ctx.user.name?.trim() || ctx.user.username || `User ${ctx.user.id}`;
       const token = await createRoomToken(`user-${ctx.user.id}`, displayName, room);
       return { callId, room, token, url: liveKitUrl(), kind: input.kind, status: "ringing" as const };
@@ -236,6 +270,8 @@ export const appRouter = router({
       if (!call) throw new Error("That call has ended");
       if (!(await isConversationMember(call.conversationId, ctx.user.id))) throw new Error("You are not in this conversation");
       await setCallStatus(call.id, "active");
+      // The caller needs to stop ringing the moment this lands.
+      void nudgeConversation(call.conversationId, ctx.user.id, "call");
       const displayName = ctx.user.name?.trim() || ctx.user.username || `User ${ctx.user.id}`;
       const token = await createRoomToken(`user-${ctx.user.id}`, displayName, call.room);
       return { callId: call.id, room: call.room, token, url: liveKitUrl(), kind: call.kind, status: "active" as const };

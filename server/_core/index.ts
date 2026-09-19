@@ -13,6 +13,8 @@ import { registerAvatarRoutes } from "./avatarRoutes";
 import { registerMediaRoutes } from "./mediaRoutes";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
+import { sdk } from "./sdk";
+import { isRealtimeEnabled, subscribe } from "../realtime";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -67,8 +69,45 @@ export function createApp() {
   registerPhoneAuthRoutes(app);
   registerPasswordAuthRoutes(app);
 
+  // `realtime` lets the client decide how to stay current without guessing: a live stream where a
+  // single long-running process serves everyone, polling where it does not.
   app.get("/api/health", (_req, res) => {
-    res.json({ ok: true, timestamp: Date.now() });
+    res.json({ ok: true, timestamp: Date.now(), realtime: isRealtimeEnabled() });
+  });
+
+  /**
+   * Server-Sent Events stream. Events are nudges - "something changed in this conversation" - and
+   * the client answers them by refetching, so the payload stays tiny and there is one code path
+   * for applying changes whether they arrived by stream or by poll.
+   *
+   * This has to sit above the static/SPA fallback at the bottom of this function, or a request for
+   * it would be answered with index.html.
+   */
+  app.get("/api/realtime", async (req, res) => {
+    if (!isRealtimeEnabled()) {
+      res.status(503).json({ error: "Realtime needs a long-running server. Poll instead." });
+      return;
+    }
+    const user = await sdk.authenticateRequest(req).catch(() => null);
+    if (!user) {
+      res.status(401).json({ error: "Sign in to receive realtime events." });
+      return;
+    }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    // nginx buffers proxied responses unless told otherwise, which would withhold every event
+    // until the connection closed - realtime in name only.
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+
+    // Tells the client the stream is genuinely open, rather than it waiting on a first event.
+    res.write(`data: ${JSON.stringify({ type: "ready" })}\n\n`);
+
+    const unsubscribe = subscribe(user.id, res);
+    req.on("close", unsubscribe);
+    res.on("close", unsubscribe);
   });
 
   app.use(
@@ -95,6 +134,9 @@ export function createApp() {
 
 async function startServer() {
   const server = createServer(createApp());
+  // Event streams are long-lived by design, and Node's default 300s request timeout would cut
+  // every one of them mid-conversation. The 25s keep-alive ping is what detects a dead peer.
+  server.requestTimeout = 0;
   const preferredPort = parseInt(process.env.PORT || "3000");
   const port = await findAvailablePort(preferredPort);
 

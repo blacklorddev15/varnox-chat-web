@@ -8,8 +8,10 @@
     "dev:server": "cross-env NODE_ENV=development tsx watch server/_core/index.ts",
     "dev:metro": "cross-env EXPO_USE_METRO_WORKSPACE_ROOT=1 npx expo start --web --port ${EXPO_PORT:-8081}",
     "build:web": "npx expo export --platform web",
-    "build": "esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --outfile=server-dist/index.js && mkdir -p dist && cp server-dist/index.js dist/index.js",
-    "start": "NODE_ENV=production node server-dist/index.js",
+    "build:web:selfhost": "npx expo export --platform web --output-dir web-dist",
+    "build": "esbuild server/_core/index.ts --platform=node --packages=external --bundle --format=esm --outfile=server-dist/index.mjs",
+    "build:selfhost": "pnpm build:web:selfhost && pnpm build",
+    "start": "NODE_ENV=production node server-dist/index.mjs",
     "check": "tsc --noEmit",
     "lint": "expo lint",
     "format": "prettier --write .",
@@ -18,7 +20,7 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "qr": "node scripts/generate_qr.mjs",
-    "build:pterodactyl": "pnpm build"
+    "build:pterodactyl": "pnpm build:selfhost"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",

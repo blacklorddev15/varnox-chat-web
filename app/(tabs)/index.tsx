@@ -25,6 +25,7 @@ import { createAudioPlayer, RecordingPresets, requestRecordingPermissionsAsync, 
 import { ScreenContainer } from "@/components/screen-container";
 import { useColors } from "@/hooks/use-colors";
 import { useAppVisible } from "@/hooks/use-app-visible";
+import { useRealtime } from "@/hooks/use-realtime";
 import { useAuth } from "@/hooks/use-auth";
 import { appendMessage, filterConversations } from "@/lib/pulse-chat";
 import { prepareAttachment } from "@/lib/media-upload";
@@ -195,12 +196,31 @@ export default function HomeScreen() {
   // Every refresh timer below is gated on this, so a backgrounded app stops talking to the server.
   const appVisible = useAppVisible();
 
+  // Realtime nudges. When the stream is up the fast intervals below collapse to a slow safety net:
+  // an event channel can lose an event, and "lost" has to mean "a few seconds late", never "gone".
+  const trpcUtils = trpc.useUtils();
+  const realtimeInvalidateTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (realtimeInvalidateTimer.current) clearTimeout(realtimeInvalidateTimer.current); }, []);
+  const realtime = useRealtime(() => {
+    if (realtimeInvalidateTimer.current) return;
+    realtimeInvalidateTimer.current = setTimeout(() => {
+      realtimeInvalidateTimer.current = null;
+      // Coalesced: a burst of events (typing, then sending) causes one refetch pass, not one each.
+      void trpcUtils.invalidate();
+    }, 250);
+  }, isAuthenticated && appVisible);
+
+  const listInterval = realtime.live ? 30_000 : 8_000;
+  const messageInterval = realtime.live ? 30_000 : 2_500;
+  const presenceInterval = realtime.live ? 30_000 : 4_000;
+  const inboxInterval = realtime.live ? 30_000 : 6_000;
+
   // Real conversations from the backend. The hardcoded list below is only a pre-login
   // placeholder: it used to be what signed-in users saw (fake names, fake unread counts,
   // and fake notification titles), while the backend already had the real rows.
   const conversationListQuery = trpc.conversations.list.useQuery(undefined, {
     enabled: isAuthenticated,
-    refetchInterval: isAuthenticated && appVisible ? 8000 : false,
+    refetchInterval: isAuthenticated && appVisible ? listInterval : false,
   });
   const markRead = trpc.conversations.markRead.useMutation();
   const markDelivered = trpc.conversations.markDelivered.useMutation();
@@ -254,7 +274,7 @@ export default function HomeScreen() {
   }, [conversations, chatFilter, query]);
   const liveMessagesQuery = trpc.conversations.messages.useQuery(
     { conversationId: selectedId ?? "local", since: undefined },
-    { enabled: Boolean(selectedId && isAuthenticated), refetchInterval: isAuthenticated && appVisible ? 2500 : false },
+    { enabled: Boolean(selectedId && isAuthenticated), refetchInterval: isAuthenticated && appVisible ? messageInterval : false },
   );
   const ensureConversation = trpc.conversations.ensure.useMutation();
   const startDirect = trpc.conversations.startDirect.useMutation();
@@ -267,11 +287,11 @@ export default function HomeScreen() {
   // online dot; the per-conversation variant feeds the header of the chat that is open.
   const presenceInbox = trpc.presence.inbox.useQuery(undefined, {
     enabled: isAuthenticated && appVisible,
-    refetchInterval: isAuthenticated && appVisible ? 6000 : false,
+    refetchInterval: isAuthenticated && appVisible ? inboxInterval : false,
   });
   const chatPresence = trpc.presence.forConversation.useQuery(
     { conversationId: selectedId ?? "none" },
-    { enabled: Boolean(selectedId && isAuthenticated && appVisible), refetchInterval: isAuthenticated && appVisible ? 4000 : false },
+    { enabled: Boolean(selectedId && isAuthenticated && appVisible), refetchInterval: isAuthenticated && appVisible ? presenceInterval : false },
   );
   const presenceHeartbeat = trpc.presence.heartbeat.useMutation();
   // Presence keyed by conversation, for the list rows.
