@@ -8,7 +8,7 @@
 import { Linking, Platform } from "react-native";
 
 export const APK_PATH = "/VARNOX.apk";
-export const APK_VERSION = "1.2";
+export const APK_VERSION = "1.3";
 export const APK_SIZE_LABEL = "255 KB";
 export const APK_FILENAME = `VARNOX-${APK_VERSION}.apk`;
 
