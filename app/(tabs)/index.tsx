@@ -11,7 +11,7 @@ import {
   View,
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
-import { useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import * as Haptics from "expo-haptics";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import * as Contacts from "expo-contacts";
@@ -242,6 +242,17 @@ export default function HomeScreen() {
     notification.onclick = () => window.focus();
   }, [isAuthenticated, liveMessagesQuery.data, selectedChat?.name, selectedId, user?.id, webNotificationStatus]);
 
+  const routeParams = useLocalSearchParams<{ conversationId?: string }>();
+
+  // Opened from the new-group screen or from a search hit: select that conversation.
+  useEffect(() => {
+    const requested = typeof routeParams.conversationId === "string" ? routeParams.conversationId : "";
+    if (requested) {
+      setSelectedId(requested);
+      setChatFilter("all");
+    }
+  }, [routeParams.conversationId]);
+
   // Clear the unread badge for the conversation being read.
   useEffect(() => {
     if (!isAuthenticated || !selectedId) return;
@@ -375,7 +386,7 @@ export default function HomeScreen() {
           <View style={[styles.chatHeader, { borderBottomColor: colors.border, backgroundColor: colors.background }]}>
             <Pressable onPress={() => setSelectedId(null)} style={({ pressed }) => [styles.backButton, pressed && styles.pressed]}><MaterialIcons name="arrow-back-ios" size={20} color={colors.foreground} /></Pressable>
             <Avatar item={selectedChat} size={40} />
-            <View style={styles.chatTitleBlock}><Text style={[styles.chatTitle, { color: colors.foreground }]}>{selectedChat.name}</Text><Text style={[styles.chatSubtitle, { color: selectedChat.online ? colors.success : colors.muted }]}>{isAuthenticated ? "syncing every few seconds" : selectedChat.online ? "active now" : "last seen recently"}</Text></View>
+            <Pressable onPress={() => router.push({ pathname: "/chat/group-info", params: { conversationId: selectedChat.id } })} style={styles.chatTitleBlock}><Text style={[styles.chatTitle, { color: colors.foreground }]}>{selectedChat.name}</Text><Text style={[styles.chatSubtitle, { color: selectedChat.online ? colors.success : colors.muted }]}>{selectedChat.group ? "tap for group info" : isAuthenticated ? "syncing every few seconds" : selectedChat.online ? "active now" : "last seen recently"}</Text></Pressable>
             <IconButton name="videocam" color={colors.primary} onPress={() => notify(`Starting a video call with ${selectedChat.name}`)} />
             <IconButton name="call" color={colors.primary} onPress={() => notify(`Calling ${selectedChat.name}`)} />
           </View>

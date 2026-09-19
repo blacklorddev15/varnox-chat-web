@@ -4,7 +4,7 @@ import { MAX_DB_MEDIA_BYTES } from "./_core/mediaRoutes";
 import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
-import { clearUserAvatar, createAppeal, createMessage, createConversation, getUserByUsername, getUserSettings, isConversationMember, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setUserAvatar, updateUserProfile, updateUserSettings } from "./db";
+import { addConversationMembers, clearUserAvatar, createAppeal, createGroupConversation, createMessage, createConversation, getConversationRole, getUserByUsername, getUserSettings, isConversationMember, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings } from "./db";
 import { storagePut } from "./storage";
 import { notifyConversationMembers } from "./push";
 import { messages } from "../drizzle/schema";
@@ -25,6 +25,44 @@ export const appRouter = router({
     list: protectedProcedure.query(({ ctx }) => listConversationsForUser(ctx.user.id)),
     markRead: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).mutation(({ ctx, input }) => markConversationRead(input.conversationId, ctx.user.id)),
     search: protectedProcedure.input(z.object({ query: z.string().trim().min(1).max(100) })).query(({ ctx, input }) => searchMessages(ctx.user.id, input.query)),
+    // ---- groups: the creator owns the group, and only the owner manages admins ----------
+    createGroup: protectedProcedure.input(z.object({ title: z.string().trim().min(1).max(80), memberIds: z.array(z.number().int().positive()).max(256).default([]) })).mutation(async ({ ctx, input }) => {
+      const conversationId = await createGroupConversation(ctx.user.id, input.title, input.memberIds);
+      return { conversationId };
+    }),
+    members: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(async ({ ctx, input }) => {
+      const role = await getConversationRole(input.conversationId, ctx.user.id);
+      if (!role) throw new Error("You are not a member of this group");
+      const members = await listConversationMembersDetailed(input.conversationId);
+      return { role, members };
+    }),
+    addMembers: protectedProcedure.input(z.object({ conversationId: z.string().min(1), userIds: z.array(z.number().int().positive()).min(1).max(256) })).mutation(async ({ ctx, input }) => {
+      const role = await getConversationRole(input.conversationId, ctx.user.id);
+      if (role !== "owner" && role !== "admin") throw new Error("Only the group owner or an admin can add members");
+      const added = await addConversationMembers(input.conversationId, input.userIds);
+      return { added };
+    }),
+    removeMember: protectedProcedure.input(z.object({ conversationId: z.string().min(1), userId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
+      const role = await getConversationRole(input.conversationId, ctx.user.id);
+      if (!role) throw new Error("You are not a member of this group");
+      if (input.userId === ctx.user.id) throw new Error("You cannot remove yourself from the group");
+      const targetRole = await getConversationRole(input.conversationId, input.userId);
+      if (!targetRole) throw new Error("That person is not in this group");
+      if (targetRole === "owner") throw new Error("The group owner cannot be removed");
+      // The owner can remove anyone below them; an admin can only remove plain members.
+      if (role !== "owner" && !(role === "admin" && targetRole === "member")) throw new Error("Only the group owner can remove an admin");
+      await removeConversationMember(input.conversationId, input.userId);
+      return { removed: input.userId };
+    }),
+    setRole: protectedProcedure.input(z.object({ conversationId: z.string().min(1), userId: z.number().int().positive(), role: z.enum(["admin", "member"]) })).mutation(async ({ ctx, input }) => {
+      const role = await getConversationRole(input.conversationId, ctx.user.id);
+      if (role !== "owner") throw new Error("Only the group owner can manage admins");
+      const targetRole = await getConversationRole(input.conversationId, input.userId);
+      if (!targetRole) throw new Error("That person is not in this group");
+      if (targetRole === "owner") throw new Error("The group owner role cannot be changed");
+      await setConversationMemberRole(input.conversationId, input.userId, input.role);
+      return { userId: input.userId, role: input.role };
+    }),
     messages: protectedProcedure.input(z.object({ conversationId: z.string().min(1), since: z.string().datetime().optional() })).query(({ ctx, input }) => listMessages(input.conversationId, ctx.user.id, input.since ? new Date(input.since) : undefined)),
     ensure: protectedProcedure.input(z.object({ conversationId: z.string().min(1), title: z.string().max(255).optional() })).mutation(async ({ ctx, input }) => {
       if (!(await isConversationMember(input.conversationId, ctx.user.id))) await createConversation(input.conversationId, ctx.user.id, input.title);

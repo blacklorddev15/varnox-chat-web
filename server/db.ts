@@ -196,6 +196,97 @@ export async function markConversationRead(conversationId: string, userId: numbe
     .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)));
 }
 
+/** The caller's role in a conversation: "owner" | "admin" | "member", or undefined if absent. */
+export async function getConversationRole(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db
+    .select({ role: conversationMembers.role })
+    .from(conversationMembers)
+    .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)))
+    .limit(1);
+  return rows[0]?.role;
+}
+
+/** Members of a conversation, with the profile fields the group screen needs. */
+export async function listConversationMembersDetailed(conversationId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({
+      userId: conversationMembers.userId,
+      role: conversationMembers.role,
+      joinedAt: conversationMembers.joinedAt,
+      name: users.name,
+      username: users.username,
+      avatarUpdatedAt: users.avatarUpdatedAt,
+    })
+    .from(conversationMembers)
+    .innerJoin(users, eq(users.id, conversationMembers.userId))
+    .where(eq(conversationMembers.conversationId, conversationId));
+}
+
+/**
+ * Creates a group conversation: the creator becomes the owner, everyone else a member.
+ * A first message is inserted so a brand new group is not an empty screen.
+ */
+export async function createGroupConversation(creatorId: number, title: string, memberIds: number[]) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const id = `grp_${crypto.randomUUID()}`;
+  const members = Array.from(new Set([creatorId, ...memberIds])).filter((value) => Number.isInteger(value));
+
+  await db.transaction(async (tx) => {
+    await tx.insert(conversations).values({ id, kind: "group", title, createdBy: creatorId });
+    await tx.insert(conversationMembers).values(
+      members.map((userId) => ({
+        conversationId: id,
+        userId,
+        role: userId === creatorId ? "owner" : "member",
+      })),
+    );
+    await tx.insert(messages).values({
+      id: crypto.randomUUID(),
+      conversationId: id,
+      senderId: creatorId,
+      kind: "text",
+      body: `Created the group "${title}"`,
+    });
+  });
+
+  return id;
+}
+
+/** Adds members to a group, skipping anyone already in it. Returns how many were added. */
+export async function addConversationMembers(conversationId: string, userIds: number[]) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const rows = userIds
+    .filter((value) => Number.isInteger(value))
+    .map((userId) => ({ conversationId, userId, role: "member" }));
+  if (rows.length === 0) return 0;
+  const inserted = await db.insert(conversationMembers).values(rows).onConflictDoNothing().returning({ userId: conversationMembers.userId });
+  await db.update(conversations).set({ updatedAt: new Date() }).where(eq(conversations.id, conversationId));
+  return inserted.length;
+}
+
+export async function setConversationMemberRole(conversationId: string, userId: number, role: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db
+    .update(conversationMembers)
+    .set({ role })
+    .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)));
+}
+
+export async function removeConversationMember(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db
+    .delete(conversationMembers)
+    .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)));
+}
+
 export async function listMessages(conversationId: string, userId: number, since?: Date) {
   const db = await getDb();
   if (!db || !(await isConversationMember(conversationId, userId))) return [];
