@@ -2,7 +2,7 @@ import { z } from "zod";
 import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
-import { createAppeal, createMessage, createConversation, getUserByUsername, getUserSettings, isConversationMember, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationsForUser, listMessages, listUsersForAdmin, moderateUser, registerPushToken, reviewAppeal, searchUsers, setBlockedContact, updateUserSettings } from "./db";
+import { clearUserAvatar, createAppeal, createMessage, createConversation, getUserByUsername, getUserSettings, isConversationMember, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationsForUser, listMessages, listUsersForAdmin, moderateUser, registerPushToken, reviewAppeal, searchUsers, setBlockedContact, setUserAvatar, updateUserProfile, updateUserSettings } from "./db";
 import { storagePut } from "./storage";
 import { notifyConversationMembers } from "./push";
 import { messages } from "../drizzle/schema";
@@ -43,6 +43,17 @@ export const appRouter = router({
   }),
   push: router({
     register: protectedProcedure.input(z.object({ token: z.string().min(1).max(512), platform: z.string().max(32).optional() })).mutation(({ ctx, input }) => registerPushToken(ctx.user.id, input.token, input.platform)),
+  }),
+  profile: router({
+    update: protectedProcedure.input(z.object({ name: z.string().trim().min(1).max(60).optional(), about: z.string().trim().max(140).optional() })).mutation(({ ctx, input }) => updateUserProfile(ctx.user.id, input)),
+    setAvatar: protectedProcedure.input(z.object({ base64: z.string().min(1).max(4_000_000), mimeType: z.string().regex(/^image\/(png|jpe?g|webp)$/) })).mutation(async ({ ctx, input }) => {
+      const updatedAt = await setUserAvatar(ctx.user.id, input.mimeType, input.base64);
+      return { avatarUpdatedAt: updatedAt.toISOString() };
+    }),
+    clearAvatar: protectedProcedure.mutation(async ({ ctx }) => {
+      await clearUserAvatar(ctx.user.id);
+      return { ok: true as const };
+    }),
   }),
   settings: router({
     get: protectedProcedure.query(({ ctx }) => getUserSettings(ctx.user.id)),

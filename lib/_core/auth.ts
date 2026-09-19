@@ -14,6 +14,8 @@ export type User = {
   moderationStatus?: string;
   suspendedUntil?: string | null;
   moderationReason?: string | null;
+  about?: string | null;
+  avatarUpdatedAt?: string | null;
   lastSignedIn: Date;
 };
 

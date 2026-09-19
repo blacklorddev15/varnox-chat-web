@@ -136,6 +136,8 @@ export async function getMe(): Promise<{
   moderationStatus?: string;
   suspendedUntil?: string | null;
   moderationReason?: string | null;
+  about?: string | null;
+  avatarUpdatedAt?: string | null;
   lastSignedIn: string;
 } | null> {
   try {

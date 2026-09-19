@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, inArray, like, ne, or } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, conversationMembers, conversations, InsertUser, messages, pushTokens, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, conversationMembers, conversations, InsertUser, messages, pushTokens, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -242,4 +242,41 @@ export async function updatePasswordHash(userId: number, passwordHash: string) {
   const db = await getDb();
   if (!db) throw new Error("Account storage is not available");
   await db.update(users).set({ passwordHash, updatedAt: new Date() }).where(eq(users.id, userId));
+}
+
+export async function updateUserProfile(userId: number, patch: { name?: string; about?: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const set: Record<string, unknown> = { updatedAt: new Date() };
+  if (patch.name !== undefined) set.name = patch.name;
+  if (patch.about !== undefined) set.about = patch.about;
+  await db.update(users).set(set).where(eq(users.id, userId));
+  return getUserById(userId);
+}
+
+/** Stores the profile photo as base64 and stamps users.avatarUpdatedAt for cache-busting. */
+export async function setUserAvatar(userId: number, mimeType: string, data: string) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const now = new Date();
+  await db
+    .insert(userAvatars)
+    .values({ userId, mimeType, data, updatedAt: now })
+    .onConflictDoUpdate({ target: userAvatars.userId, set: { mimeType, data, updatedAt: now } });
+  await db.update(users).set({ avatarUpdatedAt: now, updatedAt: now }).where(eq(users.id, userId));
+  return now;
+}
+
+export async function getUserAvatar(userId: number) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(userAvatars).where(eq(userAvatars.userId, userId)).limit(1);
+  return rows[0];
+}
+
+export async function clearUserAvatar(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.delete(userAvatars).where(eq(userAvatars.userId, userId));
+  await db.update(users).set({ avatarUpdatedAt: null, updatedAt: new Date() }).where(eq(users.id, userId));
 }

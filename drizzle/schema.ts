@@ -5,7 +5,7 @@ export const conversationKindEnum = pgEnum("conversation_kind", ["direct", "grou
 export const messageKindEnum = pgEnum("message_kind", ["text", "image", "video", "file", "voice"]);
 
 export const users = pgTable("users", {
-  id: serial("id").primaryKey(), openId: varchar("openId", { length: 64 }).notNull().unique(), name: text("name"), email: varchar("email", { length: 320 }), emailVerifiedAt: timestamp("emailVerifiedAt"), username: varchar("username", { length: 32 }).unique(), passwordHash: text("passwordHash"), loginMethod: varchar("loginMethod", { length: 64 }), role: roleEnum("role").default("user").notNull(), moderationStatus: varchar("moderationStatus", { length: 16 }).default("active").notNull(), suspendedUntil: timestamp("suspendedUntil"), moderationReason: text("moderationReason"), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull(), lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(),
+  id: serial("id").primaryKey(), openId: varchar("openId", { length: 64 }).notNull().unique(), name: text("name"), email: varchar("email", { length: 320 }), emailVerifiedAt: timestamp("emailVerifiedAt"), username: varchar("username", { length: 32 }).unique(), passwordHash: text("passwordHash"), loginMethod: varchar("loginMethod", { length: 64 }), role: roleEnum("role").default("user").notNull(), moderationStatus: varchar("moderationStatus", { length: 16 }).default("active").notNull(), suspendedUntil: timestamp("suspendedUntil"), moderationReason: text("moderationReason"), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull(), lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(), about: text("about"), avatarUpdatedAt: timestamp("avatarUpdatedAt"),
 });
 export const conversations = pgTable("conversations", { id: varchar("id", { length: 64 }).primaryKey(), title: varchar("title", { length: 255 }), kind: conversationKindEnum("kind").default("direct").notNull(), createdBy: integer("createdBy").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 export const conversationMembers = pgTable("conversationMembers", { conversationId: varchar("conversationId", { length: 64 }).notNull(), userId: integer("userId").notNull(), joinedAt: timestamp("joinedAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.conversationId, table.userId] }) }));
@@ -23,3 +23,8 @@ export type Message = typeof messages.$inferSelect;
 export type PushToken = typeof pushTokens.$inferSelect;
 export type UserSettings = typeof userSettings.$inferSelect;
 export type Appeal = typeof appeals.$inferSelect;
+// Profile photos are stored here (base64) rather than in object storage: this deployment has
+// no BUILT_IN_FORGE_API_* credentials, so the generic upload path cannot be used. Served by
+// GET /api/avatar/:userId.
+export const userAvatars = pgTable("userAvatars", { userId: integer("userId").primaryKey(), mimeType: text("mimeType").notNull(), data: text("data").notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
+export type UserAvatar = typeof userAvatars.$inferSelect;

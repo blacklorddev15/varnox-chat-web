@@ -9,6 +9,7 @@ import { registerOAuthRoutes } from "./oauth";
 import { registerPhoneAuthRoutes } from "./phoneAuth";
 import { registerPasswordAuthRoutes } from "./passwordAuth";
 import { registerStorageProxy } from "./storageProxy";
+import { registerAvatarRoutes } from "./avatarRoutes";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 
@@ -59,6 +60,7 @@ export function createApp() {
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
   registerStorageProxy(app);
+  registerAvatarRoutes(app);
   registerOAuthRoutes(app);
   registerPhoneAuthRoutes(app);
   registerPasswordAuthRoutes(app);

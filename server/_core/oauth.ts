@@ -54,9 +54,16 @@ function buildUserResponse(
   return {
     id: (user as any)?.id ?? null,
     openId: user?.openId ?? null,
+    username: (user as any)?.username ?? null,
     name: user?.name ?? null,
     email: user?.email ?? null,
+    emailVerifiedAt: (user as any)?.emailVerifiedAt ? new Date((user as any).emailVerifiedAt).toISOString() : null,
     loginMethod: user?.loginMethod ?? null,
+    role: (user as any)?.role ?? null,
+    moderationStatus: (user as any)?.moderationStatus ?? null,
+    about: (user as any)?.about ?? null,
+    // version stamp the client uses to cache-bust /api/avatar/<id>
+    avatarUpdatedAt: (user as any)?.avatarUpdatedAt ? new Date((user as any).avatarUpdatedAt).toISOString() : null,
     lastSignedIn: (user?.lastSignedIn ?? new Date()).toISOString(),
   };
 }
