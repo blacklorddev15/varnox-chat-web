@@ -193,9 +193,13 @@ export async function checkPhoneVerification(
   return { sessionToken: result.app_session_id, user: result.user };
 }
 
-export async function registerWithPassword(username: string, password: string, email?: string): Promise<{ sessionToken: string; user: Auth.User }> {
-  const result = await apiCall<{ app_session_id: string; user: Auth.User }>("/api/auth/password/register", { method: "POST", body: JSON.stringify({ username, password, email }) });
-  return { sessionToken: result.app_session_id, user: result.user };
+export async function registerWithPassword(
+  username: string,
+  password: string,
+  options: { email?: string; name?: string; phone?: string } = {},
+): Promise<{ sessionToken: string; user: Auth.User; verificationSent: boolean; devCode?: string }> {
+  const result = await apiCall<{ app_session_id: string; user: Auth.User; verificationSent?: boolean; devCode?: string }>("/api/auth/password/register", { method: "POST", body: JSON.stringify({ username, password, email: options.email, name: options.name, phone: options.phone }) });
+  return { sessionToken: result.app_session_id, user: result.user, verificationSent: Boolean(result.verificationSent), devCode: result.devCode };
 }
 
 export async function loginWithPassword(username: string, password: string): Promise<{ sessionToken: string; user: Auth.User }> {
