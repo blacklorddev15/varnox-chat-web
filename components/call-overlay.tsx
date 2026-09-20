@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { Image, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { RoomEvent, Track, type Room as LiveKitRoom } from "livekit-client";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 
 import { useColors } from "@/hooks/use-colors";
 import { formatElapsed, useCall } from "@/lib/call-context";
+import { avatarUrl } from "@/lib/media-url";
 
 /**
  * The call UI, rendered once above every screen so it survives navigation. Nothing is drawn
@@ -196,6 +197,7 @@ export function CallOverlay() {
   const name = session?.peerName ?? "Call";
   const isVideo = session?.kind === "video";
   const connected = phase === "active" && remoteCount > 0;
+  const peerPhoto = session?.peerId ? avatarUrl(session.peerId, session.avatarUpdatedAt) : undefined;
 
   // One tile per remote participant plus your own, laid out in rows. Tiles are `flex: 1` inside a
   // row rather than a percentage width: the card has a maximum width but a shrinking one, and
@@ -226,9 +228,17 @@ export function CallOverlay() {
   return (
     <View style={styles.backdrop} pointerEvents="auto">
       <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-        <View style={[styles.avatar, { backgroundColor: colors.primary }]}>
-          <Text style={styles.avatarText}>{initialsOf(name)}</Text>
-        </View>
+        {/* Their face, not a blank circle. This drew initials and nothing else whatever the person
+            had set, which on a dark call backdrop is just an empty ring - the thing that made a
+            ringing call look like nothing had happened. Initials remain the fallback for somebody
+            who has no photo and for a call link, which has no person behind it. */}
+        {peerPhoto ? (
+          <Image source={{ uri: peerPhoto }} style={styles.avatar} />
+        ) : (
+          <View style={[styles.avatar, { backgroundColor: colors.primary }]}>
+            <Text style={styles.avatarText}>{initialsOf(name)}</Text>
+          </View>
+        )}
         <Text style={[styles.name, { color: colors.foreground }]} numberOfLines={1}>{name}</Text>
         <Text style={[styles.status, { color: connected ? colors.success : colors.muted }]}>{status}</Text>
 

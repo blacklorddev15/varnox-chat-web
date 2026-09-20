@@ -26,6 +26,15 @@ export type CallSession = {
   peerName: string;
   conversationId: string | null;
   outgoing: boolean;
+  /**
+   * Who is on the other end, so the call screen can show their face rather than a blank circle.
+   *
+   * `peerName` was already here and the name was never the problem - the picture was, because
+   * nothing carried the id needed to fetch one. Absent for a call link, which has no person behind
+   * it, and the overlay falls back to initials there.
+   */
+  peerId?: number | null;
+  avatarUpdatedAt?: string | Date | null;
 };
 
 type CallContextValue = {
@@ -41,7 +50,7 @@ type CallContextValue = {
   reconnecting: boolean;
   elapsed: number;
   error: string | null;
-  startCall: (input: { conversationId: string; kind: CallKind; peerName: string }) => Promise<void>;
+  startCall: (input: { conversationId: string; kind: CallKind; peerName: string; peerId?: number | null; avatarUpdatedAt?: string | Date | null }) => Promise<void>;
   joinLink: (input: { room: string; token: string; url: string; peerName: string; kind: CallKind }) => Promise<void>;
   accept: () => Promise<void>;
   decline: () => Promise<void>;
@@ -184,7 +193,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   }, [setPhaseBoth, teardown]);
 
   const startCall = useCallback(
-    async ({ conversationId, kind, peerName }: { conversationId: string; kind: CallKind; peerName: string }) => {
+    async ({ conversationId, kind, peerName, peerId, avatarUpdatedAt }: { conversationId: string; kind: CallKind; peerName: string; peerId?: number | null; avatarUpdatedAt?: string | Date | null }) => {
       if (phaseRef.current !== "idle") return;
       // Refused before the mutation is fired, not after. React Query pauses a mutation while offline
       // rather than failing it, so `mutateAsync` below would never settle and the ring timer below it
@@ -197,7 +206,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       setError(null);
       try {
         const started = await startMutation.mutateAsync({ conversationId, kind });
-        const next: CallSession = { callId: started.callId, room: started.room, token: started.token, url: started.url, kind: started.kind === "video" ? "video" : "audio", peerName, conversationId, outgoing: true };
+        const next: CallSession = { callId: started.callId, room: started.room, token: started.token, url: started.url, kind: started.kind === "video" ? "video" : "audio", peerName, conversationId, outgoing: true, peerId: peerId ?? null, avatarUpdatedAt: avatarUpdatedAt ?? null };
         sessionRef.current = next;
         setSession(next);
         setPhaseBoth("ringing-out");
@@ -343,9 +352,13 @@ export function CallProvider({ children }: { children: ReactNode }) {
       token: "",
       url: "",
       kind: ringing.kind === "video" ? "video" : "audio",
-      peerName: ringing.conversationTitle ?? "Incoming call",
+      // The person first, then the conversation: a one-to-one has no title, so using the title
+      // alone showed "Incoming call" for somebody whose name we know perfectly well.
+      peerName: ringing.callerName ?? ringing.conversationTitle ?? ringing.callerUsername ?? "Incoming call",
       conversationId: ringing.conversationId,
       outgoing: false,
+      peerId: ringing.initiatorId,
+      avatarUpdatedAt: ringing.callerAvatarUpdatedAt,
     };
     sessionRef.current = next;
     setSession(next);

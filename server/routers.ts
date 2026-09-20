@@ -844,7 +844,20 @@ export const appRouter = router({
       await setCallStatus(call.id, call.status === "ringing" ? "missed" : "ended");
       return { ok: true as const };
     }),
-    incoming: protectedProcedure.query(async ({ ctx }) => (await getIncomingCallForUser(ctx.user.id)) ?? null),
+    incoming: protectedProcedure.query(async ({ ctx }) => {
+      const ringing = await getIncomingCallForUser(ctx.user.id);
+      if (!ringing) return null;
+      // The caller, so the ring can show a face and a name instead of a blank circle labelled
+      // "Incoming call". A one-to-one conversation has no title, so the caller's own name is the
+      // only thing that can name the call - `conversationTitle` is left as the group-call fallback.
+      const caller = await getUserById(ringing.initiatorId);
+      return {
+        ...ringing,
+        callerName: caller?.name ?? null,
+        callerUsername: caller?.username ?? null,
+        callerAvatarUpdatedAt: caller?.avatarUpdatedAt ?? null,
+      };
+    }),
     history: protectedProcedure.input(z.object({ limit: z.number().int().min(1).max(50).default(30) }).optional()).query(({ ctx, input }) => listRecentCalls(ctx.user.id, input?.limit ?? 30)),
     // A shareable room. The link carries only an unguessable room name and anyone signed in
     // who opens it gets their own token, so no row is written until somebody actually joins.

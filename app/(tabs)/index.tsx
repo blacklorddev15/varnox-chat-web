@@ -1580,8 +1580,8 @@ export default function HomeScreen() {
             <IconButton name="more-vert" color={colors.muted} onPress={() => router.push({ pathname: "/chat/chat-settings", params: { conversationId: selectedChat.id } })} />
             {/* Refused here rather than inside startCall so the answer is a toast in the header
                 rather than the full call overlay appearing only to report an error. */}
-            <IconButton name="videocam" dimmed={!online} color={online ? colors.primary : colors.muted} onPress={() => { if (blockedOffline(OFFLINE_CALL_MESSAGE)) return; void startCall({ conversationId: selectedChat.id, kind: "video", peerName: selectedChat.name }); }} />
-            <IconButton name="call" dimmed={!online} color={online ? colors.primary : colors.muted} onPress={() => { if (blockedOffline(OFFLINE_CALL_MESSAGE)) return; void startCall({ conversationId: selectedChat.id, kind: "audio", peerName: selectedChat.name }); }} />
+            <IconButton name="videocam" dimmed={!online} color={online ? colors.primary : colors.muted} onPress={() => { if (blockedOffline(OFFLINE_CALL_MESSAGE)) return; void startCall({ conversationId: selectedChat.id, kind: "video", peerName: selectedChat.name, peerId: selectedChat.peerId, avatarUpdatedAt: selectedChat.avatarUpdatedAt }); }} />
+            <IconButton name="call" dimmed={!online} color={online ? colors.primary : colors.muted} onPress={() => { if (blockedOffline(OFFLINE_CALL_MESSAGE)) return; void startCall({ conversationId: selectedChat.id, kind: "audio", peerName: selectedChat.name, peerId: selectedChat.peerId, avatarUpdatedAt: selectedChat.avatarUpdatedAt }); }} />
           </View>
           <OfflineBanner />
           {/*
