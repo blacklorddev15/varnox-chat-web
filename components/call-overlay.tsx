@@ -1,6 +1,6 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Platform, Pressable, StyleSheet, Text, View } from "react-native";
-import type { Room as LiveKitRoom } from "livekit-client";
+import { RoomEvent, type Room as LiveKitRoom } from "livekit-client";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 
 import { useColors } from "@/hooks/use-colors";
@@ -21,7 +21,18 @@ function initialsOf(name: string) {
  * on web. The element is re-attached on a short interval so a track that arrives after the
  * call screen mounted still shows up. Audio does not depend on any of this.
  */
-function VideoSurface({ room, side, fallbackColor }: { room: LiveKitRoom | null; side: "local" | "remote"; fallbackColor: string }) {
+function VideoSurface({
+  room,
+  identity,
+  side,
+  fallbackColor,
+}: {
+  room: LiveKitRoom | null;
+  /** The participant this tile belongs to. `null` for the local tile, which is looked up differently. */
+  identity: string | null;
+  side: "local" | "remote";
+  fallbackColor: string;
+}) {
   const holder = useRef<View | null>(null);
 
   useEffect(() => {
@@ -35,7 +46,9 @@ function VideoSurface({ room, side, fallbackColor }: { room: LiveKitRoom | null;
         // Branches kept separate: local and remote publication types do not unify in Array.from.
         const track = (() => {
           if (side === "local") return Array.from(room.localParticipant.videoTrackPublications.values())[0]?.track;
-          const remote = Array.from(room.remoteParticipants.values())[0];
+          // Looked up by identity rather than by position: in a group call the participant at index 0
+          // changes as people join and leave, which would slide every other tile's picture sideways.
+          const remote = identity ? room.remoteParticipants.get(identity) : Array.from(room.remoteParticipants.values())[0];
           if (!remote) return undefined;
           return Array.from(remote.videoTrackPublications.values())[0]?.track;
         })();
@@ -68,9 +81,63 @@ function VideoSurface({ room, side, fallbackColor }: { room: LiveKitRoom | null;
         // ignore
       }
     };
-  }, [room, side]);
+    // `identity` is part of the dependency list so a tile that was reused for a different participant
+    // re-attaches instead of keeping the previous person's picture.
+  }, [room, side, identity]);
 
   return <View ref={holder} style={[styles.videoSurface, { backgroundColor: fallbackColor }]} />;
+}
+
+/**
+ * Who else is on the call, kept in sync with the room.
+ *
+ * The room is the source of truth and it is a live object, so this subscribes rather than reading it
+ * once. Mute and unmute are included because a participant whose camera is switched on after joining
+ * publishes a track without a connection event, and without those the new tile would have no picture
+ * until something else happened to trigger a re-render.
+ */
+function useRemoteParticipants(room: LiveKitRoom | null) {
+  const [participants, setParticipants] = useState<Array<{ identity: string; name: string }>>([]);
+
+  useEffect(() => {
+    if (!room) {
+      setParticipants([]);
+      return;
+    }
+
+    const sync = () =>
+      setParticipants(
+        Array.from(room.remoteParticipants.values()).map((participant) => ({
+          identity: participant.identity,
+          // `name` is what the app set when joining; identity is the user id and is the fallback.
+          name: participant.name || participant.identity,
+        })),
+      );
+
+    sync();
+    const events = [
+      RoomEvent.ParticipantConnected,
+      RoomEvent.ParticipantDisconnected,
+      RoomEvent.TrackSubscribed,
+      RoomEvent.TrackUnsubscribed,
+      RoomEvent.TrackMuted,
+      RoomEvent.TrackUnmuted,
+    ];
+    for (const event of events) room.on(event, sync);
+
+    return () => {
+      for (const event of events) room.off(event, sync);
+    };
+  }, [room]);
+
+  return participants;
+}
+
+/** Columns for the grid, so a two-person call fills the row and a large one does not get tiny. */
+function columnsFor(tiles: number): number {
+  if (tiles <= 1) return 1;
+  if (tiles <= 4) return 2;
+  return 3;
 }
 
 export function CallOverlay() {
@@ -82,6 +149,19 @@ export function CallOverlay() {
   const name = session?.peerName ?? "Call";
   const isVideo = session?.kind === "video";
   const connected = phase === "active" && remoteCount > 0;
+
+  // One tile per remote participant plus your own, laid out in rows. Tiles are `flex: 1` inside a
+  // row rather than a percentage width: the card has a maximum width but a shrinking one, and
+  // percentages would overflow it on a narrow screen.
+  const remotes = useRemoteParticipants(room);
+  const tiles = [
+    ...remotes.map((participant) => ({ key: participant.identity, identity: participant.identity as string | null, label: participant.name })),
+    // Your own tile goes last and is labelled, so a grid needs no legend to be readable.
+    { key: "__self", identity: null as string | null, label: "You" },
+  ];
+  const columns = columnsFor(tiles.length);
+  const videoRows: Array<typeof tiles> = [];
+  for (let index = 0; index < tiles.length; index += columns) videoRows.push(tiles.slice(index, index + columns));
 
   const status =
     phase === "ringing-out" ? "Ringing…"
@@ -101,8 +181,27 @@ export function CallOverlay() {
 
         {isVideo && phase === "active" ? (
           <View style={styles.videos}>
-            <VideoSurface room={room} side="remote" fallbackColor="#111116" />
-            <VideoSurface room={room} side="local" fallbackColor="#1B1B22" />
+            {videoRows.map((row, rowIndex) => (
+              <View key={`row-${rowIndex}`} style={styles.videoRow}>
+                {row.map((tile) => (
+                  <View key={tile.key} style={styles.tile}>
+                    <VideoSurface
+                      room={room}
+                      identity={tile.identity}
+                      side={tile.identity === null ? "local" : "remote"}
+                      fallbackColor={tile.identity === null ? "#1B1B22" : "#111116"}
+                    />
+                    <Text style={styles.tileLabel} numberOfLines={1}>
+                      {tile.label}
+                    </Text>
+                  </View>
+                ))}
+                {/* Keeps the last row's tiles the same width as the rows above them. */}
+                {Array.from({ length: Math.max(0, columns - row.length) }).map((_, fillerIndex) => (
+                  <View key={`filler-${fillerIndex}`} style={styles.tileFiller} />
+                ))}
+              </View>
+            ))}
           </View>
         ) : null}
 
@@ -152,8 +251,15 @@ const styles = StyleSheet.create({
   avatarText: { color: "#FFFFFF", fontSize: 26, fontWeight: "800" },
   name: { fontSize: 19, fontWeight: "800", marginTop: 14, textAlign: "center" },
   status: { fontSize: 13, fontWeight: "700", marginTop: 5 },
-  videos: { flexDirection: "row", gap: 10, marginTop: 16, width: "100%", height: 150 },
-  videoSurface: { flex: 1, borderRadius: 14, overflow: "hidden" },
+  videos: { marginTop: 16, width: "100%", gap: 8 },
+  videoRow: { flexDirection: "row", gap: 8 },
+  // Height comes from the tile's own width, so a row of two and a row of three both end up sensibly
+  // shaped instead of one being stretched thin.
+  tile: { flex: 1, aspectRatio: 4 / 3, borderRadius: 14, overflow: "hidden", backgroundColor: "#111116" },
+  tileFiller: { flex: 1 },
+  videoSurface: { flex: 1 },
+  // Dark chip rather than a plain label, so a name stays readable over whatever the camera shows.
+  tileLabel: { position: "absolute", left: 6, bottom: 6, right: 6, fontSize: 10, fontWeight: "700", color: "#FFFFFF", backgroundColor: "rgba(0,0,0,0.45)", borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, overflow: "hidden" },
   error: { fontSize: 12, lineHeight: 17, marginTop: 12, textAlign: "center" },
   actions: { flexDirection: "row", gap: 18, marginTop: 22 },
   circle: { width: 60, height: 60, borderRadius: 30, alignItems: "center", justifyContent: "center" },
