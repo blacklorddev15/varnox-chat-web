@@ -9,7 +9,7 @@ import { normalizePhone } from "./_core/phoneAuth";
 import { sdk } from "./_core/sdk";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { createRoomToken, isLiveKitConfigured, liveKitUrl } from "./livekit";
-import { addConversationMembers, clearUserAvatar, createAppeal, createCallRecord, createGroupConversation, createMessage, createConversation, findOrCreateDirectConversation, expireStaleCalls, getCallRecord, getConversationRole, getIncomingCallForUser, getUserByUsername, getUserById, getUserSettings, isConversationMember, listRecentCalls, setCallStatus, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings, adminRemoveStatus, createChannel, createChannelPost, createStatus, deleteStatus, deleteChannel, followChannel, getChannel, getChannelDetail, getChannelPost, getStatus, isChannelFollower, saveMessageMedia, listActiveStatusesByAuthors, listChannelFollowers, listChannelPosts, listChannelPostsForAdmin, listChannelsForAdmin, listChannelsForUser, listContactIdsForUser, listStatusesForAdmin, listStatusViewers, listViewedStatusIds, markChannelRead, markStatusViewed, removeChannelPost, searchChannels, setChannelSuspended, unfollowChannel } from "./db";
+import { addConversationMembers, appealStatusForUsername, clearUserAvatar, createAppeal, createCallRecord, createGroupConversation, createMessage, createConversation, findOrCreateDirectConversation, expireStaleCalls, getCallRecord, getConversationRole, getIncomingCallForUser, getUserByUsername, getUserById, getUserSettings, isConversationMember, listRecentCalls, setCallStatus, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings, adminRemoveStatus, createChannel, createChannelPost, createStatus, deleteStatus, deleteChannel, followChannel, getChannel, getChannelDetail, getChannelPost, getStatus, isChannelFollower, saveMessageMedia, listActiveStatusesByAuthors, listChannelFollowers, listChannelPosts, listChannelPostsForAdmin, listChannelsForAdmin, listChannelsForUser, listContactIdsForUser, listStatusesForAdmin, listStatusViewers, listViewedStatusIds, markChannelRead, markStatusViewed, removeChannelPost, searchChannels, setChannelSuspended, unfollowChannel } from "./db";
 import { storagePut } from "./storage";
 import { notifyConversationMembers } from "./push";
 import { messages, type User } from "../drizzle/schema";
@@ -770,7 +770,30 @@ export const appRouter = router({
   }),
   appeals: router({
     mine: protectedProcedure.query(({ ctx }) => listAppealsForUser(ctx.user.id)),
-    submit: publicProcedure.input(z.object({ username: z.string().min(3).max(32), reason: z.string().min(3).max(1000) })).mutation(async ({ input }) => { const user = await getUserByUsername(input.username.trim().toLowerCase()); if (!user) throw new Error("Account not found"); return createAppeal(user.id, input.reason.trim()); }),
+    /**
+     * Files a request for review and returns the deadline the person is told to expect.
+     *
+     * The details are optional, the way the field says on screen. This used to demand three characters,
+     * so pressing Submit with an empty box failed validation and no request was ever filed.
+     */
+    submit: publicProcedure
+      .input(z.object({ username: z.string().min(3).max(32), reason: z.string().max(1000).optional() }))
+      .mutation(async ({ input }) => {
+        const user = await getUserByUsername(input.username.trim().toLowerCase());
+        if (!user) throw new Error("Account not found");
+        const appeal = await createAppeal(user.id, input.reason?.trim() || "No additional details given.");
+        return { reviewDueAt: appeal.reviewDueAt, state: appeal.status as "pending" | "approved" | "rejected" };
+      }),
+
+    /**
+     * Polled by the ban screen, so a restored account finds out without having to guess.
+     *
+     * Public because the person asking is signed out by definition - the ban is what stopped them
+     * getting in. It answers with a state and two dates for one username, and says nothing else.
+     */
+    status: publicProcedure
+      .input(z.object({ username: z.string().min(3).max(32) }))
+      .query(({ input }) => appealStatusForUsername(input.username.trim().toLowerCase())),
   }),
   people: router({
     search: protectedProcedure.input(z.object({ query: z.string().min(2).max(80) })).query(({ ctx, input }) => searchUsers(input.query, ctx.user.id)),

@@ -67,7 +67,10 @@ export const userSettings = pgTable("userSettings", { userId: integer("userId").
 export const presence = pgTable("presence", { userId: integer("userId").primaryKey(), lastSeenAt: timestamp("lastSeenAt").defaultNow().notNull(), typingConversationId: varchar("typingConversationId", { length: 64 }), typingUntil: timestamp("typingUntil") });
 export type Presence = typeof presence.$inferSelect;
 export const blockedContacts = pgTable("blockedContacts", { userId: integer("userId").notNull(), blockedUserId: integer("blockedUserId").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.userId, table.blockedUserId] }) }));
-export const appeals = pgTable("appeals", { id: serial("id").primaryKey(), userId: integer("userId").notNull(), reason: text("reason").notNull(), status: varchar("status", { length: 16 }).default("pending").notNull(), reviewedBy: integer("reviewedBy"), reviewNote: text("reviewNote"), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
+// reviewDueAt is when the person who asked for a review is told to expect an answer by. It is a promise
+// made as the request is filed, not a schedule: nothing restores an account on a timer. The account comes
+// back only when someone actually approves the review.
+export const appeals = pgTable("appeals", { id: serial("id").primaryKey(), userId: integer("userId").notNull(), reason: text("reason").notNull(), status: varchar("status", { length: 16 }).default("pending").notNull(), reviewedBy: integer("reviewedBy"), reviewNote: text("reviewNote"), reviewDueAt: timestamp("reviewDueAt"), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 export const authTokens = pgTable("authTokens", { id: serial("id").primaryKey(), userId: integer("userId").notNull(), kind: varchar("kind", { length: 32 }).notNull(), tokenHash: varchar("tokenHash", { length: 128 }).notNull().unique(), expiresAt: timestamp("expiresAt").notNull(), usedAt: timestamp("usedAt"), createdAt: timestamp("createdAt").defaultNow().notNull() });
 
 // ---------------------------------------------------------------- signed-in devices

@@ -917,12 +917,60 @@ export async function setBlockedContact(userId: number, blockedUserId: number, b
   return listBlockedContacts(userId);
 }
 
+/** How long someone asking for a review is told to expect. One constant, so the window shown on screen
+ *  and the deadline stored on the row cannot disagree. */
+export const REVIEW_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Files a request for review, or updates the one already waiting.
+ *
+ * A second request while one is pending replaces its details and restarts the clock, rather than piling
+ * up rows an admin would have to read twice. A request that has already been answered is left alone:
+ * otherwise asking again would be a way to keep a decided case open forever.
+ */
 export async function createAppeal(userId: number, reason: string) {
   const db = await getDb();
   if (!db) throw new Error("Account storage is not available");
-  await db.insert(appeals).values({ userId, reason });
+
+  const [pending] = await db
+    .select({ id: appeals.id })
+    .from(appeals)
+    .where(and(eq(appeals.userId, userId), eq(appeals.status, "pending")))
+    .orderBy(desc(appeals.createdAt))
+    .limit(1);
+
+  const reviewDueAt = new Date(Date.now() + REVIEW_WINDOW_MS);
+  if (pending) {
+    await db.update(appeals).set({ reason, reviewDueAt, updatedAt: new Date() }).where(eq(appeals.id, pending.id));
+  } else {
+    await db.insert(appeals).values({ userId, reason, reviewDueAt });
+  }
+
   const rows = await db.select().from(appeals).where(eq(appeals.userId, userId)).orderBy(desc(appeals.createdAt)).limit(1);
   return rows[0];
+}
+
+/**
+ * What to tell someone about their own case, looked up by the username they tried to sign in with.
+ *
+ * A state and two dates only - no reason, no reviewer, no notes. This answer is reachable without a
+ * session, so it must not say more than the login screen already tells that same person.
+ */
+export async function appealStatusForUsername(username: string) {
+  const db = await getDb();
+  if (!db) return { state: "none" as const, reviewDueAt: null, decidedAt: null };
+
+  const [user] = await db.select({ id: users.id }).from(users).where(eq(users.username, username)).limit(1);
+  if (!user) return { state: "none" as const, reviewDueAt: null, decidedAt: null };
+
+  const [appeal] = await db.select().from(appeals).where(eq(appeals.userId, user.id)).orderBy(desc(appeals.createdAt)).limit(1);
+  if (!appeal) return { state: "none" as const, reviewDueAt: null, decidedAt: null };
+
+  return {
+    state: appeal.status as "pending" | "approved" | "rejected",
+    reviewDueAt: appeal.reviewDueAt,
+    decidedAt: appeal.status === "pending" ? null : appeal.updatedAt,
+  };
 }
 
 export async function listAppealsForUser(userId: number) {

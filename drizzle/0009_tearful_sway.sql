@@ -1,0 +1,1 @@
+ALTER TABLE "appeals" ADD COLUMN "reviewDueAt" timestamp;
