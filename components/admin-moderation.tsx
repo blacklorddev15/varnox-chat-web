@@ -17,10 +17,12 @@ export function AdminModerationPanel() {
 
   const statuses = trpc.admin.statuses.useQuery();
   const channels = trpc.admin.channels.useQuery();
+  const groups = trpc.admin.groups.useQuery();
   const posts = trpc.admin.channelPosts.useQuery();
 
   const removeStatus = trpc.admin.removeStatus.useMutation({ onSuccess: () => { void statuses.refetch(); setNotice("Status removed from every feed."); }, onError: (error) => setNotice(error.message) });
   const suspendChannel = trpc.admin.suspendChannel.useMutation({ onSuccess: () => { void channels.refetch(); setNotice("Channel updated."); }, onError: (error) => setNotice(error.message) });
+  const suspendGroup = trpc.admin.suspendGroup.useMutation({ onSuccess: () => { void groups.refetch(); setNotice("Group updated."); }, onError: (error) => setNotice(error.message) });
   const deleteChannel = trpc.admin.deleteChannel.useMutation({ onSuccess: () => { void channels.refetch(); void posts.refetch(); setNotice("Channel deleted with its posts and followers."); }, onError: (error) => setNotice(error.message) });
   const removePost = trpc.admin.removeChannelPost.useMutation({ onSuccess: () => { void posts.refetch(); setNotice("Post removed."); }, onError: (error) => setNotice(error.message) });
 
@@ -32,7 +34,7 @@ export function AdminModerationPanel() {
       <View style={[styles.notice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <MaterialIcons name="info-outline" size={18} color={colors.primary} />
         <Text style={[styles.noticeText, { color: colors.muted }]}>
-          Removing is a soft delete: the row stays for the audit trail and disappears from every feed. Suspending a channel keeps its posts but blocks new ones.
+          Removing is a soft delete: the row stays for the audit trail and disappears from every feed. Suspending a channel or a group keeps its posts and messages but blocks new ones, and a suspended group is blocked for everyone in it, admins included.
         </Text>
       </View>
       <TextInput
@@ -86,6 +88,30 @@ export function AdminModerationPanel() {
             </Pressable>
             <Pressable onPress={() => deleteChannel.mutate({ channelId: item.id })} disabled={deleteChannel.isPending} style={({ pressed }) => [styles.action, { borderColor: colors.error }, pressed && styles.pressed]}>
               <Text style={[styles.actionText, { color: colors.error }]}>Delete</Text>
+            </Pressable>
+          </View>
+        </View>
+      ))}
+
+      <Text style={[styles.sectionTitle, { color: colors.foreground }]}>Groups ({groups.data?.length ?? 0})</Text>
+      {!groups.isLoading && (groups.data ?? []).length === 0 ? <Text style={[styles.empty, { color: colors.muted }]}>No groups created yet.</Text> : null}
+      {(groups.data ?? []).slice(0, 25).map((item) => (
+        <View key={item.id} style={[styles.card, { borderColor: item.suspendedAt ? colors.error : colors.border }]}>
+          <View style={styles.cardTop}>
+            <MaterialIcons name="groups" size={16} color={item.suspendedAt ? colors.error : colors.primary} />
+            <Text style={[styles.cardTitle, { color: colors.foreground }]} numberOfLines={1}>{item.title || "Untitled group"}</Text>
+            <Text style={[styles.cardTime, { color: colors.muted }]}>{item.memberCount} members</Text>
+          </View>
+          <Text style={[styles.cardBody, { color: colors.muted }]} numberOfLines={2}>
+            by {item.ownerName ?? item.ownerUsername ?? `User ${item.createdBy}`}{item.suspendedAt ? ` · suspended${item.suspendedReason ? `: ${item.suspendedReason}` : ""}` : ""}
+          </Text>
+          <View style={styles.actions}>
+            <Pressable
+              onPress={() => suspendGroup.mutate({ conversationId: item.id, suspended: !item.suspendedAt, reason })}
+              disabled={suspendGroup.isPending}
+              style={({ pressed }) => [styles.action, { borderColor: colors.border }, pressed && styles.pressed]}
+            >
+              <Text style={[styles.actionText, { color: colors.foreground }]}>{item.suspendedAt ? "Reinstate" : "Suspend"}</Text>
             </Pressable>
           </View>
         </View>

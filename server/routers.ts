@@ -9,7 +9,7 @@ import { normalizePhone } from "./_core/phoneAuth";
 import { sdk } from "./_core/sdk";
 import { ownerProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { createRoomToken, isLiveKitConfigured, liveKitUrl } from "./livekit";
-import { addConversationMembers, appealStatusForUsername, clearUserAvatar, createAppeal, createCallRecord, createGroupConversation, createMessage, createConversation, findOrCreateDirectConversation, expireStaleCalls, getCallRecord, getConversationRole, getIncomingCallForUser, getUserByUsername, getUserById, getUserSettings, isConversationMember, listRecentCalls, setCallStatus, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings, adminRemoveStatus, createChannel, createChannelPost, createStatus, deleteStatus, deleteChannel, followChannel, getChannel, getChannelDetail, getChannelPost, getStatus, isChannelFollower, saveMessageMedia, listActiveStatusesByAuthors, listChannelFollowers, listChannelPosts, listChannelPostsForAdmin, listChannelsForAdmin, listChannelsForUser, listContactIdsForUser, listStatusesForAdmin, listStatusViewers, listViewedStatusIds, markChannelRead, markStatusViewed, removeChannelPost, searchChannels, setChannelSuspended, unfollowChannel } from "./db";
+import { addConversationMembers, appealStatusForUsername, clearUserAvatar, createAppeal, createCallRecord, createGroupConversation, createMessage, createConversation, findOrCreateDirectConversation, expireStaleCalls, getCallRecord, getConversationRole, getIncomingCallForUser, getUserByUsername, getUserById, getUserSettings, isConversationMember, listRecentCalls, setCallStatus, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings, adminRemoveStatus, createChannel, createChannelPost, createStatus, deleteStatus, deleteChannel, followChannel, getChannel, getChannelDetail, getChannelPost, getStatus, isChannelFollower, saveMessageMedia, listActiveStatusesByAuthors, listChannelFollowers, listChannelPosts, listChannelPostsForAdmin, listChannelsForAdmin, listChannelsForUser, listContactIdsForUser, listStatusesForAdmin, listStatusViewers, listViewedStatusIds, markChannelRead, markStatusViewed, removeChannelPost, searchChannels, setConversationSuspended, listGroupsForAdmin, setChannelSuspended, unfollowChannel } from "./db";
 import { storagePut } from "./storage";
 import { notifyConversationMembers } from "./push";
 import { messages, type User } from "../drizzle/schema";
@@ -208,7 +208,10 @@ export const appRouter = router({
       // The description column and the mutation that writes it both existed, but nothing ever read
       // it back, so a group description could be set and never seen.
       const summary = await getConversationSummary(input.conversationId);
-      return { role, members, title: summary?.title ?? null, description: summary?.description ?? null };
+      // The suspension travels with the group rather than being fetched separately, so the screen
+      // cannot render a composer for a group that an owner has suspended while a second query is
+      // still in flight.
+      return { role, members, title: summary?.title ?? null, description: summary?.description ?? null, suspendedAt: summary?.suspendedAt ?? null, suspendedReason: summary?.suspendedReason ?? null };
     }),
     addMembers: protectedProcedure.input(z.object({ conversationId: z.string().min(1), userIds: z.array(z.number().int().positive()).min(1).max(256) })).mutation(async ({ ctx, input }) => {
       const access = await getConversationAccess(input.conversationId, ctx.user.id);
@@ -396,6 +399,11 @@ export const appRouter = router({
       // Announcement-style groups restrict sending to admins; the setting starts at "all", so every
       // group that existed before it behaves exactly as it did.
       if (!permitted(access.whoCanSend, access.role)) throw new Error("Only admins can send messages in this group");
+      // An owner may have suspended this group. That stops everybody, including the group's own
+      // admins, which is the point of the power: a suspension its admins could talk their way around
+      // would not be one. Confirmed here as well as hidden in the UI, so the block holds whatever the
+      // client chooses to show.
+      if (access.suspendedAt) throw new Error("This group has been suspended, so messages cannot be sent");
       // The disappearing clock is stamped at send time, so changing the setting later cannot
       // retroactively expire messages somebody already received.
       // Falls back to the sender's account-wide default when the chat itself has no setting. Without
@@ -1354,6 +1362,17 @@ export const appRouter = router({
     }),
     deleteChannel: ownerProcedure.input(z.object({ channelId: z.string().min(1) })).mutation(async ({ input }) => {
       await deleteChannel(input.channelId);
+      return { ok: true as const };
+    }),
+    // ---- groups. Only the two owner accounts reach any of this, via `ownerProcedure`. -------
+    groups: ownerProcedure.query(() => listGroupsForAdmin()),
+    suspendGroup: ownerProcedure.input(z.object({ conversationId: z.string().min(1), suspended: z.boolean(), reason: z.string().max(500).optional() })).mutation(async ({ input }) => {
+      // Groups only. A direct chat is not a group and has no admins to act on, and suspending one
+      // would silently stop two people talking to each other, which is not what this is for.
+      const summary = await getConversationSummary(input.conversationId);
+      if (!summary) throw new Error("That group no longer exists");
+      if (summary.kind !== "group") throw new Error("Only groups can be suspended");
+      await setConversationSuspended(input.conversationId, input.suspended, input.reason?.trim() || null);
       return { ok: true as const };
     }),
   }),

@@ -175,6 +175,11 @@ export async function listConversationsForUser(userId: number) {
       // Carried on the list rather than behind its own query: the chat screen needs it to decide
       // whether to load media, and the list is already being fetched.
       mediaAutoLoad: member.mediaAutoLoad === 1,
+      // Same reasoning. The chat screen has to know a group is suspended before somebody types into
+      // it, and it already holds this list; the server refuses the send either way, but a composer
+      // that looks usable and then rejects is a worse answer than one that says why it is closed.
+      suspendedAt: conversation.suspendedAt,
+      suspendedReason: conversation.suspendedReason,
     });
   }
   return result;
@@ -1092,7 +1097,7 @@ export async function getConversationAccess(conversationId: string, userId: numb
   const db = await getDb();
   if (!db) return null;
   const [row] = await db
-    .select({ role: conversationMembers.role, whoCanSend: conversations.whoCanSend, whoCanEditInfo: conversations.whoCanEditInfo, whoCanAddMembers: conversations.whoCanAddMembers, approveNewMembers: conversations.approveNewMembers })
+    .select({ role: conversationMembers.role, whoCanSend: conversations.whoCanSend, whoCanEditInfo: conversations.whoCanEditInfo, whoCanAddMembers: conversations.whoCanAddMembers, approveNewMembers: conversations.approveNewMembers, suspendedAt: conversations.suspendedAt, suspendedReason: conversations.suspendedReason })
     .from(conversationMembers)
     .innerJoin(conversations, eq(conversations.id, conversationMembers.conversationId))
     .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)))
@@ -2722,11 +2727,47 @@ export async function getConversationSummary(conversationId: string) {
   const db = await getDb();
   if (!db) return null;
   const rows = await db
-    .select({ id: conversations.id, title: conversations.title, kind: conversations.kind, description: conversations.description })
+    .select({ id: conversations.id, title: conversations.title, kind: conversations.kind, description: conversations.description, suspendedAt: conversations.suspendedAt, suspendedReason: conversations.suspendedReason })
     .from(conversations)
     .where(eq(conversations.id, conversationId))
     .limit(1);
   return rows[0] ?? null;
+}
+
+/**
+ * Suspending a group, in the same shape as `setChannelSuspended`.
+ *
+ * Keeps the group and every message in it, and only stops new ones being sent. A suspended group is
+ * a pause, not a deletion, so nothing here is destructive and clearing the flag restores it exactly.
+ */
+export async function setConversationSuspended(id: string, suspended: boolean, reason: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.update(conversations).set({ suspendedAt: suspended ? new Date() : null, suspendedReason: suspended ? reason : null }).where(eq(conversations.id, id));
+}
+
+/** The groups an owner can act on, newest first, with who created them and how big they are. */
+export async function listGroupsForAdmin(limit = 200) {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db
+    .select({ id: conversations.id, title: conversations.title, createdBy: conversations.createdBy, createdAt: conversations.createdAt, suspendedAt: conversations.suspendedAt, suspendedReason: conversations.suspendedReason, ownerName: users.name, ownerUsername: users.username })
+    .from(conversations)
+    .innerJoin(users, eq(users.id, conversations.createdBy))
+    // Direct chats are not groups and cannot be suspended; only `kind: "group"` is listed so the
+    // console cannot be used to reach into somebody's one-to-one conversation.
+    .where(eq(conversations.kind, "group"))
+    .orderBy(desc(conversations.createdAt))
+    .limit(limit);
+
+  if (rows.length === 0) return [];
+  const counts = await db
+    .select({ conversationId: conversationMembers.conversationId, members: sql<number>`count(*)::int` })
+    .from(conversationMembers)
+    .where(inArray(conversationMembers.conversationId, rows.map((row) => row.id)))
+    .groupBy(conversationMembers.conversationId);
+  const byId = new Map(counts.map((row) => [row.conversationId, row.members]));
+  return rows.map((row) => ({ ...row, memberCount: byId.get(row.id) ?? 0 }));
 }
 
 export type LeaveGroupOutcome = { remaining: number; transferredTo: number | null };

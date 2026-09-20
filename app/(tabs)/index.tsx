@@ -716,6 +716,24 @@ export default function HomeScreen() {
     return true;
   };
 
+  /**
+   * A group an owner has suspended, read off the conversation list this screen already holds.
+   *
+   * Checked before the send for the same reason the offline check above is: the server refuses it
+   * either way, and what matters is that the answer is a sentence rather than a failed request. The
+   * banner below says it too - a composer that looks usable and then rejects is the thing this is
+   * here to avoid.
+   */
+  const openConversation = (conversationListQuery.data ?? []).find((row) => row.id === selectedId) ?? null;
+  const groupSuspended = Boolean(openConversation?.suspendedAt);
+  const groupSuspendedReason = openConversation?.suspendedReason ?? null;
+
+  const blockedSuspended = () => {
+    if (!groupSuspended) return false;
+    notify(groupSuspendedReason ? `This group is suspended: ${groupSuspendedReason}` : "This group has been suspended by an administrator");
+    return true;
+  };
+
   const requestWebNotifications = async () => {
     if (Platform.OS !== "web" || typeof window === "undefined" || !("Notification" in window)) {
       notify("Browser notifications are not supported here");
@@ -927,6 +945,9 @@ export default function HomeScreen() {
     // Checked before the text is cleared below, so an offline send leaves the message in the box to
     // be typed again rather than swallowing it.
     if (blockedOffline()) return;
+    // Before the text is cleared, same as the offline check: a refused send leaves the message in
+    // the box rather than swallowing it.
+    if (blockedSuspended()) return;
     const now = new Date();
     const time = now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
     const localMessage: Message = { id: `new-${Date.now()}`, text: trimmed || override?.text || "Shared media", time, mine: true, read: true, viewOnce, quote: replyTo ? { id: replyTo.id, body: replyTo.text, kind: "text", senderId: user?.id ?? 0, senderName: replyTo.senderName, deleted: false } : undefined, ...override };
@@ -1584,6 +1605,7 @@ export default function HomeScreen() {
             <IconButton name="call" dimmed={!online} color={online ? colors.primary : colors.muted} onPress={() => { if (blockedOffline(OFFLINE_CALL_MESSAGE)) return; void startCall({ conversationId: selectedChat.id, kind: "audio", peerName: selectedChat.name, peerId: selectedChat.peerId, avatarUpdatedAt: selectedChat.avatarUpdatedAt }); }} />
           </View>
           <OfflineBanner />
+          {groupSuspended ? <View style={[styles.strandedBar, { backgroundColor: colors.surface, borderBottomColor: colors.border }]}><MaterialIcons name="gavel" size={16} color={colors.error} /><Text style={[styles.strandedText, { color: colors.muted }]}>Suspended by an administrator{groupSuspendedReason ? `: ${groupSuspendedReason}` : ""} — nobody can post here until it is reinstated.</Text></View> : null}
           {/*
             A group whose only member is you. Every message sent from here is stored and delivered to
             nobody, and until this banner existed there was nothing on the screen to say so - which is

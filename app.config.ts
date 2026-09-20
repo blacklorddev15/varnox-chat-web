@@ -36,7 +36,10 @@ const config: ExpoConfig = {
   ios: { supportsTablet: true, bundleIdentifier: env.iosBundleId, infoPlist: { ITSAppUsesNonExemptEncryption: false } },
   android: {
     adaptiveIcon: {
-      backgroundColor: "#FFF4D6",
+      // The master emblem's own measured background, so the adaptive tile reads as one full-bleed
+      // dark square with the gold mark centred in it rather than a dark image sitting on a
+      // near-miss dark. Sampled from the artwork in scripts of the icon build, not chosen by eye.
+      backgroundColor: "#010101",
       foregroundImage: "./assets/images/android-icon-foreground.png",
       backgroundImage: "./assets/images/android-icon-background.png",
       monochromeImage: "./assets/images/android-icon-monochrome.png",
@@ -55,7 +58,10 @@ const config: ExpoConfig = {
     ["expo-image-picker", { photosPermission: "Allow $(PRODUCT_NAME) to share photos and videos in conversations.", cameraPermission: "Allow $(PRODUCT_NAME) to take photos for conversations." }],
     ["expo-notifications", { color: "#F59E0B" }],
     ["expo-video", { supportsBackgroundPlayback: true, supportsPictureInPicture: true }],
-    ["expo-splash-screen", { image: "./assets/images/splash-icon.png", imageWidth: 200, resizeMode: "contain", backgroundColor: "#FFFDF8", dark: { backgroundColor: "#171717" } }],
+    // The splash carries the same dark value as the adaptive tile, and the splash image is now that
+    // tile's colour rather than a transparent mark, so the two agree and the emblem does not sit on
+    // a light panel that the rest of the app never uses.
+    ["expo-splash-screen", { image: "./assets/images/splash-icon.png", imageWidth: 200, resizeMode: "contain", backgroundColor: "#010101", dark: { backgroundColor: "#010101" } }],
     ["expo-build-properties", { android: { buildArchs: ["armeabi-v7a", "arm64-v8a"], minSdkVersion: 24 } }],
   ],
   experiments: { typedRoutes: true, reactCompiler: true },

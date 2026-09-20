@@ -232,6 +232,15 @@ export default function GroupInfoScreen() {
           <Text style={[styles.error, { color: "#EF4444" }]}>{membersQuery.error.message}</Text>
         ) : null}
 
+        {membersQuery.data?.suspendedAt ? (
+          <View style={[styles.suspended, { borderColor: colors.error, backgroundColor: colors.surface }]}>
+            <MaterialIcons name="gavel" size={18} color={colors.error} />
+            <Text style={[styles.suspendedText, { color: colors.error }]}>
+              Suspended by an administrator{membersQuery.data.suspendedReason ? `: ${membersQuery.data.suspendedReason}` : ""} — nobody can post here until it is reinstated.
+            </Text>
+          </View>
+        ) : null}
+
         <Text style={[styles.section, { color: colors.muted }]}>GROUP PHOTO</Text>
         <View style={styles.photoRow}>
           {iconUrl ? (
@@ -502,6 +511,8 @@ const styles = StyleSheet.create({
   searchInput: { flex: 1, marginLeft: 9, fontSize: 15 },
   descriptionBox: { flexDirection: "row", alignItems: "center", gap: 10, borderWidth: 1, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 12 },
   descriptionText: { flex: 1, fontSize: 14, lineHeight: 20 },
+  suspended: { flexDirection: "row", alignItems: "center", gap: 9, borderWidth: 1, borderRadius: 14, paddingHorizontal: 13, paddingVertical: 11, marginBottom: 6 },
+  suspendedText: { flex: 1, fontSize: 12, lineHeight: 17, fontWeight: "700" },
   descriptionInput: { borderWidth: 1, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 12, fontSize: 14, minHeight: 76, textAlignVertical: "top" },
   descriptionActions: { flexDirection: "row", justifyContent: "flex-end", gap: 8, marginTop: 8 },
   leaveButton: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 8, marginTop: 34, borderWidth: 1, borderColor: "#EF4444", borderRadius: 14, paddingVertical: 13 },
