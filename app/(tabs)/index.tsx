@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import { useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import {
   FlatList,
   Image,
@@ -28,6 +28,7 @@ import { RecordingPresets, requestRecordingPermissionsAsync, setAudioModeAsync, 
 import { ScreenContainer } from "@/components/screen-container";
 import { VideoMessage } from "@/components/video-message";
 import { completeMention, mentionQuery, parseMentions } from "@/lib/mentions";
+import { parseRichText, type RichNode, type RichStyle } from "@/lib/rich-text";
 import { useColors } from "@/hooks/use-colors";
 import { useAppVisible } from "@/hooks/use-app-visible";
 import { useRealtime } from "@/hooks/use-realtime";
@@ -183,38 +184,80 @@ function IconButton({ name, color, onPress }: { name: React.ComponentProps<typeo
 type IconName = ComponentProps<typeof MaterialIcons>["name"];
 
 /**
- * Message text with @mentions emphasised.
+ * How each inline marker renders.
  *
- * Takes the plain path when nothing is mentioned, so the common case renders exactly as before and
- * only messages that actually name someone pay for the parsing.
+ * Colours are not set here: a bubble is green for the sender and grey for everyone else, so the
+ * caller passes them in. These are only the glyph-level differences.
+ */
+const RICH_STYLE_OVERRIDES: Record<RichStyle, TextStyle> = {
+  bold: { fontWeight: "700" },
+  italic: { fontStyle: "italic" },
+  strike: { textDecorationLine: "line-through" },
+  mono: { fontFamily: Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" }) },
+};
+
+/**
+ * Message text with @mentions emphasised and inline formatting applied.
+ *
+ * Both parses are pure functions in `lib/`; this only turns their output into nested `<Text>`, which
+ * is how React Native applies mixed styling within one paragraph. A body with nothing to mark up
+ * takes the plain path, so the common case renders exactly as it did before.
  */
 function MessageText({
   text,
   names,
   style,
   mentionStyle,
+  linkStyle,
+  onPressLink,
 }: {
   text: string;
   names: string[];
   style: StyleProp<TextStyle>;
   mentionStyle: StyleProp<TextStyle>;
+  linkStyle: StyleProp<TextStyle>;
+  onPressLink: (href: string) => void;
 }) {
-  const segments = parseMentions(text, names);
-  if (!segments.some((segment) => segment.mention)) return <Text style={style}>{text}</Text>;
+  const nodes = useMemo(() => parseRichText(text), [text]);
 
-  return (
-    <Text style={style}>
-      {segments.map((segment, index) =>
-        segment.mention ? (
-          <Text key={index} style={mentionStyle}>
-            {segment.text}
+  if (nodes.length === 0) return <Text style={style}>{text}</Text>;
+  if (nodes.length === 1 && nodes[0].kind === "text") return <Text style={style}>{nodes[0].text}</Text>;
+
+  // Mentions are found inside the leaf runs, so "*bold @Ann*" highlights the name inside the style.
+  const renderPlain = (value: string, keyPrefix: string): ReactNode => {
+    const segments = parseMentions(value, names);
+    if (!segments.some((segment) => segment.mention)) return value;
+
+    return segments.map((segment, index) =>
+      segment.mention ? (
+        <Text key={`${keyPrefix}-mention-${index}`} style={mentionStyle}>
+          {segment.text}
+        </Text>
+      ) : (
+        segment.text
+      ),
+    );
+  };
+
+  const renderNodes = (list: RichNode[], keyPrefix: string): ReactNode[] =>
+    list.map((node, index) => {
+      const key = `${keyPrefix}-${index}`;
+      if (node.kind === "text") return renderPlain(node.text, key);
+      if (node.kind === "link") {
+        return (
+          <Text key={key} style={linkStyle} onPress={() => onPressLink(node.href)}>
+            {node.text}
           </Text>
-        ) : (
-          segment.text
-        ),
-      )}
-    </Text>
-  );
+        );
+      }
+      return (
+        <Text key={key} style={RICH_STYLE_OVERRIDES[node.kind]}>
+          {renderNodes(node.children, key)}
+        </Text>
+      );
+    });
+
+  return <Text style={style}>{renderNodes(nodes, "rich")}</Text>;
 }
 
 /**
@@ -1005,6 +1048,11 @@ export default function HomeScreen() {
     }
   };
 
+  /** Follows a link a sender typed into a message body. */
+  const openLink = (href: string) => {
+    void Linking.openURL(href).catch(() => notify("Could not open that link"));
+  };
+
   /**
    * View-once video. The stored copy is consumed first, exactly as for a photo, so a failure to
    * play cannot leave the media readable afterwards.
@@ -1095,7 +1143,7 @@ export default function HomeScreen() {
             {item.kind === "voice" ? <VoiceNoteBubble message={item} mine={Boolean(item.mine)} colors={colors} /> : null}
             {!item.deleted && item.kind === "poll" && item.meta?.kind === "poll" ? <PollBubble meta={item.meta} votes={item.votes ?? []} myUserId={user?.id} mine={Boolean(item.mine)} colors={colors} onVote={(index) => void castVote(item, index)} /> : null}
             {!item.deleted && item.kind === "contact" && item.meta?.kind === "contact" ? <Pressable onPress={() => openSharedContact(item.meta)} style={styles.contactCard}><View style={[styles.contactCardAvatar, { backgroundColor: chatColor(item.meta.name) }]}><Text style={styles.contactCardInitials}>{chatInitials(item.meta.name)}</Text></View><View style={styles.contactCardCopy}><Text style={[styles.contactCardName, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]} numberOfLines={1}>{item.meta.name}</Text><Text style={[styles.contactCardMeta, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]} numberOfLines={1}>{item.meta.username ? `@${item.meta.username}` : item.meta.phone ?? "Varnox contact"}</Text></View><MaterialIcons name="chat-bubble-outline" size={17} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /></Pressable> : null}
-            {item.kind !== "voice" && item.kind !== "file" && item.kind !== "poll" && item.kind !== "contact" && item.kind !== "sticker" && (item.kind !== "image" || !item.mediaUrl) ? <MessageText text={item.text} names={mentionNames} style={[styles.messageText, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]} mentionStyle={[styles.mention, { color: colors.primary }]} /> : null}
+            {item.kind !== "voice" && item.kind !== "file" && item.kind !== "poll" && item.kind !== "contact" && item.kind !== "sticker" && (item.kind !== "image" || !item.mediaUrl) ? <MessageText text={item.text} names={mentionNames} style={[styles.messageText, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]} mentionStyle={[styles.mention, { color: colors.primary }]} linkStyle={[styles.link, { color: item.mine ? colors.bubbleOutgoingText : colors.primary }]} onPressLink={openLink} /> : null}
             <View style={styles.messageMeta}>{item.edited ? <Text style={[styles.editedTag, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>edited</Text> : null}<Text style={[styles.messageTime, { color: item.mine ? colors.bubbleOutgoingText : colors.muted, opacity: item.mine ? 0.75 : 1 }]}>{item.time}</Text>{item.starred ? <MaterialIcons name="star" size={13} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /> : null}<MessageTicks status={item.status} color={item.mine ? colors.bubbleOutgoingText : colors.muted} readColor="#53BDEB" /></View>
           </View>{item.reactions && item.reactions.length > 0 ? <View style={styles.reactionRow}>{item.reactions.map((reaction) => <View key={`${item.id}-${reaction.userId}`} style={[styles.reactionChip, { backgroundColor: colors.surface, borderColor: colors.border }]}><Text style={styles.reactionEmoji}>{reaction.emoji}</Text></View>)}</View> : null}{reactingToId === item.id ? <View style={[styles.reactionPicker, { backgroundColor: colors.surface, borderColor: colors.border }]}>{REACTION_EMOJIS.map((emoji) => <Pressable key={emoji} onPress={() => void applyReaction(item, emoji)} hitSlop={6}><Text style={styles.reactionEmoji}>{emoji}</Text></Pressable>)}</View> : null}{activeMessageId === item.id ? <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.actionsScroll} contentContainerStyle={[styles.messageActions, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => { setReplyTo({ id: item.id, text: item.text, senderName: item.mine ? "You" : selectedChat.name }); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Reply</Text></Pressable><Pressable onPress={() => { setReactingToId(item.id); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>React</Text></Pressable><Pressable onPress={() => void toggleStar(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>{item.starred ? "Unstar" : "Star"}</Text></Pressable><Pressable onPress={() => { setForwarding(item); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Forward</Text></Pressable>{item.kind === "image" && item.mediaUrl && !item.viewOnce ? <Pressable onPress={() => { setActiveMessageId(null); void saveAsSticker(item); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Save as sticker</Text></Pressable> : null}{item.mine && !item.deleted && item.kind === "text" ? <Pressable onPress={() => beginEdit(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>Edit</Text></Pressable> : null}<Pressable onPress={() => void deleteMessage(item, false)}><Text style={[styles.actionText, { color: colors.foreground }]}>Delete for me</Text></Pressable>{item.mine && !item.deleted ? <Pressable onPress={() => void deleteMessage(item, true)}><Text style={[styles.actionText, { color: colors.error }]}>Delete for everyone</Text></Pressable> : null}</ScrollView> : null}</Pressable>} />
           <View style={[styles.composerArea, { borderTopColor: colors.border, backgroundColor: colors.background }]}>{editingId ? <Pressable onPress={() => { setEditingId(null); setComposerText(""); }} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>Editing message</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{composerText}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : replyTo ? <Pressable onPress={() => setReplyTo(null)} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>{replyTo.senderName}</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{replyTo.text}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : null}{mentionSuggestions.length > 0 ? <View style={[styles.mentionBar, { backgroundColor: colors.surface, borderColor: colors.border }]}>{mentionSuggestions.map((name) => <Pressable key={name} onPress={() => setComposerText((current) => completeMention(current, name))} style={[styles.mentionChip, { borderColor: colors.border }]}><Text style={[styles.mentionChipText, { color: colors.primary }]}>{name}</Text></Pressable>)}</View> : null}<View style={[styles.composer, { backgroundColor: colors.surface, borderColor: colors.border }]}><IconButton name="add" color={colors.muted} onPress={() => setShowAttach((current) => !current)} /><Pressable onPress={() => setViewOnce(!viewOnce)} style={[styles.viewOnce, viewOnce && { backgroundColor: colors.primary }]}><Text style={[styles.viewOnceText, { color: viewOnce ? "#FFFFFF" : colors.muted }]}>1</Text></Pressable><TextInput value={composerText} onChangeText={onComposerChange} placeholder={editingId ? "Edit message" : "Write a message"} placeholderTextColor={colors.muted} style={[styles.composerInput, { color: colors.foreground }]} multiline maxLength={500} /><IconButton name="mood" color={colors.muted} onPress={() => setComposerText((current) => `${current}${current ? " " : ""}✨`)} /></View>{showAttach ? <View style={styles.attachSheet}><Pressable onPress={() => { setShowAttach(false); void shareMedia(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="perm-media" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Photo or video</Text></Pressable><Pressable onPress={() => { setShowAttach(false); void shareDocument(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="attach-file" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Document</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setPollDraft({ question: "", options: ["", ""] }); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="poll" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Poll</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setShowShareContact(true); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="contact-page" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Contact</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setShowStickers(true); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="emoji-emotions" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Sticker</Text></Pressable></View> : null}<Pressable onPress={editingId ? () => void saveEdit() : composerText.trim() ? () => void sendMessage() : recorderState.isRecording ? () => void stopVoiceNote() : () => void startVoiceNote()} style={({ pressed }) => [styles.sendButton, { backgroundColor: recorderState.isRecording ? colors.error : colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name={editingId ? "check" : composerText.trim() ? "send" : recorderState.isRecording ? "stop" : "mic"} size={21} color="#FFFFFF" /></Pressable></View>
@@ -1136,7 +1184,7 @@ const styles = StyleSheet.create({
   fileName: { fontSize: 14, fontWeight: "600" },
   fileMeta: { fontSize: 11.5, marginTop: 2 },
   overlayVideo: { width: "88%", height: "70%", borderRadius: 14, backgroundColor: "#000" },
-  mention: { fontWeight: "800" },
+  mention: { fontWeight: "800" }, link: { textDecorationLine: "underline" },
   mentionBar: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginHorizontal: 14, marginBottom: 8, padding: 8, borderRadius: 12, borderWidth: 1 },
   mentionChip: { borderWidth: 1, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 5 },
   mentionChipText: { fontSize: 12.5, fontWeight: "700" },
