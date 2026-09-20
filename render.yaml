@@ -51,8 +51,9 @@ services:
         sync: false
       - key: RESEND_API_KEY
         sync: false
-      # Not a secret, and it must match a domain verified in Resend or sends are rejected.
-      # Pinned so it is not mis-typed; varnoxapp.blacklord.tech is verified.
+      # Not a secret, and carried over unchanged from the previous version of this file.
+      # The address must sit on a domain verified in Resend, or sends are rejected - that the
+      # domain in it is verified is not something this file can assert, so check it if mail fails.
       - key: RESEND_FROM
         value: "Varnox Chat <no-reply@varnoxapp.blacklord.tech>"
 
@@ -81,6 +82,25 @@ services:
       # which is what keeps the deployed schema in step with drizzle/ without a manual step.
       # - key: RUN_MIGRATIONS
       #   value: "0"
+
+# What you actually have to fill in, checked against the code rather than assumed:
+#
+#   DATABASE_URL   required. Without it getDb() returns undefined and every query fails. The server
+#                  still boots and /api/health still answers, so the failure looks like a broken app
+#                  rather than a missing variable.
+#   JWT_SECRET     set it. Nothing stops you skipping it - it defaults to "" - and that is the
+#                  problem: sessions would be signed with an empty key, which anyone can forge.
+#                  It fails silently and only in the security direction.
+#
+# Everything else is feature-gated and safe to leave blank:
+#
+#   RESEND_*       email only. Throws "RESEND_API_KEY is not configured" when a mail is sent, not
+#                  at boot. Skip if you are not using email verification or password reset.
+#   LIVEKIT_*      calls only. Throws "Calls are not configured on this server" when a call starts.
+#                  Leave blank and everything except calling works.
+#   VONAGE_*       phone sign-in only. Sign up with email and these are unused.
+#
+# So the minimum for a working service is two variables, and only one of them is enforced.
 
 # After this service is live, the web app must be pointed at it or none of the above matters:
 # in Vercel -> Settings -> Environment Variables, set
