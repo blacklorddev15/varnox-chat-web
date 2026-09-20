@@ -431,6 +431,20 @@ export default function GroupInfoScreen() {
           <Text style={styles.leaveText}>Leave group</Text>
         </Pressable>
 
+        {/* Events belong to a conversation rather than to Settings, so the way in is here. */}
+        <Text style={[styles.section, { color: colors.muted }]}>PLAN SOMETHING</Text>
+        <Pressable
+          onPress={() => router.push({ pathname: "/chat/events", params: { conversationId } })}
+          style={({ pressed }) => [styles.eventsRow, { borderColor: colors.border, backgroundColor: colors.surface }, pressed && styles.pressed]}
+        >
+          <MaterialIcons name="event" size={19} color={colors.primary} />
+          <View style={styles.eventsCopy}>
+            <Text style={[styles.eventsTitle, { color: colors.foreground }]}>Events</Text>
+            <Text style={[styles.eventsSub, { color: colors.muted }]}>Propose a time and see who is coming</Text>
+          </View>
+          <MaterialIcons name="chevron-right" size={20} color={colors.muted} />
+        </Pressable>
+
         <Text style={[styles.section, { color: colors.muted }]}>RECENT ACTIVITY</Text>
         {activity.data?.length ? (
           activity.data.map((event) => (
@@ -473,6 +487,11 @@ const styles = StyleSheet.create({
   photoEmpty: { borderWidth: 1, alignItems: "center", justifyContent: "center" },
   photoActions: { flex: 1, gap: 8, alignItems: "flex-start" },
   photoHint: { fontSize: 11.5, lineHeight: 16 },
+  pressed: { opacity: 0.65 },
+  eventsRow: { flexDirection: "row", alignItems: "center", gap: 12, borderWidth: 1, borderRadius: 14, padding: 13 },
+  eventsCopy: { flex: 1 },
+  eventsTitle: { fontSize: 14.5, fontWeight: "800" },
+  eventsSub: { fontSize: 12, marginTop: 2 },
   activityRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 9, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: "rgba(127,127,127,0.2)" },
   activityText: { flex: 1, fontSize: 13, lineHeight: 18 },
   activityTime: { fontSize: 11 },

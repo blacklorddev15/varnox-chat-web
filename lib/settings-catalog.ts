@@ -31,6 +31,9 @@ export type SettingsRoute =
   | "/chat/appeals"
   | "/chat/broadcasts"
   | "/chat/support"
+  | "/chat/contacts"
+  | "/security/link-device"
+  | "/catalog"
   | "/admin";
 
 export type SettingsTarget =
@@ -162,6 +165,30 @@ export const SETTINGS_ENTRIES: SettingsEntry[] = [
     icon: "history",
     keywords: "ban suspended review restore",
     target: { kind: "route", href: "/chat/appeals" },
+  },
+  {
+    id: "contacts",
+    title: "Contacts",
+    subtitle: "Names only you see, for the people you talk to",
+    icon: "contacts",
+    keywords: "saved names rename address book nickname",
+    target: { kind: "route", href: "/chat/contacts" },
+  },
+  {
+    id: "catalog",
+    title: "My catalog",
+    subtitle: "Things you offer, with prices if you want them",
+    icon: "inventory-2",
+    keywords: "products price listing shop business sell",
+    target: { kind: "route", href: "/catalog" },
+  },
+  {
+    id: "link-device",
+    title: "Link a device",
+    subtitle: "Sign in on another device with a code instead of a password",
+    icon: "qr-code-2",
+    keywords: "qr pair second device another phone computer sign in",
+    target: { kind: "route", href: "/security/link-device" },
   },
   {
     id: "broadcasts",

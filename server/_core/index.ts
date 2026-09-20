@@ -10,6 +10,7 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "./oauth";
 import { registerPhoneAuthRoutes } from "./phoneAuth";
 import { registerPasswordAuthRoutes } from "./passwordAuth";
+import { registerDeviceLinkRoutes } from "./deviceLinkRoutes";
 import { registerStorageProxy } from "./storageProxy";
 import { registerAvatarRoutes } from "./avatarRoutes";
 import { registerMediaRoutes } from "./mediaRoutes";
@@ -70,6 +71,7 @@ export function createApp() {
   registerOAuthRoutes(app);
   registerPhoneAuthRoutes(app);
   registerPasswordAuthRoutes(app);
+  registerDeviceLinkRoutes(app);
 
   // `realtime` lets the client decide how to stay current without guessing: a live stream where a
   // single long-running process serves everyone, polling where it does not.

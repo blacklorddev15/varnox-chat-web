@@ -1,4 +1,4 @@
-import { integer, jsonb, pgEnum, pgTable, primaryKey, serial, text, timestamp, varchar } from "drizzle-orm/pg-core";
+import { doublePrecision, integer, jsonb, pgEnum, pgTable, primaryKey, serial, text, timestamp, varchar } from "drizzle-orm/pg-core";
 
 export const roleEnum = pgEnum("role", ["user", "admin"]);
 export const conversationKindEnum = pgEnum("conversation_kind", ["direct", "group"]);
@@ -189,3 +189,81 @@ export const channelFollowers = pgTable("channelFollowers", { channelId: varchar
 export type StatusUpdate = typeof statusUpdates.$inferSelect;
 export type Channel = typeof channels.$inferSelect;
 export type ChannelPost = typeof channelPosts.$inferSelect;
+
+// ---------------------------------------------------------------- live location
+// A location that keeps moving, as opposed to the static `location` message meta, which is a fixed
+// point sent once. This row is updated repeatedly and expires on its own.
+export const liveLocations = pgTable("liveLocations", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  conversationId: varchar("conversationId", { length: 64 }).notNull(),
+  userId: integer("userId").notNull(),
+  lat: doublePrecision("lat").notNull(),
+  lng: doublePrecision("lng").notNull(),
+  label: varchar("label", { length: 120 }),
+  startedAt: timestamp("startedAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+  // The share ends by itself, which is the difference between sharing a location live and being
+  // tracked: even if the sender forgets about it, the row stops being served.
+  expiresAt: timestamp("expiresAt").notNull(),
+  stoppedAt: timestamp("stoppedAt"),
+});
+
+// ---------------------------------------------------------------- saved contacts
+// A name only its owner sees. Kept apart from users.name deliberately: renaming somebody in your own
+// list must not rename them for everybody else.
+export const contacts = pgTable(
+  "contacts",
+  { ownerId: integer("ownerId").notNull(), targetId: integer("targetId").notNull(), displayName: varchar("displayName", { length: 80 }).notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() },
+  (table) => ({ pk: primaryKey({ columns: [table.ownerId, table.targetId] }) }),
+);
+
+// ---------------------------------------------------------------- events
+export const events = pgTable("events", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  conversationId: varchar("conversationId", { length: 64 }).notNull(),
+  creatorId: integer("creatorId").notNull(),
+  title: varchar("title", { length: 120 }).notNull(),
+  description: text("description"),
+  startsAt: timestamp("startsAt").notNull(),
+  endsAt: timestamp("endsAt"),
+  location: varchar("location", { length: 200 }),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  cancelledAt: timestamp("cancelledAt"),
+});
+
+// One row per person per event. The composite key is what stops somebody answering twice, so a
+// change of mind updates the answer rather than adding a second one.
+export const eventRsvps = pgTable(
+  "eventRsvps",
+  { eventId: varchar("eventId", { length: 64 }).notNull(), userId: integer("userId").notNull(), response: varchar("response", { length: 16 }).notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() },
+  (table) => ({ pk: primaryKey({ columns: [table.eventId, table.userId] }) }),
+);
+
+// ---------------------------------------------------------------- business catalog
+// A plain list of things a person offers. The price is an integer of minor units because money is
+// not a floating point number, and storing it as one is how you get 0.30000000000000004.
+export const catalogItems = pgTable("catalogItems", {
+  id: varchar("id", { length: 64 }).primaryKey(),
+  ownerId: integer("ownerId").notNull(),
+  name: varchar("name", { length: 120 }).notNull(),
+  description: text("description"),
+  priceCents: integer("priceCents"),
+  currency: varchar("currency", { length: 8 }).default("USD").notNull(),
+  imageUrl: text("imageUrl"),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+  archivedAt: timestamp("archivedAt"),
+});
+
+// ---------------------------------------------------------------- device linking
+// A short-lived code that signs a second device in without a password.
+//
+// The code is the entire credential, so it is single-use, short-lived and deliberately short enough
+// to type: whoever holds it can add a device to the account that issued it.
+export const deviceLinkCodes = pgTable("deviceLinkCodes", {
+  code: varchar("code", { length: 16 }).primaryKey(),
+  userId: integer("userId").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  expiresAt: timestamp("expiresAt").notNull(),
+  usedAt: timestamp("usedAt"),
+});

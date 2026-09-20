@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, ilike, inArray, isNotNull, isNull, like, lt, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, broadcastLists, broadcastRecipients, calls, channelFollowers, channelPosts, channels, communities, communityGroups, conversationIcons, conversationMembers, conversations, groupEvents, InsertUser, inviteLinks, joinRequests, linkPreviews, messageHides, messageKeeps, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, reports, sessions, statusUpdates, statusViews, stickers, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, broadcastLists, broadcastRecipients, calls, catalogItems, channelFollowers, channelPosts, channels, communities, communityGroups, contacts, conversationIcons, conversationMembers, conversations, deviceLinkCodes, eventRsvps, events, groupEvents, InsertUser, inviteLinks, joinRequests, linkPreviews, liveLocations, messageHides, messageKeeps, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, reports, sessions, statusUpdates, statusViews, stickers, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -469,6 +469,375 @@ function isDeliveredFor(row: { senderId: number; scheduledAt: Date | null }, use
   if (row.senderId === userId) return true;
   if (!row.scheduledAt) return true;
   return row.scheduledAt.getTime() <= nowMs;
+}
+
+// ---------------------------------------------------------------- live location
+/** The longest a share may run. A cap rather than a suggestion: an unbounded share is tracking. */
+export const LIVE_LOCATION_MAX_MS = 8 * 60 * 60 * 1000;
+
+/**
+ * Begins sharing a moving location.
+ *
+ * The expiry is set once and never extended, so a share cannot be kept alive indefinitely by
+ * continuing to update it. Somebody who wants longer starts a new one, which is a deliberate act
+ * rather than an accident of leaving a tab open.
+ */
+export async function startLiveLocation(conversationId: string, userId: number, lat: number, lng: number, durationMs: number, label?: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Location sharing is not available");
+  if (!(await isConversationMember(conversationId, userId))) throw new Error("You are not in that chat");
+
+  const clamped = Math.min(Math.max(durationMs, 60_000), LIVE_LOCATION_MAX_MS);
+  const id = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + clamped);
+  await db.insert(liveLocations).values({ id, conversationId, userId, lat, lng, label: label?.trim() || null, expiresAt });
+  return { id, expiresAt };
+}
+
+/** Moves an existing share. Only its owner can move it, and only while it is still running. */
+export async function updateLiveLocation(id: string, userId: number, lat: number, lng: number): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db
+    .update(liveLocations)
+    .set({ lat, lng, updatedAt: new Date() })
+    .where(and(eq(liveLocations.id, id), eq(liveLocations.userId, userId), isNull(liveLocations.stoppedAt), gt(liveLocations.expiresAt, new Date())))
+    .returning({ id: liveLocations.id });
+  return rows.length > 0;
+}
+
+export async function stopLiveLocation(id: string, userId: number): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db
+    .update(liveLocations)
+    .set({ stoppedAt: new Date() })
+    .where(and(eq(liveLocations.id, id), eq(liveLocations.userId, userId), isNull(liveLocations.stoppedAt)))
+    .returning({ id: liveLocations.id });
+  return rows.length > 0;
+}
+
+/**
+ * The shares still running in a conversation.
+ *
+ * Expired and stopped shares are filtered in the query rather than by the caller, so there is no
+ * path anywhere that can serve a location its owner has already stopped.
+ */
+export async function listLiveLocations(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db || !(await isConversationMember(conversationId, userId))) return [];
+  const rows = await db
+    .select({
+      id: liveLocations.id,
+      userId: liveLocations.userId,
+      lat: liveLocations.lat,
+      lng: liveLocations.lng,
+      label: liveLocations.label,
+      updatedAt: liveLocations.updatedAt,
+      expiresAt: liveLocations.expiresAt,
+      name: users.name,
+      username: users.username,
+    })
+    .from(liveLocations)
+    .leftJoin(users, eq(users.id, liveLocations.userId))
+    .where(and(eq(liveLocations.conversationId, conversationId), isNull(liveLocations.stoppedAt), gt(liveLocations.expiresAt, new Date())))
+    .orderBy(desc(liveLocations.updatedAt))
+    .limit(50);
+  return rows.map((row) => ({ ...row, userName: row.name ?? row.username ?? "Someone" }));
+}
+
+// ---------------------------------------------------------------- saved contacts
+/** The reader's own names for people. */
+export async function listContacts(ownerId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({ targetId: contacts.targetId, displayName: contacts.displayName, createdAt: contacts.createdAt, name: users.name, username: users.username })
+    .from(contacts)
+    .leftJoin(users, eq(users.id, contacts.targetId))
+    .where(eq(contacts.ownerId, ownerId))
+    .orderBy(contacts.displayName);
+}
+
+/** Saves, or renames, a personal name for somebody. Idempotent through the primary key. */
+export async function setContactName(ownerId: number, targetId: number, displayName: string): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  // Naming yourself is not a contact, and would shadow your own name in your own lists.
+  if (ownerId === targetId) return false;
+  const trimmed = displayName.trim().slice(0, 80);
+  if (!trimmed) return false;
+  await db
+    .insert(contacts)
+    .values({ ownerId, targetId, displayName: trimmed })
+    .onConflictDoUpdate({ target: [contacts.ownerId, contacts.targetId], set: { displayName: trimmed } });
+  return true;
+}
+
+export async function removeContact(ownerId: number, targetId: number): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  await db.delete(contacts).where(and(eq(contacts.ownerId, ownerId), eq(contacts.targetId, targetId)));
+  return true;
+}
+
+/**
+ * A lookup from user id to the reader's own name for them.
+ *
+ * A map, because every caller wants one: naming rows individually would be a query per name, and a
+ * list of fifty people would be fifty queries.
+ */
+export async function contactNamesFor(ownerId: number, targetIds: number[]): Promise<Map<number, string>> {
+  const db = await getDb();
+  const map = new Map<number, string>();
+  if (!db || targetIds.length === 0) return map;
+  const rows = await db
+    .select({ targetId: contacts.targetId, displayName: contacts.displayName })
+    .from(contacts)
+    .where(and(eq(contacts.ownerId, ownerId), inArray(contacts.targetId, targetIds)));
+  for (const row of rows) map.set(row.targetId, row.displayName);
+  return map;
+}
+
+// ---------------------------------------------------------------- events
+export const RSVP_ANSWERS = ["going", "maybe", "no"] as const;
+export type RsvpAnswer = (typeof RSVP_ANSWERS)[number];
+
+export async function createEvent(input: {
+  conversationId: string;
+  creatorId: number;
+  title: string;
+  description?: string | null;
+  startsAt: Date;
+  endsAt?: Date | null;
+  location?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("Events are not available");
+  if (!(await isConversationMember(input.conversationId, input.creatorId))) throw new Error("You are not in that chat");
+  const id = crypto.randomUUID();
+  await db.insert(events).values({
+    id,
+    conversationId: input.conversationId,
+    creatorId: input.creatorId,
+    title: input.title.trim().slice(0, 120),
+    description: input.description?.trim() || null,
+    startsAt: input.startsAt,
+    endsAt: input.endsAt ?? null,
+    location: input.location?.trim()?.slice(0, 200) || null,
+  });
+  return { id };
+}
+
+/**
+ * The events in a conversation, with answers counted and the reader's own answer.
+ *
+ * Cancelled events are returned rather than hidden. An event that silently disappeared would leave
+ * everyone who had arranged to attend wondering what happened to it.
+ */
+export async function listEvents(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db || !(await isConversationMember(conversationId, userId))) return [];
+
+  const rows = await db
+    .select({
+      id: events.id,
+      title: events.title,
+      description: events.description,
+      startsAt: events.startsAt,
+      endsAt: events.endsAt,
+      location: events.location,
+      cancelledAt: events.cancelledAt,
+      creatorId: events.creatorId,
+      name: users.name,
+      username: users.username,
+    })
+    .from(events)
+    .leftJoin(users, eq(users.id, events.creatorId))
+    .where(eq(events.conversationId, conversationId))
+    .orderBy(events.startsAt)
+    .limit(100);
+  if (rows.length === 0) return [];
+
+  const answers = await db
+    .select({ eventId: eventRsvps.eventId, userId: eventRsvps.userId, response: eventRsvps.response })
+    .from(eventRsvps)
+    .where(inArray(eventRsvps.eventId, rows.map((row) => row.id)));
+
+  return rows.map((row) => {
+    const mine = answers.filter((answer) => answer.eventId === row.id);
+    return {
+      ...row,
+      creatorName: row.name ?? row.username ?? "Someone",
+      going: mine.filter((answer) => answer.response === "going").length,
+      maybe: mine.filter((answer) => answer.response === "maybe").length,
+      declined: mine.filter((answer) => answer.response === "no").length,
+      myAnswer: mine.find((answer) => answer.userId === userId)?.response ?? null,
+    };
+  });
+}
+
+/** Records an answer, replacing any previous one from that person. */
+export async function rsvpEvent(eventId: string, userId: number, response: RsvpAnswer) {
+  const db = await getDb();
+  if (!db) throw new Error("Events are not available");
+  const rows = await db.select({ conversationId: events.conversationId, cancelledAt: events.cancelledAt }).from(events).where(eq(events.id, eventId)).limit(1);
+  const event = rows[0];
+  if (!event) throw new Error("That event no longer exists");
+  if (event.cancelledAt) throw new Error("That event was cancelled");
+  if (!(await isConversationMember(event.conversationId, userId))) throw new Error("You are not in that chat");
+  await db
+    .insert(eventRsvps)
+    .values({ eventId, userId, response })
+    .onConflictDoUpdate({ target: [eventRsvps.eventId, eventRsvps.userId], set: { response } });
+  return { ok: true as const, response };
+}
+
+/** Cancels an event. Only its creator may, and cancelling twice is not an error. */
+export async function cancelEvent(eventId: string, userId: number): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db
+    .update(events)
+    .set({ cancelledAt: new Date() })
+    .where(and(eq(events.id, eventId), eq(events.creatorId, userId), isNull(events.cancelledAt)))
+    .returning({ id: events.id });
+  return rows.length > 0;
+}
+
+// ---------------------------------------------------------------- business catalog
+export async function listCatalog(ownerId: number, includeArchived = false) {
+  const db = await getDb();
+  if (!db) return [];
+  const where = includeArchived
+    ? eq(catalogItems.ownerId, ownerId)
+    : and(eq(catalogItems.ownerId, ownerId), isNull(catalogItems.archivedAt));
+  return db.select().from(catalogItems).where(where).orderBy(desc(catalogItems.createdAt)).limit(200);
+}
+
+export async function addCatalogItem(input: {
+  ownerId: number;
+  name: string;
+  description?: string | null;
+  priceCents?: number | null;
+  currency?: string;
+  imageUrl?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("The catalog is not available");
+  const id = crypto.randomUUID();
+  await db.insert(catalogItems).values({
+    id,
+    ownerId: input.ownerId,
+    name: input.name.trim().slice(0, 120),
+    description: input.description?.trim() || null,
+    priceCents: input.priceCents ?? null,
+    currency: (input.currency ?? "USD").slice(0, 8).toUpperCase(),
+    imageUrl: input.imageUrl?.trim() || null,
+  });
+  return { id };
+}
+
+/** Edits an item. The owner is in the WHERE, so a guessed id cannot edit somebody else's row. */
+export async function updateCatalogItem(
+  id: string,
+  ownerId: number,
+  patch: { name?: string; description?: string | null; priceCents?: number | null; currency?: string; imageUrl?: string | null },
+): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const values: Record<string, unknown> = { updatedAt: new Date() };
+  if (patch.name !== undefined) values.name = patch.name.trim().slice(0, 120);
+  if (patch.description !== undefined) values.description = patch.description?.trim() || null;
+  if (patch.priceCents !== undefined) values.priceCents = patch.priceCents;
+  if (patch.currency !== undefined) values.currency = patch.currency.slice(0, 8).toUpperCase();
+  if (patch.imageUrl !== undefined) values.imageUrl = patch.imageUrl?.trim() || null;
+
+  const rows = await db
+    .update(catalogItems)
+    .set(values)
+    .where(and(eq(catalogItems.id, id), eq(catalogItems.ownerId, ownerId)))
+    .returning({ id: catalogItems.id });
+  return rows.length > 0;
+}
+
+/** Archives rather than deletes: an item already shared into a chat should not vanish from it. */
+export async function archiveCatalogItem(id: string, ownerId: number): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db
+    .update(catalogItems)
+    .set({ archivedAt: new Date(), updatedAt: new Date() })
+    .where(and(eq(catalogItems.id, id), eq(catalogItems.ownerId, ownerId), isNull(catalogItems.archivedAt)))
+    .returning({ id: catalogItems.id });
+  return rows.length > 0;
+}
+
+/** Somebody else's catalog, to look at rather than edit. Archived items stay hidden. */
+export async function listPublicCatalog(ownerId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({
+      id: catalogItems.id,
+      name: catalogItems.name,
+      description: catalogItems.description,
+      priceCents: catalogItems.priceCents,
+      currency: catalogItems.currency,
+      imageUrl: catalogItems.imageUrl,
+    })
+    .from(catalogItems)
+    .where(and(eq(catalogItems.ownerId, ownerId), isNull(catalogItems.archivedAt)))
+    .orderBy(desc(catalogItems.createdAt))
+    .limit(200);
+}
+
+// ---------------------------------------------------------------- device linking
+/** How long a linking code lives. Short, because holding the code is the entire credential. */
+export const DEVICE_LINK_TTL_MS = 5 * 60 * 1000;
+
+/** Characters that survive being read aloud and typed: no O/0, no I/1. */
+const LINK_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/**
+ * Issues a single-use code for adding another device.
+ *
+ * Any code this user already had is discarded first, so a code left visible on screen is not still
+ * usable after they ask for a fresh one.
+ */
+export async function createDeviceLinkCode(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Device linking is not available");
+  await db.delete(deviceLinkCodes).where(and(eq(deviceLinkCodes.userId, userId), isNull(deviceLinkCodes.usedAt)));
+
+  // getRandomValues rather than a random number generator: this code is a credential, and a
+  // predictable one would let anybody add a device to somebody else's account.
+  const bytes = crypto.getRandomValues(new Uint8Array(8));
+  let code = "";
+  for (const byte of bytes) code += LINK_ALPHABET[byte % LINK_ALPHABET.length];
+
+  const expiresAt = new Date(Date.now() + DEVICE_LINK_TTL_MS);
+  await db.insert(deviceLinkCodes).values({ code, userId, expiresAt });
+  return { code, expiresAt };
+}
+
+/**
+ * Spends a linking code and reports whose it was.
+ *
+ * The statement that marks it used is the one that reads it, so two devices racing for the same code
+ * cannot both succeed: the loser finds nothing left to update.
+ */
+export async function consumeDeviceLinkCode(code: string): Promise<number | null> {
+  const db = await getDb();
+  if (!db) return null;
+  const normalised = code.trim().toUpperCase();
+  if (!normalised) return null;
+  const rows = await db
+    .update(deviceLinkCodes)
+    .set({ usedAt: new Date() })
+    .where(and(eq(deviceLinkCodes.code, normalised), isNull(deviceLinkCodes.usedAt), gt(deviceLinkCodes.expiresAt, new Date())))
+    .returning({ userId: deviceLinkCodes.userId });
+  return rows[0]?.userId ?? null;
 }
 
 // ---------------------------------------------------------------- privacy

@@ -27,6 +27,8 @@ import { getConversationSummary, leaveGroup, listConversationMemberIds, listConv
 // Pins, keeps, abuse reports and the link-preview cache. Grouped on their own lines for the same
 // reason as the two blocks above: the main list is already long enough to be hard to scan.
 import { MAX_ICON_BYTES, MAX_PINNED_MESSAGES, REPORT_CATEGORIES, VISIBILITY_VALUES, canAddToGroup, callShouldRing, clearConversationIcon, conversationIconVersions, getLinkPreview, getOrCreateSelfConversation, listGroupEvents, listPinnedMessages, listReportsForAdmin, lockedConversationIds, logGroupEvent, reviewReport, saveLinkPreview, setChatLocked, setConversationIcon, setMessageKept, setMessagePinned, storageUsageForUser, submitReport } from "./db";
+// Live location, saved contacts, events, the catalog and device linking.
+import { LIVE_LOCATION_MAX_MS, RSVP_ANSWERS, addCatalogItem, archiveCatalogItem, cancelEvent, createDeviceLinkCode, createEvent, listCatalog, listContacts, listEvents, listLiveLocations, listPublicCatalog, removeContact, rsvpEvent, setContactName, startLiveLocation, stopLiveLocation, updateCatalogItem, updateLiveLocation } from "./db";
 import { fetchLinkPreview } from "./linkPreview";
 // Server-Sent Events nudge channel; see nudgeConversation below.
 import { isRealtimeEnabled, publishToUsers } from "./realtime";
@@ -577,6 +579,134 @@ export const appRouter = router({
         return null;
       }
     }),
+  }),
+  // ---- live location -------------------------------------------------------------------------
+  // A share expires by itself, so stopping it is a courtesy rather than the thing that ends it.
+  locations: router({
+    list: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(({ ctx, input }) => listLiveLocations(input.conversationId, ctx.user.id)),
+    start: protectedProcedure
+      .input(
+        z.object({
+          conversationId: z.string().min(1),
+          lat: z.number().min(-90).max(90),
+          lng: z.number().min(-180).max(180),
+          durationMs: z.number().int().min(60_000).max(LIVE_LOCATION_MAX_MS),
+          label: z.string().max(120).optional(),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        const started = await startLiveLocation(input.conversationId, ctx.user.id, input.lat, input.lng, input.durationMs, input.label ?? null);
+        void nudgeConversation(input.conversationId, ctx.user.id, "location");
+        return started;
+      }),
+    update: protectedProcedure
+      .input(z.object({ id: z.string().min(1), lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) }))
+      .mutation(async ({ ctx, input }) => {
+        if (!(await updateLiveLocation(input.id, ctx.user.id, input.lat, input.lng))) throw new Error("That location share has ended");
+        return { ok: true as const };
+      }),
+    stop: protectedProcedure.input(z.object({ id: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      await stopLiveLocation(input.id, ctx.user.id);
+      return { ok: true as const };
+    }),
+  }),
+  // ---- saved contacts ------------------------------------------------------------------------
+  contacts: router({
+    list: protectedProcedure.query(({ ctx }) => listContacts(ctx.user.id)),
+    setName: protectedProcedure.input(z.object({ targetId: z.number().int().positive(), displayName: z.string().trim().min(1).max(80) })).mutation(async ({ ctx, input }) => {
+      if (!(await setContactName(ctx.user.id, input.targetId, input.displayName))) throw new Error("That name could not be saved");
+      return { ok: true as const };
+    }),
+    remove: protectedProcedure.input(z.object({ targetId: z.number().int().positive() })).mutation(({ ctx, input }) => removeContact(ctx.user.id, input.targetId)),
+  }),
+  // ---- events --------------------------------------------------------------------------------
+  events: router({
+    list: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(({ ctx, input }) => listEvents(input.conversationId, ctx.user.id)),
+    create: protectedProcedure
+      .input(
+        z.object({
+          conversationId: z.string().min(1),
+          title: z.string().trim().min(1).max(120),
+          description: z.string().max(2000).optional(),
+          startsAt: z.string().min(1),
+          endsAt: z.string().optional(),
+          location: z.string().max(200).optional(),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        const startsAt = new Date(input.startsAt);
+        if (Number.isNaN(startsAt.getTime())) throw new Error("That start time is not valid");
+        const endsAt = input.endsAt ? new Date(input.endsAt) : null;
+        if (endsAt && Number.isNaN(endsAt.getTime())) throw new Error("That end time is not valid");
+        // An event that ends before it starts is a mistake worth refusing rather than storing.
+        if (endsAt && endsAt.getTime() <= startsAt.getTime()) throw new Error("The end time has to be after the start time");
+        const created = await createEvent({
+          conversationId: input.conversationId,
+          creatorId: ctx.user.id,
+          title: input.title,
+          description: input.description ?? null,
+          startsAt,
+          endsAt,
+          location: input.location ?? null,
+        });
+        void nudgeConversation(input.conversationId, ctx.user.id, "message-updated");
+        return created;
+      }),
+    rsvp: protectedProcedure.input(z.object({ eventId: z.string().min(1), response: z.enum(RSVP_ANSWERS) })).mutation(({ ctx, input }) => rsvpEvent(input.eventId, ctx.user.id, input.response)),
+    cancel: protectedProcedure.input(z.object({ eventId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      if (!(await cancelEvent(input.eventId, ctx.user.id))) throw new Error("Only the person who created an event can cancel it");
+      return { ok: true as const };
+    }),
+  }),
+  // ---- business catalog ----------------------------------------------------------------------
+  catalog: router({
+    mine: protectedProcedure.query(({ ctx }) => listCatalog(ctx.user.id)),
+    ofUser: protectedProcedure.input(z.object({ userId: z.number().int().positive() })).query(({ input }) => listPublicCatalog(input.userId)),
+    add: protectedProcedure
+      .input(
+        z.object({
+          name: z.string().trim().min(1).max(120),
+          description: z.string().max(2000).optional(),
+          priceCents: z.number().int().min(0).max(100_000_000).optional(),
+          currency: z.string().max(8).optional(),
+          imageUrl: z.string().max(2000).optional(),
+        }),
+      )
+      .mutation(({ ctx, input }) =>
+        addCatalogItem({
+          ownerId: ctx.user.id,
+          name: input.name,
+          description: input.description ?? null,
+          priceCents: input.priceCents ?? null,
+          currency: input.currency,
+          imageUrl: input.imageUrl ?? null,
+        }),
+      ),
+    update: protectedProcedure
+      .input(
+        z.object({
+          id: z.string().min(1),
+          name: z.string().trim().min(1).max(120).optional(),
+          description: z.string().max(2000).nullable().optional(),
+          priceCents: z.number().int().min(0).max(100_000_000).nullable().optional(),
+          imageUrl: z.string().max(2000).nullable().optional(),
+        }),
+      )
+      .mutation(async ({ ctx, input }) => {
+        const { id, ...patch } = input;
+        if (!(await updateCatalogItem(id, ctx.user.id, patch))) throw new Error("That item is no longer available");
+        return { ok: true as const };
+      }),
+    archive: protectedProcedure.input(z.object({ id: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      if (!(await archiveCatalogItem(input.id, ctx.user.id))) throw new Error("That item is no longer available");
+      return { ok: true as const };
+    }),
+  }),
+  // ---- device linking ------------------------------------------------------------------------
+  deviceLink: router({
+    // Only an already signed-in device may issue one, which is the whole point: possession of the
+    // code stands in for having been signed in somewhere.
+    create: protectedProcedure.mutation(({ ctx }) => createDeviceLinkCode(ctx.user.id)),
   }),
   // ---- storage: what this account is actually keeping ----------------------------------------
   storage: router({
