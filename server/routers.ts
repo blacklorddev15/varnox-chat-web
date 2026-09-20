@@ -892,6 +892,25 @@ export const appRouter = router({
       return { room: input.room, token, url: liveKitUrl(), kind: "audio" as const };
     }),
   }),
+
+  /**
+   * TEMPORARY. Remove once calls are confirmed working on a device.
+   *
+   * A place for the app to report what it is doing while it goes wrong on a device nobody can attach
+   * a debugger to. `lib/diagnostics.ts` feeds it client-side crashes, including React render errors
+   * caught by the boundary; the call context feeds it call state. Both are read back with
+   * `vercel logs`.
+   *
+   * Bounded lengths and a signed-in user, so it cannot be used to write arbitrary volumes of text.
+   */
+  diagnostics: router({
+    report: protectedProcedure
+      .input(z.object({ kind: z.string().max(40), detail: z.string().max(400) }))
+      .mutation(({ ctx, input }) => {
+        console.log(`[client-diag] user=${ctx.user.id} kind=${input.kind} ${input.detail}`);
+        return { ok: true };
+      }),
+  }),
   profile: router({
     update: protectedProcedure.input(z.object({ name: z.string().trim().min(1).max(60).optional(), about: z.string().trim().max(140).optional(), phone: z.string().trim().regex(/^\+?\d{7,15}$/, "Enter a valid phone number").optional() })).mutation(({ ctx, input }) => updateUserProfile(ctx.user.id, input)),
     setAvatar: protectedProcedure.input(z.object({ base64: z.string().min(1).max(4_000_000), mimeType: z.string().regex(/^image\/(png|jpe?g|webp)$/) })).mutation(async ({ ctx, input }) => {

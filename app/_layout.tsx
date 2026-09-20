@@ -23,6 +23,9 @@ import { initManusRuntime, subscribeSafeAreaInsets } from "@/lib/_core/manus-run
 import { useAuth } from "@/hooks/use-auth";
 import { CallProvider } from "@/lib/call-context";
 import { CallOverlay } from "@/components/call-overlay";
+import { ErrorBoundary } from "@/components/error-boundary";
+import { installGlobalErrorReporting, reportDiagnostic, setDiagnosticsReporter } from "@/lib/diagnostics";
+import { isOnline } from "@/lib/offline";
 import { LockGate } from "@/components/lock-gate";
 
 const DEFAULT_WEB_INSETS: EdgeInsets = { top: 0, right: 0, bottom: 0, left: 0 };
@@ -124,6 +127,19 @@ export default function RootLayout() {
   // Writes the cache back to storage after it settles, so the next launch has something to restore.
   useEffect(() => createCachePersister(queryClient), [queryClient]);
 
+  // Reports go through the vanilla client rather than a hook, because this has to be installed
+  // before anything renders - a crash during the first render is exactly the kind worth catching.
+  useEffect(() => {
+    setDiagnosticsReporter((kind, detail) => {
+      // Fire and forget. A report that fails must not become a second error to report.
+      void trpcClient.diagnostics.report.mutate({ kind, detail }).catch(() => undefined);
+    });
+    // Always sent, so that silence is unambiguous: no boot line means reporting itself is broken,
+    // rather than nothing having gone wrong.
+    reportDiagnostic("boot", `online=${isOnline()} ua=${typeof navigator !== "undefined" ? navigator.userAgent.slice(0, 130) : "n/a"}`);
+    return installGlobalErrorReporting();
+  }, [trpcClient]);
+
   // Ensure minimum 8px padding for top and bottom on mobile
   const providerInitialMetrics = useMemo(() => {
     const metrics = initialWindowMetrics ?? { insets: initialInsets, frame: initialFrame };
@@ -144,18 +160,22 @@ export default function RootLayout() {
           {/* Default to hiding native headers so raw route segments don't appear (e.g. "(tabs)", "products/[id]"). */}
           {/* If a screen needs the native header, explicitly enable it and set a human title via Stack.Screen options. */}
           {/* in order for ios apps tab switching to work properly, use presentation: "fullScreenModal" for login page, whenever you decide to use presentation: "modal*/}
-          <CallProvider>
-            <Stack screenOptions={{ headerShown: false }}>
-              <Stack.Screen name="(tabs)" />
-              <Stack.Screen name="login" />
-              <Stack.Screen name="account-status" />
-              <Stack.Screen name="oauth/callback" />
-            </Stack>
-            {/* Above every route, so a call survives navigation and tab switches. */}
-            <CallOverlay />
-            {/* Also above every route: a two-step PIN that a navigation could dodge is not a lock. */}
-            <LockGate />
-          </CallProvider>
+          {/* Wraps everything, so a render crash shows its error instead of unmounting to a black
+              screen. See components/error-boundary.tsx. */}
+          <ErrorBoundary onError={(message, stack, where) => reportDiagnostic("render", `${where} :: ${message} :: ${stack}`)} label="The app">
+            <CallProvider>
+              <Stack screenOptions={{ headerShown: false }}>
+                <Stack.Screen name="(tabs)" />
+                <Stack.Screen name="login" />
+                <Stack.Screen name="account-status" />
+                <Stack.Screen name="oauth/callback" />
+              </Stack>
+              {/* Above every route, so a call survives navigation and tab switches. */}
+              <CallOverlay />
+              {/* Also above every route: a two-step PIN that a navigation could dodge is not a lock. */}
+              <LockGate />
+            </CallProvider>
+          </ErrorBoundary>
           <StatusBar style="auto" />
         </QueryClientProvider>
       </trpc.Provider>
