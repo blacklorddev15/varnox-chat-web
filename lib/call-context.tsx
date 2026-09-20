@@ -6,6 +6,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { setNativeCallActive } from "@/lib/native-call";
 import { isOnline, OFFLINE_CALL_MESSAGE } from "@/lib/offline";
 import { startRingtone } from "@/lib/ringtone";
+import { reportDiagnostic } from "@/lib/diagnostics";
 import { trpc } from "@/lib/trpc";
 
 /**
@@ -243,10 +244,33 @@ export function CallProvider({ children }: { children: ReactNode }) {
     const playback = await tryStartAudio(instance);
     setCanPlaybackAudio(playback);
 
-    await instance.localParticipant.setMicrophoneEnabled(true);
+    // Neither of these is allowed to end the call.
+    //
+    // Both used to be awaited bare, so a refusal - no permission, no device, a WebView that will not
+    // hand one over - threw out of connect() and straight into the caller's catch, which tears the
+    // whole call down. A video call that could not open the camera therefore failed even though the
+    // audio was fine and both people were already in the room, and the report was simply that the
+    // call did not connect.
+    //
+    // A call that connects with one of them missing is worth having; a call that disappears because
+    // of a camera permission is not. What failed is visible on the call screen either way - the
+    // microphone and camera buttons show their own state, and `mic=`/`aPub=` in the diagnostics line
+    // say whether a track was actually published.
+    try {
+      await instance.localParticipant.setMicrophoneEnabled(true);
+      setMicOn(true);
+    } catch (cause) {
+      setMicOn(false);
+      reportDiagnostic("call-mic", String(cause instanceof Error ? cause.message : cause));
+    }
     if (withCamera) {
-      await instance.localParticipant.setCameraEnabled(true);
-      setCameraOn(true);
+      try {
+        await instance.localParticipant.setCameraEnabled(true);
+        setCameraOn(true);
+      } catch (cause) {
+        setCameraOn(false);
+        reportDiagnostic("call-camera", String(cause instanceof Error ? cause.message : cause));
+      }
     }
     // They may already have been in the room - a link join, or a call placed into a room that
     // already had somebody in it - in which case no ParticipantConnected fires for them and the
