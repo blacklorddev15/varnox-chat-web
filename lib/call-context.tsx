@@ -5,6 +5,7 @@ import type { Room as LiveKitRoom } from "livekit-client";
 import { useAuth } from "@/hooks/use-auth";
 import { setNativeCallActive } from "@/lib/native-call";
 import { isOnline, OFFLINE_CALL_MESSAGE } from "@/lib/offline";
+import { startRingtone } from "@/lib/ringtone";
 import { trpc } from "@/lib/trpc";
 
 /**
@@ -186,7 +187,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
      */
     const promoteOnAnswer = () => {
       setRemoteCount(instance.remoteParticipants.size);
-      if (phaseRef.current === "ringing-out") setPhaseBoth("active");
+      // Somebody has to actually be there. This is called once after connecting as well, to cover a
+      // room that already had people in it, and without the count it promoted every outgoing call to
+      // "active" the instant it connected - replacing "Ringing…" with "Connecting…" and hiding that
+      // nobody had picked up, which is precisely what the caller needs to see while they wait.
+      if (instance.remoteParticipants.size > 0 && phaseRef.current === "ringing-out") setPhaseBoth("active");
     };
     instance.on(RoomEvent.ParticipantConnected, promoteOnAnswer);
     // Deliberately not the same handler: somebody else leaving does not make this side stop being a
@@ -510,6 +515,41 @@ export function CallProvider({ children }: { children: ReactNode }) {
     return () => {
       document.removeEventListener("visibilitychange", post);
       clear();
+    };
+  }, [phase, session]);
+
+  /**
+   * Ring, and buzz, while an incoming call is arriving.
+   *
+   * Separate from the notification above, and deliberately not conditional on the page being hidden.
+   * That notification is a system alert for a call that arrived while the app was elsewhere; this is
+   * the ring itself, and a call arriving on a phone sitting on a table is exactly the case that used
+   * to be silent - the overlay appeared with Accept and Decline and made no sound at all, so nobody
+   * looked, and the caller watched "Ringing…" with no way to tell whether anything had arrived.
+   *
+   * It starts on the transition into "ringing-in" and stops on the way out of it, which covers both
+   * answering and declining, and a caller who hangs up first.
+   */
+  useEffect(() => {
+    if (phase !== "ringing-in" || !session) return;
+    const stopRinging = startRingtone();
+
+    // Repeats, because one buzz is over before anybody notices it. Needs the VIBRATE permission in
+    // the Android shell, which it does not have yet - so this works on the web build and is
+    // harmless in the app until the APK is rebuilt.
+    const buzz = () => {
+      try {
+        navigator.vibrate?.(400);
+      } catch {
+        // No motor, or no permission. The ring still sounds.
+      }
+    };
+    buzz();
+    const buzzTimer = setInterval(buzz, 3000);
+
+    return () => {
+      clearInterval(buzzTimer);
+      stopRinging();
     };
   }, [phase, session]);
 
