@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.varnox.chat",
+      "sha256_cert_fingerprints": [
+        "26:2F:68:A7:A7:18:FA:73:2F:DD:4A:28:44:75:C7:D5:38:FB:70:07:8C:66:8E:29:85:5D:9E:69:41:4B:16:BD"
+      ]
+    }
+  }
+]

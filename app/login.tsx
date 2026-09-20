@@ -12,7 +12,7 @@ type AuthMode = "password" | "phone";
 type PasswordMode = "login" | "register";
 
 export default function LoginScreen() {
-  const colors = useColors(); const router = useRouter(); const { previewStatus } = useLocalSearchParams<{ previewStatus?: string }>();
+  const colors = useColors(); const router = useRouter(); const { previewStatus, next } = useLocalSearchParams<{ previewStatus?: string; next?: string }>();
   const [authMode, setAuthMode] = useState<AuthMode>("password"); const [passwordMode, setPasswordMode] = useState<PasswordMode>("login");
   const [username, setUsername] = useState(""); const [password, setPassword] = useState(""); const [confirmPassword, setConfirmPassword] = useState(""); const [accountEmail, setAccountEmail] = useState("");
   const [fullName, setFullName] = useState(""); const [accountPhone, setAccountPhone] = useState(""); const [signupCode, setSignupCode] = useState("");
@@ -28,7 +28,15 @@ export default function LoginScreen() {
 
   useEffect(() => { if (cooldown <= 0) return; const timer = setInterval(() => setCooldown((value) => Math.max(0, value - 1)), 1000); return () => clearInterval(timer); }, [cooldown]);
 
-  const finishLogin = async (result: { sessionToken: string; user: Auth.User }) => { await Auth.setSessionToken(result.sessionToken); await Auth.setUserInfo({ ...result.user, lastSignedIn: new Date(result.user.lastSignedIn) }); router.replace("/(tabs)"); };
+  const finishLogin = async (result: { sessionToken: string; user: Auth.User }) => {
+    await Auth.setSessionToken(result.sessionToken);
+    await Auth.setUserInfo({ ...result.user, lastSignedIn: new Date(result.user.lastSignedIn) });
+    // Where the person was headed before being asked to sign in — an invite link, typically. Only a
+    // single-slash path is accepted; "//host" and full URLs are treated as no destination at all,
+    // because otherwise the query string would be an open redirect.
+    const destination = typeof next === "string" && /^\/[^/]/.test(next) ? next : null;
+    router.replace((destination ?? "/(tabs)") as never);
+  };
   const handleAuthError = (cause: unknown, attemptedUsername?: string) => { const message = cause instanceof Error ? cause.message : "Could not complete authentication."; if (/(banned|suspended)/i.test(message)) { router.replace({ pathname: "/account-status", params: { status: /banned/i.test(message) ? "banned" : "suspended", reason: message, username: attemptedUsername ?? "" } }); return; } setError(message); };
   const submitPassword = async () => {
     setError(null); const cleanUsername = username.trim().toLowerCase();

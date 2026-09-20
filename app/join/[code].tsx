@@ -77,16 +77,18 @@ export default function JoinGroupScreen() {
         {error ? (
           <>
             <Text style={[styles.title, { color: colors.foreground }]}>This link could not be used</Text>
-            <Text style={[styles.copy, { color: colors.muted }]}>{error}</Text>
+            <Text style={[styles.copy, { color: colors.muted }]}>
+              {needsSignIn ? "Sign in and this invite will be waiting for you." : error}
+            </Text>
           </>
         ) : null}
 
         {error || outcome ? (
           <Pressable
-            onPress={() => router.replace(needsSignIn ? "/login" : "/(tabs)")}
+            onPress={() => router.replace(needsSignIn ? (`/login?next=${encodeURIComponent(`/join/${code}`)}` as never) : "/(tabs)")}
             style={[styles.button, { backgroundColor: colors.primary }]}
           >
-            <Text style={styles.buttonText}>{needsSignIn ? "Sign in first" : "Open chats"}</Text>
+            <Text style={styles.buttonText}>{needsSignIn ? "Sign in to join" : "Open chats"}</Text>
           </Pressable>
         ) : null}
       </View>
