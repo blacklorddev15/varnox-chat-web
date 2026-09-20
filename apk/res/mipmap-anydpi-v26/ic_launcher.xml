@@ -1,4 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@mipmap/ic_launcher_bg" />
+    <!-- This was missing. An adaptive icon with a background and no foreground draws the background
+         layer alone on Android 8 and later, which is what the adaptive icon exists for - so
+         ic_launcher_foreground.png was dead weight in the APK and the mark never appeared. -->
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
 </adaptive-icon>

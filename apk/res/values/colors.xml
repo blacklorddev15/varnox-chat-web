@@ -1,5 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="varnox_background">#FF171717</color>
-    <color name="ic_launcher_background">#FFE6F4FD</color>
+    <!-- Both were the old brand: a neutral grey window and the chevron's pale blue behind the
+         launcher mark. Matched to the artwork's own sampled background, so the splash the shell
+         paints and the tile the launcher draws agree with the icon on top of them. -->
+    <color name="varnox_background">#FF010101</color>
+    <color name="ic_launcher_background">#FF010101</color>
 </resources>
