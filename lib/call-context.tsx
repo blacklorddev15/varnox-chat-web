@@ -132,7 +132,22 @@ export function CallProvider({ children }: { children: ReactNode }) {
     roomRef.current = instance;
     setRoom(instance);
 
-    instance.on(RoomEvent.ParticipantConnected, () => setRemoteCount(instance.remoteParticipants.size));
+    /**
+     * Somebody else appearing in the room is what "answered" looks like from the caller's side.
+     *
+     * This is where an outgoing call turns into a live one, and it has to be here rather than at the
+     * end of startCall. connect() resolves as soon as *this* side is in the room, which is
+     * immediately - long before the other phone is picked up. Promoting there would replace
+     * "Ringing…" with "Connecting…" for as long as it rang. Promoting on the participant arriving
+     * keeps "Ringing…" while it rings and switches the moment somebody joins.
+     */
+    const promoteOnAnswer = () => {
+      setRemoteCount(instance.remoteParticipants.size);
+      if (phaseRef.current === "ringing-out") setPhaseBoth("active");
+    };
+    instance.on(RoomEvent.ParticipantConnected, promoteOnAnswer);
+    // Deliberately not the same handler: somebody else leaving does not make this side stop being a
+    // live call, and demoting on it would hide the video and the timer mid-conversation.
     instance.on(RoomEvent.ParticipantDisconnected, () => setRemoteCount(instance.remoteParticipants.size));
     instance.on(RoomEvent.Disconnected, () => {
       // The other side hung up, or the room closed underneath us.
@@ -159,11 +174,14 @@ export function CallProvider({ children }: { children: ReactNode }) {
     // Browser autoplay policy: audio only starts inside a user gesture, which dialling or
     // answering both are.
     await instance.startAudio().catch(() => undefined);
-    setRemoteCount(instance.remoteParticipants.size);
+    // They may already have been in the room - a link join, or a call placed into a room that
+    // already had somebody in it - in which case no ParticipantConnected fires for them and the
+    // phase would sit at "ringing-out" with the video hidden for the whole call.
+    promoteOnAnswer();
 
     if (tick.current) clearInterval(tick.current);
     tick.current = setInterval(() => setElapsed((value) => value + 1), 1000);
-  }, [teardown]);
+  }, [setPhaseBoth, teardown]);
 
   const startCall = useCallback(
     async ({ conversationId, kind, peerName }: { conversationId: string; kind: CallKind; peerName: string }) => {
