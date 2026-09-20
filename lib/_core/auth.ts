@@ -15,6 +15,8 @@ export type User = {
   suspendedUntil?: string | null;
   moderationReason?: string | null;
   about?: string | null;
+  // Returned by auth.me (the full user row); the change-number screen shows the current one.
+  phone?: string | null;
   avatarUpdatedAt?: string | null;
   lastSignedIn: Date;
 };

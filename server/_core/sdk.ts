@@ -2,6 +2,7 @@ import { AXIOS_TIMEOUT_MS, COOKIE_NAME, ONE_YEAR_MS } from "../../shared/const.j
 import { ForbiddenError } from "../../shared/_core/errors.js";
 import axios, { type AxiosInstance } from "axios";
 import { parse as parseCookieHeader } from "cookie";
+import { randomUUID } from "node:crypto";
 import type { Request } from "express";
 import type { User } from "../../drizzle/schema";
 import * as db from "../db";
@@ -21,7 +22,28 @@ export type SessionPayload = {
   openId: string;
   appId: string;
   name: string;
+  /** Row id of the session this token belongs to, so it can be withdrawn later. */
+  sessionId?: string;
 };
+
+/** Device details taken from the request that is signing in, for the signed-in devices list. */
+export function deviceMetaFrom(req: Request): { userAgent: string | null; platform: string | null } {
+  const header = req.headers["user-agent"];
+  const userAgent = typeof header === "string" ? header.slice(0, 255) : null;
+  const ua = (userAgent ?? "").toLowerCase();
+  const platform = ua.includes("android")
+    ? "Android"
+    : ua.includes("iphone") || ua.includes("ipad") || ua.includes("ios")
+      ? "iOS"
+      : ua.includes("mac os")
+        ? "macOS"
+        : ua.includes("windows")
+          ? "Windows"
+          : ua.includes("linux")
+            ? "Linux"
+            : null;
+  return { userAgent, platform };
+}
 
 const EXCHANGE_TOKEN_PATH = `/webdev.v1.WebDevAuthPublicService/ExchangeToken`;
 const GET_USER_INFO_PATH = `/webdev.v1.WebDevAuthPublicService/GetUserInfo`;
@@ -164,16 +186,41 @@ class SDKServer {
    */
   async createSessionToken(
     openId: string,
-    options: { expiresInMs?: number; name?: string } = {},
+    options: { expiresInMs?: number; name?: string; meta?: { userAgent?: string | null; platform?: string | null } } = {},
   ): Promise<string> {
-    return this.signSession(
+    // Every session gets a row before the token exists, so there is never a usable token that nothing
+    // can withdraw. Cron identities are not devices and are deliberately left out.
+    const sessionId = randomUUID();
+    const expiresInMs = options.expiresInMs ?? ONE_YEAR_MS;
+    const token = await this.signSession(
       {
         openId,
         appId: ENV.appId,
         name: options.name || "",
+        sessionId,
       },
       options,
     );
+
+    if (!openId.startsWith(CRON_OPEN_ID_PREFIX)) {
+      try {
+        const user = await db.getUserByOpenId(openId);
+        if (user) {
+          await db.createSessionRow({
+            id: sessionId,
+            userId: user.id,
+            userAgent: options.meta?.userAgent ?? null,
+            platform: options.meta?.platform ?? null,
+            expiresAt: new Date(Date.now() + expiresInMs),
+          });
+        }
+      } catch (error) {
+        // A session that could not be listed is still a working session; refusing to sign somebody in
+        // because the list failed would be the worse outcome.
+        console.warn("[Auth] Could not record session", String(error));
+      }
+    }
+    return token;
   }
 
   async signSession(
@@ -194,6 +241,7 @@ class SDKServer {
       openId: payload.openId,
       appId: payload.appId,
       name: payload.name,
+      ...(payload.sessionId ? { jti: payload.sessionId } : {}),
     })
       .setProtectedHeader({ alg: "HS256", typ: "JWT" })
       .setExpirationTime(expirationSeconds)
@@ -202,7 +250,7 @@ class SDKServer {
 
   async verifySession(
     cookieValue: string | undefined | null,
-  ): Promise<{ openId: string; appId: string; name: string } | null> {
+  ): Promise<{ openId: string; appId: string; name: string; sessionId: string | null } | null> {
     if (!cookieValue) {
       console.warn("[Auth] Missing session cookie");
       return null;
@@ -215,7 +263,7 @@ class SDKServer {
       const { payload } = await jwtVerify(cookieValue, secretKey, {
         algorithms: ["HS256"],
       });
-      const { openId, appId, name } = payload as Record<string, unknown>;
+      const { openId, appId, name, jti } = payload as Record<string, unknown>;
 
       if (!isNonEmptyString(openId) || !isNonEmptyString(appId) || !isNonEmptyString(name)) {
         console.warn("[Auth] Session payload missing required fields");
@@ -226,6 +274,7 @@ class SDKServer {
         openId,
         appId,
         name,
+        sessionId: isNonEmptyString(jti) ? jti : null,
       };
     } catch (error) {
       console.warn("[Auth] Session verification failed", String(error));
@@ -254,6 +303,18 @@ class SDKServer {
       platform: loginMethod,
       loginMethod,
     } as GetUserInfoWithJwtResponse;
+  }
+
+  /**
+   * The id of the session behind this request, so a route can tell "this device" from the others.
+   * Returns null for tokens issued before sessions were recorded.
+   */
+  async sessionIdFromRequest(req: Request): Promise<string | null> {
+    const authHeader = req.headers.authorization || req.headers.Authorization;
+    const token = typeof authHeader === "string" && authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : undefined;
+    const cookies = this.parseCookies(req.headers.cookie);
+    const session = await this.verifySession(token || cookies.get(COOKIE_NAME));
+    return session?.sessionId ?? null;
   }
 
   async authenticateRequest(req: Request): Promise<AuthenticatedUser> {
@@ -312,6 +373,17 @@ class SDKServer {
     }
     if (user.moderationStatus === "suspended" && (!user.suspendedUntil || user.suspendedUntil > new Date())) {
       throw ForbiddenError(user.suspendedUntil ? `This account is suspended until ${user.suspendedUntil.toISOString()}` : "This Varnox account is suspended");
+    }
+
+    // A session that has been signed out from the device list stops working here. Tokens issued before
+    // the device list existed carry no session id and are let through: there is no row to consult, and
+    // refusing them would sign every existing user out on deploy.
+    if (session.sessionId) {
+      const active = await db.isSessionActive(session.sessionId);
+      if (!active) {
+        throw ForbiddenError("This device has been signed out. Sign in again to continue.");
+      }
+      await db.touchSession(session.sessionId);
     }
 
     await db.upsertUser({

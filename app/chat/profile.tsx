@@ -215,12 +215,36 @@ export default function ProfileScreen() {
             Your email and phone are private. Only your name, photo, and about line are visible to contacts.
           </Text>
         </View>
+
+        <Text style={[styles.label, { color: colors.muted }]}>SECURITY</Text>
+        {([
+          { icon: "pin" as const, title: "Two-step PIN", hint: "Ask for a PIN before the app opens", href: "/security/two-step" },
+          { icon: "devices" as const, title: "Linked devices", hint: "See where you are signed in, and sign any of them out", href: "/security/linked-devices" },
+          { icon: "phone-iphone" as const, title: "Change number", hint: "Move this account to a different number", href: "/security/change-number" },
+          { icon: "delete-forever" as const, title: "Delete account", hint: "Erase your account and its data", href: "/security/delete-account" },
+        ]).map((entry) => (
+          <Pressable
+            key={entry.title}
+            onPress={() => router.push(entry.href as never)}
+            style={[styles.securityRow, { borderBottomColor: colors.border }]}
+          >
+            <MaterialIcons name={entry.icon} size={19} color={colors.primary} />
+            <View style={styles.securityCopy}>
+              <Text style={[styles.securityTitle, { color: colors.foreground }]}>{entry.title}</Text>
+              <Text style={[styles.privateText, { color: colors.muted }]}>{entry.hint}</Text>
+            </View>
+            <MaterialIcons name="chevron-right" size={20} color={colors.muted} />
+          </Pressable>
+        ))}
       </View>
     </ScreenContainer>
   );
 }
 
 const styles = StyleSheet.create({
+  securityRow: { flexDirection: "row", alignItems: "center", gap: 12, borderBottomWidth: StyleSheet.hairlineWidth, paddingVertical: 13 },
+  securityCopy: { flex: 1 },
+  securityTitle: { fontSize: 14, fontWeight: "700" },
   header: { flexDirection: "row", alignItems: "center", gap: 16, padding: 20 },
   title: { flex: 1, fontSize: 21, fontWeight: "800" },
   save: { fontSize: 14, fontWeight: "800" },

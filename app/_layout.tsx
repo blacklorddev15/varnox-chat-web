@@ -22,6 +22,7 @@ import { initManusRuntime, subscribeSafeAreaInsets } from "@/lib/_core/manus-run
 import { useAuth } from "@/hooks/use-auth";
 import { CallProvider } from "@/lib/call-context";
 import { CallOverlay } from "@/components/call-overlay";
+import { LockGate } from "@/components/lock-gate";
 
 const DEFAULT_WEB_INSETS: EdgeInsets = { top: 0, right: 0, bottom: 0, left: 0 };
 const DEFAULT_WEB_FRAME: Rect = { x: 0, y: 0, width: 0, height: 0 };
@@ -134,6 +135,8 @@ export default function RootLayout() {
             </Stack>
             {/* Above every route, so a call survives navigation and tab switches. */}
             <CallOverlay />
+            {/* Also above every route: a two-step PIN that a navigation could dodge is not a lock. */}
+            <LockGate />
           </CallProvider>
           <StatusBar style="auto" />
         </QueryClientProvider>

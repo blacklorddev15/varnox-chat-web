@@ -1,5 +1,5 @@
 import type { Express, Request, Response } from "express";
-import { getMessageMedia } from "../db";
+import { getMessageMedia, getSticker } from "../db";
 
 /**
  * Attachments larger than this are refused with a clear message. The limit exists because
@@ -40,6 +40,32 @@ export function registerMediaRoutes(app: Express) {
     } catch (error) {
       console.error("[Media] failed to serve attachment:", error);
       res.status(500).json({ error: "Could not load attachment" });
+    }
+  });
+
+  /**
+   * Serves a sticker's bytes.
+   *
+   *   GET /api/sticker/:id -> image bytes, or 404
+   *
+   * A sticker is addressed by id rather than being inlined into every message that uses it, so a sticker
+   * sent in twenty chats is stored once and fetched once per device.
+   */
+  app.get("/api/sticker/:id", async (req: Request, res: Response) => {
+    try {
+      const sticker = await getSticker(String(req.params.id));
+      if (!sticker) {
+        res.status(404).json({ error: "No such sticker" });
+        return;
+      }
+      const bytes = Buffer.from(sticker.data, "base64");
+      res.setHeader("Content-Type", sticker.mimeType);
+      res.setHeader("Content-Length", String(bytes.length));
+      res.setHeader("Cache-Control", "public, max-age=604800, immutable");
+      res.send(bytes);
+    } catch (error) {
+      console.error("[Media] failed to serve sticker:", error);
+      res.status(500).json({ error: "Could not load sticker" });
     }
   });
 }

@@ -1,7 +1,7 @@
 import type { Express, Request, Response } from "express";
 import { ONE_YEAR_MS, COOKIE_NAME } from "../../shared/const.js";
 import { getSessionCookieOptions } from "./cookies";
-import { sdk } from "./sdk";
+import { deviceMetaFrom, sdk } from "./sdk";
 import { getUserByOpenId, upsertUser } from "../db";
 import { ENV } from "./env";
 
@@ -122,7 +122,7 @@ export function registerPhoneAuthRoutes(app: Express) {
       if (!user) throw new Error("Account storage is not available yet");
       if (user.moderationStatus === "banned") throw new Error(`This Varnox account is banned${user.moderationReason ? `: ${user.moderationReason}` : "."}`);
       if (user.moderationStatus === "suspended" && (!user.suspendedUntil || user.suspendedUntil > new Date())) throw new Error(`This Varnox account is suspended${user.suspendedUntil ? ` until ${user.suspendedUntil.toLocaleString()}` : ""}${user.moderationReason ? `: ${user.moderationReason}` : "."}`);
-      const sessionToken = await sdk.createSessionToken(openId, { name: phone, expiresInMs: ONE_YEAR_MS });
+      const sessionToken = await sdk.createSessionToken(openId, { name: phone, expiresInMs: ONE_YEAR_MS , meta: deviceMetaFrom(req) });
       const cookieOptions = getSessionCookieOptions(req);
       res.cookie(COOKIE_NAME, sessionToken, { ...cookieOptions, maxAge: ONE_YEAR_MS });
       res.json({ app_session_id: sessionToken, user: userResponse(user) });
