@@ -78,6 +78,13 @@
       "when": 1789896227283,
       "tag": "0010_curved_wallop",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1789898337841,
+      "tag": "0011_red_nightshade",
+      "breakpoints": true
     }
   ]
 }

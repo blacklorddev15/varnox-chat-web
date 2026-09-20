@@ -33,7 +33,10 @@ export const conversations = pgTable("conversations", { id: varchar("id", { leng
 export const joinRequests = pgTable("joinRequests", { conversationId: varchar("conversationId", { length: 64 }).notNull(), userId: integer("userId").notNull(), status: varchar("status", { length: 16 }).default("pending").notNull(), inviteCode: varchar("inviteCode", { length: 32 }), requestedAt: timestamp("requestedAt").defaultNow().notNull(), decidedAt: timestamp("decidedAt"), decidedBy: integer("decidedBy") }, (table) => ({ pk: primaryKey({ columns: [table.conversationId, table.userId] }) }));
 // Per-person state for a chat lives here rather than in shared columns: archiving, muting,
 // pinning and drafts are personal, and one member's choices must not rewrite everyone's row.
-export const conversationMembers = pgTable("conversationMembers", { conversationId: varchar("conversationId", { length: 64 }).notNull(), userId: integer("userId").notNull(), joinedAt: timestamp("joinedAt").defaultNow().notNull(), lastReadAt: timestamp("lastReadAt"), lastDeliveredAt: timestamp("lastDeliveredAt"), role: varchar("role", { length: 16 }).default("member").notNull(), archived: integer("archived").default(0).notNull(), muted: integer("muted").default(0).notNull(), pinned: integer("pinned").default(0).notNull(), draft: text("draft"), mediaAutoLoad: integer("mediaAutoLoad").default(1).notNull() }, (table) => ({ pk: primaryKey({ columns: [table.conversationId, table.userId] }) }));
+export const conversationMembers = pgTable("conversationMembers", { conversationId: varchar("conversationId", { length: 64 }).notNull(), userId: integer("userId").notNull(), joinedAt: timestamp("joinedAt").defaultNow().notNull(), lastReadAt: timestamp("lastReadAt"), lastDeliveredAt: timestamp("lastDeliveredAt"), role: varchar("role", { length: 16 }).default("member").notNull(), archived: integer("archived").default(0).notNull(), muted: integer("muted").default(0).notNull(), pinned: integer("pinned").default(0).notNull(), draft: text("draft"), mediaAutoLoad: integer("mediaAutoLoad").default(1).notNull(), // "Chat lock": this reader must re-enter the app PIN to open this thread.
+  // Per person, because locking a chat is a decision about one screen, not about the conversation -
+  // one participant locking it must not lock it for everybody.
+  lockedAt: timestamp("lockedAt") }, (table) => ({ pk: primaryKey({ columns: [table.conversationId, table.userId] }) }));
 export const messages = pgTable("messages", { id: varchar("id", { length: 64 }).primaryKey(), conversationId: varchar("conversationId", { length: 64 }).notNull(), senderId: integer("senderId").notNull(), body: text("body"), kind: messageKindEnum("kind").default("text").notNull(), mediaUrl: text("mediaUrl"), mediaMime: varchar("mediaMime", { length: 160 }), mediaName: varchar("mediaName", { length: 255 }), voiceDurationMs: integer("voiceDurationMs"), replyToId: varchar("replyToId", { length: 64 }), forwardedFromId: varchar("forwardedFromId", { length: 64 }), viewOnce: integer("viewOnce").default(0).notNull(), editedAt: timestamp("editedAt"), deletedAt: timestamp("deletedAt"), expiresAt: timestamp("expiresAt"), meta: jsonb("meta").$type<MessageMeta>(), createdAt: timestamp("createdAt").defaultNow().notNull(), // A pin belongs to the conversation, not to the person who set it: everyone sees the same banner.
   // Whoever pinned it last is recorded so the sheet can say who did, and unpinning clears both.
   pinnedAt: timestamp("pinnedAt"), pinnedBy: integer("pinnedBy") });
@@ -66,7 +69,15 @@ export const messageKeeps = pgTable("messageKeeps", { messageId: varchar("messag
 export const pollVotes = pgTable("pollVotes", { messageId: varchar("messageId", { length: 64 }).notNull(), userId: integer("userId").notNull(), optionIndex: integer("optionIndex").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.messageId, table.userId] }) }));
 // autoDownloadMedia and defaultDisappearSeconds are the account-wide defaults that any single chat can
 // override. Both start at what the app did before they could be changed: downloads on, timer off.
-export const userSettings = pgTable("userSettings", { userId: integer("userId").primaryKey(), readReceipts: integer("readReceipts").default(1).notNull(), lastSeen: integer("lastSeen").default(1).notNull(), darkTheme: integer("darkTheme").default(0).notNull(), notificationsMessages: integer("notificationsMessages").default(1).notNull(), notificationsGroups: integer("notificationsGroups").default(1).notNull(), notificationsCalls: integer("notificationsCalls").default(1).notNull(), autoDownloadMedia: integer("autoDownloadMedia").default(1).notNull(), defaultDisappearSeconds: integer("defaultDisappearSeconds").default(0).notNull(), // Hashed with the same scrypt scheme as the account password. Null means no two-step PIN is set.
+export const userSettings = pgTable("userSettings", { userId: integer("userId").primaryKey(), readReceipts: integer("readReceipts").default(1).notNull(), lastSeen: integer("lastSeen").default(1).notNull(), darkTheme: integer("darkTheme").default(0).notNull(), notificationsMessages: integer("notificationsMessages").default(1).notNull(), notificationsGroups: integer("notificationsGroups").default(1).notNull(), notificationsCalls: integer("notificationsCalls").default(1).notNull(), autoDownloadMedia: integer("autoDownloadMedia").default(1).notNull(), defaultDisappearSeconds: integer("defaultDisappearSeconds").default(0).notNull(), // Who may see each part of the profile, and who may add this person to a group.
+  // Stored as a word rather than a number so the value is readable in the database and a new tier
+  // can be added without renumbering what is already stored.
+  profilePhotoVisibility: varchar("profilePhotoVisibility", { length: 16 }).default("everyone").notNull(),
+  aboutVisibility: varchar("aboutVisibility", { length: 16 }).default("everyone").notNull(),
+  statusVisibility: varchar("statusVisibility", { length: 16 }).default("everyone").notNull(),
+  // Being added to groups by strangers is the complaint people change first.
+  groupAddPolicy: varchar("groupAddPolicy", { length: 16 }).default("everyone").notNull(),
+  silenceUnknownCallers: integer("silenceUnknownCallers").default(0).notNull(), // Hashed with the same scrypt scheme as the account password. Null means no two-step PIN is set.
   pinHash: text("pinHash"), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 // ---------------------------------------------------------------- presence
 // "Is this person reachable right now." One upserted row per user rather than an append-only log,
@@ -140,6 +151,14 @@ export type Appeal = typeof appeals.$inferSelect;
 // no BUILT_IN_FORGE_API_* credentials, so the generic upload path cannot be used. Served by
 // GET /api/avatar/:userId.
 export const userAvatars = pgTable("userAvatars", { userId: integer("userId").primaryKey(), mimeType: text("mimeType").notNull(), data: text("data").notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
+// A group or community photo, stored exactly the way a profile photo is: one row per conversation.
+// Groups used to be initials only, because `conversations` has no image column to hold one.
+export const conversationIcons = pgTable("conversationIcons", { conversationId: varchar("conversationId", { length: 64 }).primaryKey(), mimeType: text("mimeType").notNull(), data: text("data").notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
+
+// ---------------------------------------------------------------- group activity
+// Who joined, who left, who changed what. The `detail` column holds the shape of the change and
+// never message content, because every member can read this log.
+export const groupEvents = pgTable("groupEvents", { id: serial("id").primaryKey(), conversationId: varchar("conversationId", { length: 64 }).notNull(), actorId: integer("actorId"), kind: varchar("kind", { length: 32 }).notNull(), targetUserId: integer("targetUserId"), detail: varchar("detail", { length: 255 }), createdAt: timestamp("createdAt").defaultNow().notNull() });
 export type UserAvatar = typeof userAvatars.$inferSelect;
 // Attachments (photos, voice notes) for deployments with no object storage, served by
 // GET /api/media/:id. Kept out of the messages table so message payloads stay small.
@@ -154,7 +173,8 @@ export type Call = typeof calls.$inferSelect;
 // "Stories": short-lived posts that expire after a day. An image status keeps its bytes in
 // messageMedia (the same base64 store chat attachments use) and only the URL here, so it
 // inherits that size cap and is already served by GET /api/media/<id>.
-export const statusUpdates = pgTable("statusUpdates", { id: varchar("id", { length: 64 }).primaryKey(), userId: integer("userId").notNull(), kind: varchar("kind", { length: 8 }).default("text").notNull(), body: text("body"), mediaUrl: text("mediaUrl"), background: varchar("background", { length: 16 }).default("amber").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull(), expiresAt: timestamp("expiresAt").notNull(), removedAt: timestamp("removedAt"), removedBy: integer("removedBy") });
+export const statusUpdates = pgTable("statusUpdates", { id: varchar("id", { length: 64 }).primaryKey(), userId: integer("userId").notNull(), kind: varchar("kind", { length: 8 }).default("text").notNull(), body: text("body"), mediaUrl: text("mediaUrl"), background: varchar("background", { length: 16 }).default("amber").notNull(), // Video and voice statuses need to know what the media is and how long a clip runs.
+  mediaMime: varchar("mediaMime", { length: 100 }), voiceDurationMs: integer("voiceDurationMs"), createdAt: timestamp("createdAt").defaultNow().notNull(), expiresAt: timestamp("expiresAt").notNull(), removedAt: timestamp("removedAt"), removedBy: integer("removedBy") });
 export const statusViews = pgTable("statusViews", { statusId: varchar("statusId", { length: 64 }).notNull(), viewerId: integer("viewerId").notNull(), viewedAt: timestamp("viewedAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.statusId, table.viewerId] }) }));
 
 // ---------------------------------------------------------------- channels

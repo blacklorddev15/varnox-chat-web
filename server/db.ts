@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, ilike, inArray, isNotNull, isNull, like, lt, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, broadcastLists, broadcastRecipients, calls, channelFollowers, channelPosts, channels, communities, communityGroups, conversationMembers, conversations, InsertUser, inviteLinks, joinRequests, linkPreviews, messageHides, messageKeeps, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, reports, sessions, statusUpdates, statusViews, stickers, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, broadcastLists, broadcastRecipients, calls, channelFollowers, channelPosts, channels, communities, communityGroups, conversationIcons, conversationMembers, conversations, groupEvents, InsertUser, inviteLinks, joinRequests, linkPreviews, messageHides, messageKeeps, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, reports, sessions, statusUpdates, statusViews, stickers, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -279,6 +279,171 @@ export async function storageUsageForUser(userId: number) {
       .filter((row) => row.count > 0)
       .sort((a, b) => b.bytes - a.bytes),
   };
+}
+
+// ---------------------------------------------------------------- group icons
+/** Group photos share the profile-photo ceiling; the client enforces the same limit. */
+export const MAX_ICON_BYTES = 4 * 1024 * 1024;
+
+export async function getConversationIcon(conversationId: string) {
+  const db = await getDb();
+  if (!db) return undefined;
+  const rows = await db.select().from(conversationIcons).where(eq(conversationIcons.conversationId, conversationId)).limit(1);
+  return rows[0];
+}
+
+/**
+ * When each of the reader's group photos last changed.
+ *
+ * The client puts this in the image URL, so replacing a photo shows up immediately instead of after
+ * the previous one expires from the image cache.
+ */
+export async function conversationIconVersions(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const memberships = await db
+    .select({ conversationId: conversationMembers.conversationId })
+    .from(conversationMembers)
+    .where(eq(conversationMembers.userId, userId));
+  if (memberships.length === 0) return [];
+  return db
+    .select({ conversationId: conversationIcons.conversationId, updatedAt: conversationIcons.updatedAt })
+    .from(conversationIcons)
+    .where(inArray(conversationIcons.conversationId, memberships.map((row) => row.conversationId)));
+}
+
+export async function setConversationIcon(conversationId: string, userId: number, mimeType: string, base64: string): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  if (!(await isConversationMember(conversationId, userId))) return false;
+  const values = { conversationId, mimeType, data: base64, updatedAt: new Date() };
+  await db.insert(conversationIcons).values(values).onConflictDoUpdate({ target: conversationIcons.conversationId, set: values });
+  return true;
+}
+
+export async function clearConversationIcon(conversationId: string, userId: number): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  if (!(await isConversationMember(conversationId, userId))) return false;
+  await db.delete(conversationIcons).where(eq(conversationIcons.conversationId, conversationId));
+  return true;
+}
+
+// ---------------------------------------------------------------- group activity
+export type GroupEventKind =
+  | "created"
+  | "member-add"
+  | "member-remove"
+  | "member-leave"
+  | "role-change"
+  | "info-change"
+  | "icon-change"
+  | "join-approved";
+
+/**
+ * Records a membership or settings change for the group log.
+ *
+ * Callers fire this without awaiting it: a failure to write the log must never fail the action it
+ * describes, and an action that happened but was not logged is far better than one that did not
+ * happen because the log was unavailable.
+ */
+export async function logGroupEvent(
+  conversationId: string,
+  actorId: number | null,
+  kind: GroupEventKind,
+  targetUserId?: number | null,
+  detail?: string | null,
+) {
+  const db = await getDb();
+  if (!db) return;
+  await db
+    .insert(groupEvents)
+    .values({ conversationId, actorId, kind, targetUserId: targetUserId ?? null, detail: detail ? detail.slice(0, 255) : null });
+}
+
+export async function listGroupEvents(conversationId: string, userId: number, limit = 60) {
+  const db = await getDb();
+  if (!db || !(await isConversationMember(conversationId, userId))) return [];
+  return db
+    .select({
+      id: groupEvents.id,
+      kind: groupEvents.kind,
+      detail: groupEvents.detail,
+      createdAt: groupEvents.createdAt,
+      targetUserId: groupEvents.targetUserId,
+      actorName: users.name,
+      actorUsername: users.username,
+    })
+    .from(groupEvents)
+    .leftJoin(users, eq(users.id, groupEvents.actorId))
+    .where(eq(groupEvents.conversationId, conversationId))
+    .orderBy(desc(groupEvents.createdAt))
+    .limit(limit);
+}
+
+// ---------------------------------------------------------------- self chat
+/**
+ * The conversation you have with yourself.
+ *
+ * Stored as an ordinary direct conversation whose only member is you, so sending, starring, search,
+ * export and the unread counts all work on it with no special cases anywhere else. The id is derived
+ * from the user id, which makes creation idempotent without a lookup race.
+ */
+export async function getOrCreateSelfConversation(userId: number): Promise<string> {
+  const db = await getDb();
+  if (!db) throw new Error("Chat storage is not available");
+
+  const mine = await db
+    .select({ id: conversations.id })
+    .from(conversations)
+    .innerJoin(conversationMembers, eq(conversationMembers.conversationId, conversations.id))
+    .where(and(eq(conversations.kind, "direct"), eq(conversationMembers.userId, userId)));
+
+  const ids = mine.map((row) => row.id);
+  if (ids.length > 0) {
+    // A direct conversation with one member is a self chat; one with two is a real conversation.
+    const counts = await db
+      .select({ conversationId: conversationMembers.conversationId, n: sql<number>`count(*)` })
+      .from(conversationMembers)
+      .where(inArray(conversationMembers.conversationId, ids))
+      .groupBy(conversationMembers.conversationId);
+    const solo = counts.find((row) => Number(row.n) === 1);
+    if (solo) return solo.conversationId;
+  }
+
+  const id = `self-${userId}`;
+  await db.insert(conversations).values({ id, kind: "direct", createdBy: userId }).onConflictDoNothing();
+  await db.insert(conversationMembers).values({ conversationId: id, userId, role: "member" }).onConflictDoNothing();
+  return id;
+}
+
+// ---------------------------------------------------------------- chat lock
+/**
+ * "Chat lock": require the app PIN again before this thread opens.
+ *
+ * Only the reader's own membership row is touched, so locking a chat is private to the person who
+ * did it and never affects anybody else in the conversation.
+ */
+export async function setChatLocked(conversationId: string, userId: number, locked: boolean): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db
+    .update(conversationMembers)
+    .set({ lockedAt: locked ? new Date() : null })
+    .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)))
+    .returning({ conversationId: conversationMembers.conversationId });
+  return rows.length > 0;
+}
+
+/** Which of the reader's chats are locked, so the gate knows what to cover. */
+export async function lockedConversationIds(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const rows = await db
+    .select({ conversationId: conversationMembers.conversationId })
+    .from(conversationMembers)
+    .where(and(eq(conversationMembers.userId, userId), isNotNull(conversationMembers.lockedAt)));
+  return rows.map((row) => row.conversationId);
 }
 
 /** Searches message text inside the conversations the user is a member of. */

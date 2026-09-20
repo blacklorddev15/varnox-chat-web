@@ -26,7 +26,7 @@ import {
 import { getConversationSummary, leaveGroup, listConversationMemberIds, listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
 // Pins, keeps, abuse reports and the link-preview cache. Grouped on their own lines for the same
 // reason as the two blocks above: the main list is already long enough to be hard to scan.
-import { MAX_PINNED_MESSAGES, REPORT_CATEGORIES, getLinkPreview, listPinnedMessages, listReportsForAdmin, reviewReport, saveLinkPreview, setMessageKept, setMessagePinned, storageUsageForUser, submitReport } from "./db";
+import { MAX_ICON_BYTES, MAX_PINNED_MESSAGES, REPORT_CATEGORIES, clearConversationIcon, conversationIconVersions, getLinkPreview, getOrCreateSelfConversation, listGroupEvents, listPinnedMessages, listReportsForAdmin, lockedConversationIds, logGroupEvent, reviewReport, saveLinkPreview, setChatLocked, setConversationIcon, setMessageKept, setMessagePinned, storageUsageForUser, submitReport } from "./db";
 import { fetchLinkPreview } from "./linkPreview";
 // Server-Sent Events nudge channel; see nudgeConversation below.
 import { isRealtimeEnabled, publishToUsers } from "./realtime";
@@ -168,6 +168,9 @@ export const appRouter = router({
       if (!access) throw new Error("You are not a member of this group");
       if (!permitted(access.whoCanAddMembers, access.role)) throw new Error("Only group admins can add members");
       const added = await addConversationMembers(input.conversationId, input.userIds);
+      // Logged after the fact and not awaited: the members are already in, and a missing log line is
+      // a smaller problem than a failed add.
+      for (const userId of input.userIds) void logGroupEvent(input.conversationId, ctx.user.id, "member-add", userId);
       return { added };
     }),
     removeMember: protectedProcedure.input(z.object({ conversationId: z.string().min(1), userId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
@@ -180,6 +183,7 @@ export const appRouter = router({
       // The owner can remove anyone below them; an admin can only remove plain members.
       if (role !== "owner" && !(role === "admin" && targetRole === "member")) throw new Error("Only the group owner can remove an admin");
       await removeConversationMember(input.conversationId, input.userId);
+      void logGroupEvent(input.conversationId, ctx.user.id, "member-remove", input.userId);
       return { removed: input.userId };
     }),
     setRole: protectedProcedure.input(z.object({ conversationId: z.string().min(1), userId: z.number().int().positive(), role: z.enum(["admin", "member"]) })).mutation(async ({ ctx, input }) => {
@@ -189,6 +193,7 @@ export const appRouter = router({
       if (!targetRole) throw new Error("That person is not in this group");
       if (targetRole === "owner") throw new Error("The group owner role cannot be changed");
       await setConversationMemberRole(input.conversationId, input.userId, input.role);
+      void logGroupEvent(input.conversationId, ctx.user.id, "role-change", input.userId, input.role);
       return { userId: input.userId, role: input.role };
     }),
     // ---- group settings and invite links ---------------------------------------------------
@@ -273,6 +278,37 @@ export const appRouter = router({
     }),
 
     /** What this chat's settings screen needs: the chat's own values plus the defaults behind them. */
+    // ---- group photo ---------------------------------------------------------------------
+    // The image itself is served by /api/group-icon/<id>; these only record and version it.
+    iconVersions: protectedProcedure.query(({ ctx }) => conversationIconVersions(ctx.user.id)),
+    setIcon: protectedProcedure
+      .input(z.object({ conversationId: z.string().min(1), mimeType: z.string().min(3).max(100), data: z.string().min(16) }))
+      .mutation(async ({ ctx, input }) => {
+        // Only images, so the stored bytes can never be served back under a content type the client
+        // did not expect. The size ceiling is checked here as well as in the client.
+        if (!input.mimeType.startsWith("image/")) throw new Error("A group photo has to be an image");
+        if (Math.floor((input.data.length * 3) / 4) > MAX_ICON_BYTES) throw new Error("That image is too large");
+        if (!(await setConversationIcon(input.conversationId, ctx.user.id, input.mimeType, input.data))) {
+          throw new Error("That conversation is not available");
+        }
+        void logGroupEvent(input.conversationId, ctx.user.id, "icon-change");
+        return { ok: true as const };
+      }),
+    clearIcon: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+      if (!(await clearConversationIcon(input.conversationId, ctx.user.id))) throw new Error("That conversation is not available");
+      void logGroupEvent(input.conversationId, ctx.user.id, "icon-change", null, "removed the group photo");
+      return { ok: true as const };
+    }),
+    // ---- group activity ------------------------------------------------------------------
+    activity: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(({ ctx, input }) => listGroupEvents(input.conversationId, ctx.user.id)),
+    // ---- self chat -----------------------------------------------------------------------
+    selfChat: protectedProcedure.mutation(async ({ ctx }) => ({ conversationId: await getOrCreateSelfConversation(ctx.user.id) })),
+    // ---- chat lock -----------------------------------------------------------------------
+    lockedChats: protectedProcedure.query(({ ctx }) => lockedConversationIds(ctx.user.id)),
+    setChatLock: protectedProcedure.input(z.object({ conversationId: z.string().min(1), locked: z.boolean() })).mutation(async ({ ctx, input }) => {
+      if (!(await setChatLocked(input.conversationId, ctx.user.id, input.locked))) throw new Error("That conversation is not available");
+      return { ok: true as const, locked: input.locked };
+    }),
     // The pins everyone in the conversation sees, newest first.
     pinned: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(({ ctx, input }) => listPinnedMessages(input.conversationId, ctx.user.id)),
     chatSettings: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(async ({ ctx, input }) => {
