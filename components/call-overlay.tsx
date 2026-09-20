@@ -190,7 +190,9 @@ function columnsFor(tiles: number): number {
 
 export function CallOverlay() {
   const colors = useColors();
-  const { phase, session, room, remoteCount, micOn, cameraOn, screenSharing, reconnecting, elapsed, error, accept, decline, hangUp, toggleMic, toggleCamera, toggleScreenShare } = useCall();
+  // Every hook this component needs is called here, above the early return below. See the note on
+  // `useRemoteParticipants` for what happens otherwise.
+  const { phase, session, room, remoteCount, micOn, cameraOn, screenSharing, reconnecting, elapsed, error, canPlaybackAudio, enableAudio, accept, decline, hangUp, toggleMic, toggleCamera, toggleScreenShare } = useCall();
 
   // One tile per remote participant plus your own, laid out in rows. Tiles are `flex: 1` inside a
   // row rather than a percentage width: the card has a maximum width but a shrinking one, and
@@ -236,22 +238,17 @@ export function CallOverlay() {
     : "";
 
   return (
-    <View style={styles.backdrop} pointerEvents="auto">
-      <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-        {/* Their face, not a blank circle. This drew initials and nothing else whatever the person
-            had set, which on a dark call backdrop is just an empty ring - the thing that made a
-            ringing call look like nothing had happened. Initials remain the fallback for somebody
-            who has no photo and for a call link, which has no person behind it. */}
-        {peerPhoto ? (
-          <Image source={{ uri: peerPhoto }} style={styles.avatar} />
-        ) : (
-          <View style={[styles.avatar, { backgroundColor: colors.primary }]}>
-            <Text style={styles.avatarText}>{initialsOf(name)}</Text>
-          </View>
-        )}
+    <View style={styles.screen} pointerEvents="auto">
+      {/* Name and status at the top, the way every call screen puts them. The photo and the video
+          live in the middle and take whatever room is left, which is the whole point of the layout:
+          this used to be a small card floating in the middle of a dimmed screen, so a call occupied
+          about a third of the display and the rest of it was empty dark space. */}
+      <View style={styles.topBar}>
         <Text style={[styles.name, { color: colors.foreground }]} numberOfLines={1}>{name}</Text>
         <Text style={[styles.status, { color: connected ? colors.success : colors.muted }]}>{status}</Text>
+      </View>
 
+      <View style={styles.stage}>
         {showStage && phase === "active" ? (
           <View style={styles.videos}>
             {videoRows.map((row, rowIndex) => (
@@ -278,8 +275,38 @@ export function CallOverlay() {
               </View>
             ))}
           </View>
-        ) : null}
+        ) : (
+          /* Their face, filling the middle of the screen. This drew initials and nothing else
+             whatever the person had set, which on a dark call screen is just an empty ring - the
+             thing that made a ringing call look like nothing had happened. Initials remain the
+             fallback for somebody who has no photo and for a call link, which has no person behind
+             it. */
+          peerPhoto ? (
+            <Image source={{ uri: peerPhoto }} style={styles.photo} />
+          ) : (
+            <View style={[styles.photo, styles.photoEmpty, { backgroundColor: colors.primary }]}>
+              <Text style={styles.photoText}>{initialsOf(name)}</Text>
+            </View>
+          )
+        )}
+      </View>
 
+      {/*
+        A call can be connected, publishing and receiving perfectly, and still be silent, because the
+        browser is refusing to play audio until a gesture allows it. Both sides being unable to hear
+        each other is exactly what that looks like, and nothing on screen used to say so.
+
+        Shown for both sides - whoever is not hearing the other needs it, and either end can be the
+        one that was blocked.
+      */}
+      {!canPlaybackAudio ? (
+        <Pressable onPress={enableAudio} style={({ pressed }) => [styles.soundBar, { backgroundColor: colors.warning }, pressed && styles.pressed]}>
+          <MaterialIcons name="volume-off" size={18} color="#3A2A05" />
+          <Text style={styles.soundText}>Tap to turn on sound — your device is blocking it</Text>
+        </Pressable>
+      ) : null}
+
+      <View style={styles.footer}>
         {error ? <Text style={[styles.error, { color: colors.error }]}>{error}</Text> : null}
 
         <View style={styles.actions}>
@@ -346,8 +373,14 @@ export function CallOverlay() {
             `phase=${phase}`,
             `room=${room ? "yes" : "no"}`,
             `remote=${remoteCount}`,
-            `cam=${cameraOn ? "on" : "off"}`,
-            `pub=${room ? room.localParticipant.videoTrackPublications.size : 0}/${room ? Array.from(room.remoteParticipants.values()).reduce((total, participant) => total + participant.videoTrackPublications.size, 0) : 0}`,
+            `mic=${micOn ? "on" : "off"}`,
+            // Audio tracks are counted separately from video because they answer the question this
+            // bug turns on. `aPub=0/1` means the other side is sending sound and this side has
+            // nothing to play it with; `aPub=0/0` means nobody is sending any at all, which is a
+            // capture problem and a different fix entirely.
+            `aPub=${room ? room.localParticipant.audioTrackPublications.size : 0}/${room ? Array.from(room.remoteParticipants.values()).reduce((total, participant) => total + participant.audioTrackPublications.size, 0) : 0}`,
+            `vPub=${room ? room.localParticipant.videoTrackPublications.size : 0}/${room ? Array.from(room.remoteParticipants.values()).reduce((total, participant) => total + participant.videoTrackPublications.size, 0) : 0}`,
+            `spk=${canPlaybackAudio ? "ok" : "blocked"}`,
             `err=${error ? "yes" : "no"}`,
           ].join("  ")}
         </Text>
@@ -357,27 +390,46 @@ export function CallOverlay() {
 }
 
 const styles = StyleSheet.create({
-  backdrop: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(6,6,10,0.82)", zIndex: 50, padding: 22 },
-  card: { width: "100%", maxWidth: 380, borderRadius: 24, borderWidth: 1, paddingVertical: 26, paddingHorizontal: 22, alignItems: "center" },
-  avatar: { width: 78, height: 78, borderRadius: 39, alignItems: "center", justifyContent: "center" },
-  avatarText: { color: "#FFFFFF", fontSize: 26, fontWeight: "800" },
-  name: { fontSize: 19, fontWeight: "800", marginTop: 14, textAlign: "center" },
-  status: { fontSize: 13, fontWeight: "700", marginTop: 5 },
-  videos: { marginTop: 16, width: "100%", gap: 8 },
-  videoRow: { flexDirection: "row", gap: 8 },
-  // Height comes from the tile's own width, so a row of two and a row of three both end up sensibly
-  // shaped instead of one being stretched thin.
-  tile: { flex: 1, aspectRatio: 4 / 3, borderRadius: 14, overflow: "hidden", backgroundColor: "#111116" },
+  /**
+   * Full screen, opaque, above everything.
+   *
+   * This was a translucent backdrop with a 380pt card centred in it, so a call covered about a third
+   * of the display and the rest was the app showing through behind it. A call is the one thing in a
+   * messenger that should take the whole screen.
+   */
+  screen: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "#0B0B10", zIndex: 50 },
+  topBar: { paddingTop: 54, paddingHorizontal: 28, alignItems: "center" },
+  name: { fontSize: 21, fontWeight: "800", textAlign: "center" },
+  status: { fontSize: 14, fontWeight: "700", marginTop: 6 },
+  // Takes every pixel the top bar and footer leave. `minHeight: 0` so a tall video grid is able to
+  // shrink inside a flex column instead of pushing the controls off the bottom of the screen.
+  stage: { flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 20, paddingVertical: 18, minHeight: 0 },
+  // No fixed size: 42% of the screen's width, so it reads as the subject of the screen on a phone and
+  // does not become absurd on a tablet.
+  photo: { width: "62%", aspectRatio: 1, borderRadius: 999, maxWidth: 300, maxHeight: 300, alignItems: "center", justifyContent: "center" },
+  photoEmpty: {},
+  photoText: { color: "#FFFFFF", fontSize: 54, fontWeight: "800" },
+  // The grid fills the stage rather than sitting at its natural height, so a video call uses the
+  // whole screen instead of a band across the middle of it.
+  videos: { width: "100%", height: "100%", gap: 8, justifyContent: "center" },
+  videoRow: { flexDirection: "row", gap: 8, flex: 1 },
+  // Height comes from the row it is in, so a row of two and a row of three both fill the space given
+  // to them and stay sensibly shaped instead of one being stretched thin.
+  tile: { flex: 1, borderRadius: 14, overflow: "hidden", backgroundColor: "#111116" },
   tileFiller: { flex: 1 },
   videoSurface: { flex: 1 },
   // Dark chip rather than a plain label, so a name stays readable over whatever the camera shows.
   tileLabel: { position: "absolute", left: 6, bottom: 6, right: 6, fontSize: 10, fontWeight: "700", color: "#FFFFFF", backgroundColor: "rgba(0,0,0,0.45)", borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, overflow: "hidden" },
-  error: { fontSize: 12, lineHeight: 17, marginTop: 12, textAlign: "center" },
+  // Extra padding at the bottom clears the Android navigation bar, which is drawn over the app.
+  footer: { paddingHorizontal: 20, paddingBottom: 44, paddingTop: 10, alignItems: "center" },
+  error: { fontSize: 12, lineHeight: 17, marginBottom: 12, textAlign: "center" },
   // Monospace so a screenshot is unambiguous about which value is which - a proportional font makes
   // "1" and "l" and "0" and "O" a guess, and this line exists to be read off a screenshot.
-  diagnostics: { fontSize: 10, lineHeight: 14, marginTop: 14, textAlign: "center", fontFamily: Platform.OS === "web" ? "monospace" : undefined },
-  actions: { flexDirection: "row", gap: 18, marginTop: 22 },
-  circle: { width: 60, height: 60, borderRadius: 30, alignItems: "center", justifyContent: "center" },
+  diagnostics: { fontSize: 10, lineHeight: 14, marginTop: 10, textAlign: "center", fontFamily: Platform.OS === "web" ? "monospace" : undefined },
+  actions: { flexDirection: "row", gap: 18 },
+  circle: { width: 62, height: 62, borderRadius: 31, alignItems: "center", justifyContent: "center" },
   pressed: { opacity: 0.75, transform: [{ scale: 0.96 }] },
   hint: { fontSize: 11, marginTop: 16, fontWeight: "600" },
+  soundBar: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 9, marginHorizontal: 20, paddingVertical: 12, paddingHorizontal: 16, borderRadius: 14 },
+  soundText: { color: "#3A2A05", fontSize: 13, fontWeight: "800" },
 });

@@ -51,6 +51,10 @@ type CallContextValue = {
   reconnecting: boolean;
   elapsed: number;
   error: string | null;
+  /** False when the browser has blocked audio playback and needs a tap before it will start. */
+  canPlaybackAudio: boolean;
+  /** Retry playback from a fresh user gesture - the only thing that unblocks it. */
+  enableAudio: () => void;
   startCall: (input: { conversationId: string; kind: CallKind; peerName: string; peerId?: number | null; avatarUpdatedAt?: string | Date | null }) => Promise<void>;
   joinLink: (input: { room: string; token: string; url: string; peerName: string; kind: CallKind }) => Promise<void>;
   accept: () => Promise<void>;
@@ -81,6 +85,14 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const [reconnecting, setReconnecting] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Whether the browser is actually allowed to play the call's audio.
+   *
+   * Starts true so the prompt never flashes on a call that was fine, and is corrected by connect()
+   * and by LiveKit's own status event. A call can be connected, publishing and receiving perfectly
+   * and still be silent - this is the only thing that can tell the difference.
+   */
+  const [canPlaybackAudio, setCanPlaybackAudio] = useState(true);
 
   const roomRef = useRef<LiveKitRoom | null>(null);
   // Mirrors screenSharing so the toggle can read the current value without depending on it, which
@@ -136,11 +148,32 @@ export function CallProvider({ children }: { children: ReactNode }) {
     [endCall, setPhaseBoth],
   );
 
+  /**
+   * Ask the browser to start playing the remote audio, and report whether it agreed.
+   *
+   * `room.canPlaybackAudio` is the authoritative answer, not the absence of a thrown error: the call
+   * can resolve and still not be playing. Never swallowed here, because the difference between "the
+   * call is silent" and "the call is working" is not something to leave to a `.catch`.
+   */
+  const tryStartAudio = async (instance: LiveKitRoom): Promise<boolean> => {
+    try {
+      await instance.startAudio();
+    } catch {
+      // Refused, most often for want of a user gesture. The status below is the real answer.
+    }
+    return instance.canPlaybackAudio;
+  };
+
   const connect = useCallback(async (next: CallSession, withCamera: boolean) => {
     const { Room, RoomEvent } = await import("livekit-client");
     const instance = new Room({ adaptiveStream: true, dynacast: true });
     roomRef.current = instance;
     setRoom(instance);
+
+    // Playback can be blocked after connecting too - a call that starts silent and is unlocked later,
+    // or one that loses the ability when the page is backgrounded. This is what keeps the screen's
+    // "tap for sound" state honest rather than a guess made once at connect time.
+    instance.on(RoomEvent.AudioPlaybackStatusChanged, () => setCanPlaybackAudio(instance.canPlaybackAudio));
 
     /**
      * Somebody else appearing in the room is what "answered" looks like from the caller's side.
@@ -176,14 +209,26 @@ export function CallProvider({ children }: { children: ReactNode }) {
     });
 
     await instance.connect(next.url, next.token);
+
+    // Audio playback first, before anything else that awaits.
+    //
+    // It has to happen inside the browser's transient user activation, which is what dialling or
+    // answering provides - but that window is a few seconds, and the microphone and camera below
+    // each wait on a permission dialog and a device. Doing them first spent the window, and a
+    // startAudio() that arrives outside it is refused by both Chrome and the Android WebView.
+    //
+    // That refusal was the whole "neither of us can hear the other" report. Both sides were
+    // publishing sound; neither was allowed to play it, and the failure was being discarded by a
+    // `.catch(() => undefined)` so nothing said so. The status is kept instead, and the call screen
+    // offers a button to start it on a fresh gesture when it is still blocked.
+    const playback = await tryStartAudio(instance);
+    setCanPlaybackAudio(playback);
+
     await instance.localParticipant.setMicrophoneEnabled(true);
     if (withCamera) {
       await instance.localParticipant.setCameraEnabled(true);
       setCameraOn(true);
     }
-    // Browser autoplay policy: audio only starts inside a user gesture, which dialling or
-    // answering both are.
-    await instance.startAudio().catch(() => undefined);
     // They may already have been in the room - a link join, or a call placed into a room that
     // already had somebody in it - in which case no ParticipantConnected fires for them and the
     // phase would sit at "ringing-out" with the video hidden for the whole call.
@@ -347,6 +392,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
    * call that was about to work perfectly.
    */
   const diagMutation = trpc.calls.diag.useMutation();
+  // Read through a ref so the report always carries the current playback status. `reportDiag` itself
+  // is captured into a ref that is refreshed every render, but the closure inside it would otherwise
+  // keep whatever `canPlaybackAudio` was at the time it was defined.
+  const canPlaybackAudioRef = useRef(canPlaybackAudio);
+  canPlaybackAudioRef.current = canPlaybackAudio;
   const reportDiag = useCallback(() => {
     const snapshot = [
       `phase=${phaseRef.current}`,
@@ -354,7 +404,11 @@ export function CallProvider({ children }: { children: ReactNode }) {
       `remote=${roomRef.current?.remoteParticipants.size ?? 0}`,
       `mic=${roomRef.current?.localParticipant.isMicrophoneEnabled ? "on" : "off"}`,
       `cam=${roomRef.current?.localParticipant.isCameraEnabled ? "on" : "off"}`,
-      `pub=${roomRef.current?.localParticipant.videoTrackPublications.size ?? 0}/${roomRef.current ? Array.from(roomRef.current.remoteParticipants.values()).reduce((total, participant) => total + participant.videoTrackPublications.size, 0) : 0}`,
+      // Both kinds of track, counted separately. The audible-either-way report comes down to which
+      // of these is zero, and they point at opposite fixes.
+      `aPub=${roomRef.current?.localParticipant.audioTrackPublications.size ?? 0}/${roomRef.current ? Array.from(roomRef.current.remoteParticipants.values()).reduce((total, participant) => total + participant.audioTrackPublications.size, 0) : 0}`,
+      `vPub=${roomRef.current?.localParticipant.videoTrackPublications.size ?? 0}/${roomRef.current ? Array.from(roomRef.current.remoteParticipants.values()).reduce((total, participant) => total + participant.videoTrackPublications.size, 0) : 0}`,
+      `spk=${canPlaybackAudioRef.current ? "ok" : "blocked"}`,
       `plat=${Platform.OS}`,
     ].join(" ");
     diagMutation.mutate({ snapshot });
@@ -368,7 +422,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
     if (phase !== "active") return;
     const settled = setTimeout(() => reportDiagOnce.current(), 5000);
     return () => clearTimeout(settled);
-  }, [isAuthenticated, phase]);
+    // `canPlaybackAudio` is in here because a call being silent is the fault being chased. That it
+    // changes at all is the interesting event, and it is the one a later report has to carry.
+  }, [isAuthenticated, phase, canPlaybackAudio]);
 
   // Poll for an incoming call only while idle, so we never ring over a live call.
   const incoming = trpc.calls.incoming.useQuery(undefined, {
@@ -483,6 +539,19 @@ export function CallProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("pagehide", onUnload);
   }, [endMutation]);
 
+  /**
+   * Retry audio playback from a tap on the call screen.
+   *
+   * The tap is the entire point: a blocked playback is only unblocked by a fresh user gesture, so
+   * this cannot be retried on a timer or from an effect. Synchronous start, no awaits before the
+   * call to `startAudio`, or the gesture is spent before it is used.
+   */
+  const enableAudio = useCallback(() => {
+    const instance = roomRef.current;
+    if (!instance) return;
+    void tryStartAudio(instance).then(setCanPlaybackAudio);
+  }, []);
+
   const value: CallContextValue = {
     phase,
     session,
@@ -492,6 +561,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
     cameraOn,
     screenSharing,
     reconnecting,
+    canPlaybackAudio,
+    enableAudio,
     elapsed,
     error,
     startCall,
