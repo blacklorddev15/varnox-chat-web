@@ -1511,17 +1511,47 @@ export async function listRecentCalls(userId: number, limit = 30) {
     .orderBy(desc(calls.startedAt))
     .limit(limit);
 
-  return rows.map((row) => ({
-    id: row.call.id,
-    conversationId: row.call.conversationId,
-    conversationTitle: row.title,
-    initiatorId: row.call.initiatorId,
-    outgoing: row.call.initiatorId === userId,
-    kind: row.call.kind,
-    status: row.call.status,
-    startedAt: row.call.startedAt,
-    endedAt: row.call.endedAt,
-  }));
+  // The other person in each conversation, so a history row can show a face and a name.
+  //
+  // A one-to-one conversation has no title, so `conversationTitle` is null and every row in the list
+  // read "Call" - the person you had just been speaking to was the one thing the row did not say.
+  // Their picture was missing for the same reason: the row had no id to ask the avatar endpoint for.
+  //
+  // Two queries rather than a join per row: the ids are already in hand, and a call log is short.
+  // Restricted to one-to-one conversations on purpose. In a group there is no single "other person",
+  // and picking one member's face for the row would be worse than the title and initials.
+  const conversationIds = Array.from(new Set(rows.map((row) => row.call.conversationId)));
+  const others = conversationIds.length
+    ? await db
+        .select({ conversationId: conversationMembers.conversationId, id: users.id, name: users.name, username: users.username, avatarUpdatedAt: users.avatarUpdatedAt, kind: conversations.kind })
+        .from(conversationMembers)
+        .innerJoin(users, eq(users.id, conversationMembers.userId))
+        .innerJoin(conversations, eq(conversations.id, conversationMembers.conversationId))
+        .where(and(inArray(conversationMembers.conversationId, conversationIds), ne(conversationMembers.userId, userId)))
+    : [];
+  const peerByConversation = new Map<string, (typeof others)[number]>();
+  for (const other of others) {
+    if (other.kind === "group") continue;
+    if (!peerByConversation.has(other.conversationId)) peerByConversation.set(other.conversationId, other);
+  }
+
+  return rows.map((row) => {
+    const peer = peerByConversation.get(row.call.conversationId) ?? null;
+    return {
+      id: row.call.id,
+      conversationId: row.call.conversationId,
+      conversationTitle: row.title,
+      initiatorId: row.call.initiatorId,
+      outgoing: row.call.initiatorId === userId,
+      kind: row.call.kind,
+      status: row.call.status,
+      startedAt: row.call.startedAt,
+      endedAt: row.call.endedAt,
+      peerId: peer?.id ?? null,
+      peerName: peer?.name?.trim() || peer?.username || null,
+      peerAvatarUpdatedAt: peer?.avatarUpdatedAt ?? null,
+    };
+  });
 }
 
 /**

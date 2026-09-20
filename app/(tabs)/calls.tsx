@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { ActivityIndicator, FlatList, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, FlatList, Image, Platform, Pressable, StyleSheet, Text, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { useFocusEffect, useRouter } from "expo-router";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
@@ -10,7 +10,7 @@ import { useColors } from "@/hooks/use-colors";
 import { trpc } from "@/lib/trpc";
 import { useCall } from "@/lib/call-context";
 import { isOnline, OFFLINE_CALL_MESSAGE } from "@/lib/offline";
-import { shortTime } from "@/lib/media-url";
+import { avatarUrl, shortTime } from "@/lib/media-url";
 
 function initialsOf(name: string) {
   const initials = name.split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase();
@@ -124,16 +124,25 @@ export default function CallsScreen() {
         showsVerticalScrollIndicator={false}
         contentContainerStyle={styles.list}
         renderItem={({ item }) => {
-          const name = item.conversationTitle ?? "Call";
+          // The person, then the conversation. A one-to-one has no title, so preferring the title
+          // meant every such row said "Call" for somebody the server had just told us about.
+          const name = item.peerName ?? item.conversationTitle ?? "Call";
+          const photo = item.peerId ? avatarUrl(item.peerId, item.peerAvatarUpdatedAt) : undefined;
           const bad = item.status === "missed" || item.status === "declined";
           return (
             <Pressable
-              onPress={() => { if (!isOnline()) { notify(OFFLINE_CALL_MESSAGE); return; } void startCall({ conversationId: item.conversationId, kind: item.kind === "video" ? "video" : "audio", peerName: name }); }}
+              onPress={() => { if (!isOnline()) { notify(OFFLINE_CALL_MESSAGE); return; } void startCall({ conversationId: item.conversationId, kind: item.kind === "video" ? "video" : "audio", peerName: name, peerId: item.peerId, avatarUpdatedAt: item.peerAvatarUpdatedAt }); }}
               style={({ pressed }) => [styles.callRow, pressed && styles.pressed]}
             >
-              <View style={[styles.avatar, { backgroundColor: colors.primary }]}>
-                <Text style={styles.avatarText}>{initialsOf(name)}</Text>
-              </View>
+              {/* Passing the peer on is also what puts their face on the call screen when you tap
+                  the row to ring them back, instead of a bare circle with their initials. */}
+              {photo ? (
+                <Image source={{ uri: photo }} style={styles.avatar} />
+              ) : (
+                <View style={[styles.avatar, { backgroundColor: colors.primary }]}>
+                  <Text style={styles.avatarText}>{initialsOf(name)}</Text>
+                </View>
+              )}
               <View style={[styles.callCopy, { borderBottomColor: colors.border }]}>
                 <Text style={[styles.callName, { color: bad ? colors.error : colors.foreground }]} numberOfLines={1}>{name}</Text>
                 <View style={styles.callMeta}>
