@@ -471,6 +471,111 @@ function isDeliveredFor(row: { senderId: number; scheduledAt: Date | null }, use
   return row.scheduledAt.getTime() <= nowMs;
 }
 
+// ---------------------------------------------------------------- privacy
+/** The tiers every visibility setting offers. Ordered from widest to narrowest. */
+export const VISIBILITY_VALUES = ["everyone", "contacts", "nobody"] as const;
+export type Visibility = (typeof VISIBILITY_VALUES)[number];
+
+/**
+ * Whether two people are "contacts" for the purpose of a privacy setting.
+ *
+ * This app has no address book, so the word cannot mean what it means elsewhere. It is defined here
+ * as people who share a direct conversation, which is the closest thing to a contact list the data
+ * actually supports. The privacy screen says so rather than letting the label imply more than it
+ * does - someone choosing "My contacts" is choosing a narrower group than they might assume.
+ */
+export async function sharesDirectChat(a: number, b: number): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db
+    .select({ id: conversations.id })
+    .from(conversations)
+    .innerJoin(conversationMembers, eq(conversationMembers.conversationId, conversations.id))
+    .where(and(eq(conversations.kind, "direct"), inArray(conversationMembers.userId, [a, b])))
+    .groupBy(conversations.id)
+    // Both must be in the same direct conversation. Counting distinct members is what rules out a
+    // direct conversation that happens to contain one of them alongside somebody else.
+    .having(sql`count(distinct ${conversationMembers.userId}) = 2`);
+  return rows.length > 0;
+}
+
+/**
+ * Resolves one visibility tier against one viewer.
+ *
+ * The owner always satisfies their own setting, which is why this takes the owner separately rather
+ * than assuming the viewer is a stranger.
+ */
+export async function viewerSatisfies(viewerId: number | null, ownerId: number, tier: string | null | undefined): Promise<boolean> {
+  const level = tier ?? "everyone";
+  if (level === "everyone") return true;
+  if (viewerId === null) return false;
+  if (viewerId === ownerId) return true;
+  if (level === "nobody") return false;
+  return sharesDirectChat(viewerId, ownerId);
+}
+
+/** Settings for several people at once, for filtering a list without a query per row. */
+async function visibilityByUserId(userIds: number[]) {
+  const db = await getDb();
+  const map = new Map<number, { statusVisibility: string; groupAddPolicy: string; profilePhotoVisibility: string }>();
+  if (!db || userIds.length === 0) return map;
+  const rows = await db
+    .select({
+      userId: userSettings.userId,
+      statusVisibility: userSettings.statusVisibility,
+      groupAddPolicy: userSettings.groupAddPolicy,
+      profilePhotoVisibility: userSettings.profilePhotoVisibility,
+    })
+    .from(userSettings)
+    .where(inArray(userSettings.userId, userIds));
+  for (const row of rows) map.set(row.userId, row);
+  // A user with no settings row has never opened the privacy screen; the column defaults are
+  // "everyone", and an absent row must behave the same way rather than silently hiding things.
+  return map;
+}
+
+/**
+ * Drops statuses whose author has not shared them with this viewer.
+ *
+ * Filtered after the query rather than inside it: the rule needs each author's settings, and a
+ * correlated subquery in SQL would be harder to read than this and no faster for the handful of
+ * authors a status feed contains.
+ */
+export async function filterStatusesByVisibility<T extends { userId: number }>(rows: T[], viewerId: number): Promise<T[]> {
+  const authorIds = [...new Set(rows.map((row) => row.userId))];
+  if (authorIds.length === 0) return rows;
+  const settings = await visibilityByUserId(authorIds.filter((id) => id !== viewerId));
+
+  const allowed = new Map<number, boolean>();
+  for (const authorId of authorIds) {
+    if (authorId === viewerId) {
+      allowed.set(authorId, true);
+      continue;
+    }
+    allowed.set(authorId, await viewerSatisfies(viewerId, authorId, settings.get(authorId)?.statusVisibility));
+  }
+
+  return rows.filter((row) => allowed.get(row.userId) === true);
+}
+
+/** Whether this person may add that person to a group. */
+export async function canAddToGroup(actorId: number, targetId: number): Promise<boolean> {
+  if (actorId === targetId) return true;
+  const db = await getDb();
+  if (!db) return false;
+  const settings = await visibilityByUserId([targetId]);
+  return viewerSatisfies(actorId, targetId, settings.get(targetId)?.groupAddPolicy);
+}
+
+/** Whether a call from this person should ring, or arrive silently. */
+export async function callShouldRing(callerId: number, calleeId: number): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return true;
+  const rows = await db.select({ silenceUnknownCallers: userSettings.silenceUnknownCallers }).from(userSettings).where(eq(userSettings.userId, calleeId)).limit(1);
+  if (!rows[0]?.silenceUnknownCallers) return true;
+  return sharesDirectChat(callerId, calleeId);
+}
+
 /** Searches message text inside the conversations the user is a member of. */
 export async function searchMessages(userId: number, query: string, limit = 50) {
   const db = await getDb();
@@ -1553,17 +1658,24 @@ export async function createStatus(input: {
   return input.id;
 }
 
-/** Live statuses (unexpired, not moderated away) from the given authors, newest first. */
-export async function listActiveStatusesByAuthors(authorIds: number[]) {
+/**
+ * Live statuses (unexpired, not moderated away) from the given authors, newest first.
+ *
+ * The viewer is a required argument rather than an optional one. The answer depends on who is
+ * asking, and an optional viewer would be a quiet way for a future caller to skip the filter.
+ */
+export async function listActiveStatusesByAuthors(authorIds: number[], viewerId: number) {
   const db = await getDb();
   if (!db || authorIds.length === 0) return [];
-  return db
+  const rows = await db
     .select({ id: statusUpdates.id, userId: statusUpdates.userId, kind: statusUpdates.kind, body: statusUpdates.body, mediaUrl: statusUpdates.mediaUrl, mediaMime: statusUpdates.mediaMime, voiceDurationMs: statusUpdates.voiceDurationMs, background: statusUpdates.background, createdAt: statusUpdates.createdAt, expiresAt: statusUpdates.expiresAt, authorName: users.name, authorUsername: users.username, authorAvatarUpdatedAt: users.avatarUpdatedAt })
     .from(statusUpdates)
     .innerJoin(users, eq(users.id, statusUpdates.userId))
     .where(and(inArray(statusUpdates.userId, authorIds), isNull(statusUpdates.removedAt), gt(statusUpdates.expiresAt, new Date())))
     .orderBy(desc(statusUpdates.createdAt))
     .limit(300);
+  // Each author's own setting decides this, so it cannot be a condition in the WHERE clause.
+  return filterStatusesByVisibility(rows, viewerId);
 }
 
 export async function getStatus(id: string) {

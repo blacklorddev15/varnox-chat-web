@@ -26,7 +26,7 @@ import {
 import { getConversationSummary, leaveGroup, listConversationMemberIds, listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
 // Pins, keeps, abuse reports and the link-preview cache. Grouped on their own lines for the same
 // reason as the two blocks above: the main list is already long enough to be hard to scan.
-import { MAX_ICON_BYTES, MAX_PINNED_MESSAGES, REPORT_CATEGORIES, clearConversationIcon, conversationIconVersions, getLinkPreview, getOrCreateSelfConversation, listGroupEvents, listPinnedMessages, listReportsForAdmin, lockedConversationIds, logGroupEvent, reviewReport, saveLinkPreview, setChatLocked, setConversationIcon, setMessageKept, setMessagePinned, storageUsageForUser, submitReport } from "./db";
+import { MAX_ICON_BYTES, MAX_PINNED_MESSAGES, REPORT_CATEGORIES, VISIBILITY_VALUES, canAddToGroup, callShouldRing, clearConversationIcon, conversationIconVersions, getLinkPreview, getOrCreateSelfConversation, listGroupEvents, listPinnedMessages, listReportsForAdmin, lockedConversationIds, logGroupEvent, reviewReport, saveLinkPreview, setChatLocked, setConversationIcon, setMessageKept, setMessagePinned, storageUsageForUser, submitReport } from "./db";
 import { fetchLinkPreview } from "./linkPreview";
 // Server-Sent Events nudge channel; see nudgeConversation below.
 import { isRealtimeEnabled, publishToUsers } from "./realtime";
@@ -50,10 +50,12 @@ async function requireVisibleMessage(messageId: string, userId: number) {
  * latency optimisation, not a delivery guarantee - every client keeps a slow safety-net poll, so a
  * dropped event costs a few seconds rather than the message.
  */
-async function nudgeConversation(conversationId: string, actorId: number, type: string) {
+async function nudgeConversation(conversationId: string, actorId: number, type: string, excludeUserIds: number[] = []) {
   if (!isRealtimeEnabled()) return;
   try {
-    const members = (await listConversationMemberIds(conversationId)).filter((id) => id !== actorId);
+    // The exclusion list exists for calls: somebody who silences unknown callers should not have
+    // their device ring, and a nudge is what rings it.
+    const members = (await listConversationMemberIds(conversationId)).filter((id) => id !== actorId && !excludeUserIds.includes(id));
     publishToUsers(members, { type, conversationId });
   } catch (error) {
     console.warn("[Realtime] nudge failed", error);
@@ -151,7 +153,15 @@ export const appRouter = router({
     search: protectedProcedure.input(z.object({ query: z.string().trim().min(1).max(100) })).query(({ ctx, input }) => searchMessages(ctx.user.id, input.query)),
     // ---- groups: the creator owns the group, and only the owner manages admins ----------
     createGroup: protectedProcedure.input(z.object({ title: z.string().trim().min(1).max(80), memberIds: z.array(z.number().int().positive()).max(256).default([]) })).mutation(async ({ ctx, input }) => {
-      const conversationId = await createGroupConversation(ctx.user.id, input.title, input.memberIds);
+      // Being added to a new group by a stranger is the complaint people change first, so the same
+      // setting that guards `addMembers` guards creation. The group is still created: the caller
+      // becomes its owner, and simply nobody else joins without agreeing to.
+      const permittedIds: number[] = [];
+      for (const userId of input.memberIds) {
+        if (await canAddToGroup(ctx.user.id, userId)) permittedIds.push(userId);
+      }
+      const conversationId = await createGroupConversation(ctx.user.id, input.title, permittedIds);
+      for (const userId of permittedIds) void logGroupEvent(conversationId, ctx.user.id, "member-add", userId);
       return { conversationId };
     }),
     members: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(async ({ ctx, input }) => {
@@ -167,10 +177,19 @@ export const appRouter = router({
       const access = await getConversationAccess(input.conversationId, ctx.user.id);
       if (!access) throw new Error("You are not a member of this group");
       if (!permitted(access.whoCanAddMembers, access.role)) throw new Error("Only group admins can add members");
-      const added = await addConversationMembers(input.conversationId, input.userIds);
+      // Each person's own setting decides whether they may be added. The ones who refuse are left
+      // out rather than failing the whole request, because the caller picked several people at once
+      // and losing the whole selection over one of them would be the wrong outcome.
+      const permittedIds: number[] = [];
+      for (const userId of input.userIds) {
+        if (await canAddToGroup(ctx.user.id, userId)) permittedIds.push(userId);
+      }
+      if (permittedIds.length === 0) throw new Error("Nobody in that list accepts being added to groups right now");
+
+      const added = await addConversationMembers(input.conversationId, permittedIds);
       // Logged after the fact and not awaited: the members are already in, and a missing log line is
       // a smaller problem than a failed add.
-      for (const userId of input.userIds) void logGroupEvent(input.conversationId, ctx.user.id, "member-add", userId);
+      for (const userId of permittedIds) void logGroupEvent(input.conversationId, ctx.user.id, "member-add", userId);
       return { added };
     }),
     removeMember: protectedProcedure.input(z.object({ conversationId: z.string().min(1), userId: z.number().int().positive() })).mutation(async ({ ctx, input }) => {
@@ -594,8 +613,15 @@ export const appRouter = router({
       await expireStaleCalls(input.conversationId);
       const room = `call_${crypto.randomUUID()}`;
       const callId = await createCallRecord(input.conversationId, ctx.user.id, room, input.kind);
-      // Ring the other side now rather than at their next poll.
-      void nudgeConversation(input.conversationId, ctx.user.id, "call");
+      // Ring the other side now rather than at their next poll, except for anyone who silences
+      // unknown callers and does not know the caller. Their device stays quiet; the call is still
+      // recorded, so it appears in their call list rather than being hidden from them entirely.
+      const calleeIds = (await listConversationMemberIds(input.conversationId)).filter((id) => id !== ctx.user.id);
+      const silentIds: number[] = [];
+      for (const calleeId of calleeIds) {
+        if (!(await callShouldRing(ctx.user.id, calleeId))) silentIds.push(calleeId);
+      }
+      void nudgeConversation(input.conversationId, ctx.user.id, "call", silentIds);
       const displayName = ctx.user.name?.trim() || ctx.user.username || `User ${ctx.user.id}`;
       const token = await createRoomToken(`user-${ctx.user.id}`, displayName, room);
       return { callId, room, token, url: liveKitUrl(), kind: input.kind, status: "ringing" as const };
@@ -663,6 +689,31 @@ export const appRouter = router({
      * as a boolean and would flatten a number of seconds into 1.
      */
     setMessageTimer: protectedProcedure.input(z.object({ seconds: z.number().int().min(0).max(7776000) })).mutation(({ ctx, input }) => updateUserSettings(ctx.user.id, { defaultDisappearSeconds: input.seconds })),
+    /**
+     * The audience settings, kept apart from `update` for exactly the reason above: that route
+     * coerces every field to 1 or 0, which would turn "contacts" into 1 and store a value the read
+     * paths would not recognise.
+     */
+    setPrivacy: protectedProcedure
+      .input(
+        z.object({
+          profilePhotoVisibility: z.enum(VISIBILITY_VALUES).optional(),
+          aboutVisibility: z.enum(VISIBILITY_VALUES).optional(),
+          statusVisibility: z.enum(VISIBILITY_VALUES).optional(),
+          groupAddPolicy: z.enum(VISIBILITY_VALUES).optional(),
+          silenceUnknownCallers: z.boolean().optional(),
+        }),
+      )
+      .mutation(({ ctx, input }) => {
+        const patch: Record<string, unknown> = {};
+        if (input.profilePhotoVisibility !== undefined) patch.profilePhotoVisibility = input.profilePhotoVisibility;
+        if (input.aboutVisibility !== undefined) patch.aboutVisibility = input.aboutVisibility;
+        if (input.statusVisibility !== undefined) patch.statusVisibility = input.statusVisibility;
+        if (input.groupAddPolicy !== undefined) patch.groupAddPolicy = input.groupAddPolicy;
+        // The only boolean among them, so the only one that does need coercing.
+        if (input.silenceUnknownCallers !== undefined) patch.silenceUnknownCallers = input.silenceUnknownCallers ? 1 : 0;
+        return updateUserSettings(ctx.user.id, patch as never);
+      }),
   }),
 
   security: router({
@@ -939,7 +990,7 @@ export const appRouter = router({
   status: router({
     feed: protectedProcedure.query(async ({ ctx }) => {
       const authorIds = [ctx.user.id, ...(await listContactIdsForUser(ctx.user.id))];
-      const rows = await listActiveStatusesByAuthors(authorIds);
+      const rows = await listActiveStatusesByAuthors(authorIds, ctx.user.id);
       const viewed = new Set(await listViewedStatusIds(rows.map((row) => row.id), ctx.user.id));
       const byAuthor = new Map<number, { userId: number; name: string; username: string | null; avatarUpdatedAt: Date | null; allSeen: boolean; items: (StatusRow & { seen: boolean })[] }>();
       for (const row of rows) {

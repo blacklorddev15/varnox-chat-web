@@ -25,6 +25,7 @@ export type SettingsRoute =
   | "/security/change-number"
   | "/security/delete-account"
   | "/chat/settings"
+  | "/chat/privacy"
   | "/chat/starred"
   | "/chat/storage"
   | "/chat/appeals"
@@ -75,10 +76,12 @@ export const SETTINGS_ENTRIES: SettingsEntry[] = [
   {
     id: "privacy",
     title: "Privacy",
-    subtitle: "Read receipts, last seen, blocked contacts",
+    subtitle: "Photo, about, status, who can add you to groups",
     icon: "lock-outline",
-    keywords: "blocked read receipt last seen visibility who can see",
-    target: { kind: "section", section: "privacy" },
+    keywords: "blocked read receipt last seen visibility who can see photo profile audience audience",
+    // A screen of its own now. It used to point at the generic detail page, which rendered the same
+    // two toggles as every other section and had nothing to do with privacy.
+    target: { kind: "route", href: "/chat/privacy" },
   },
   {
     id: "security",

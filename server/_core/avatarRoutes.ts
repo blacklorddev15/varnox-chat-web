@@ -1,5 +1,6 @@
 import type { Express, Request, Response } from "express";
-import { getConversationIcon, getUserAvatar } from "../db";
+import { getConversationIcon, getUserAvatar, getUserSettings, viewerSatisfies } from "../db";
+import { sdk } from "./sdk";
 
 /**
  * Serves a user's profile photo.
@@ -27,11 +28,36 @@ export function registerAvatarRoutes(app: Express) {
         return;
       }
 
+      /**
+       * A restricted photo is only served to someone entitled to see it.
+       *
+       * This route has no session of its own, so it authenticates the request the same way the tRPC
+       * layer does. The refusal is a 404 rather than a 403 on purpose: a 403 would confirm that this
+       * account has a photo, which is the fact the setting exists to withhold. A 404 is exactly what
+       * the client already handles by falling back to initials.
+       *
+       * The cache header changes with the answer. A photo that anybody may see stays public and
+       * cached for a week; a restricted one must not be, or a shared device or intermediary could
+       * keep serving it to the next person.
+       */
+      const owner = await getUserSettings(userId);
+      const restricted = (owner?.profilePhotoVisibility ?? "everyone") !== "everyone";
+      if (restricted) {
+        const viewer = await sdk.authenticateRequest(req).catch(() => null);
+        const allowed = await viewerSatisfies(viewer?.id ?? null, userId, owner?.profilePhotoVisibility);
+        if (!allowed) {
+          res.status(404).json({ error: "No profile photo" });
+          return;
+        }
+        res.setHeader("Cache-Control", "private, max-age=300");
+      } else {
+        // Public and stable: clients cache it, and the ?v= suffix changes when it is replaced.
+        res.setHeader("Cache-Control", "public, max-age=604800");
+      }
+
       const bytes = Buffer.from(avatar.data, "base64");
       res.setHeader("Content-Type", avatar.mimeType);
       res.setHeader("Content-Length", String(bytes.length));
-      // Public and stable: clients cache it, and the ?v= suffix changes when it is replaced.
-      res.setHeader("Cache-Control", "public, max-age=604800");
       res.setHeader("ETag", `"${avatar.updatedAt.getTime()}"`);
       res.send(bytes);
     } catch (error) {
