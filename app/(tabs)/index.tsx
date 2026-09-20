@@ -27,9 +27,13 @@ import { RecordingPresets, requestRecordingPermissionsAsync, setAudioModeAsync, 
 
 import { ScreenContainer } from "@/components/screen-container";
 import { EmojiPicker } from "@/components/emoji-picker";
+import { LinkPreviewCard } from "@/components/link-preview-card";
 import { VideoMessage } from "@/components/video-message";
 import { completeMention, mentionQuery, parseMentions } from "@/lib/mentions";
 import { parseRichText, type RichNode, type RichStyle } from "@/lib/rich-text";
+// Type-only, so nothing from the server bundle is pulled into the client. `lib/trpc.ts` already
+// imports a type from `@/server/routers` the same way.
+import type { ReportCategory } from "@/server/db";
 import { useColors } from "@/hooks/use-colors";
 import { useAppVisible } from "@/hooks/use-app-visible";
 import { useRealtime } from "@/hooks/use-realtime";
@@ -82,6 +86,10 @@ type Message = {
   mediaMime?: string;
   voiceDurationMs?: number;
   starred?: boolean;
+  // Personal: this reader asked that the message survive its disappearing timer.
+  kept?: boolean;
+  // Shared with the conversation: set when anyone pinned it.
+  pinnedAt?: string | null;
   viewOnce?: boolean;
   // Everything below is stored server-side. These fields used to exist as local-only flags on
   // buttons that raised a toast, which is why they are spelled out here.
@@ -105,6 +113,16 @@ const CHAT_COLORS = ["#F59E0B", "#8B5CF6", "#10B981", "#EC4899", "#0EA5E9", "#F9
 
 /** The reaction row offered when a message is long-pressed. */
 const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+
+/**
+ * The categories the report sheet offers.
+ *
+ * The server holds the authoritative list and rejects anything outside it, so this only decides what
+ * the sheet shows. `satisfies` makes a rename or removal on the server a compile error here rather
+ * than a rejection the user discovers by tapping send; an addition on the server would simply not be
+ * offered yet, which is harmless.
+ */
+const REPORT_CATEGORIES = ["spam", "abuse", "scam", "impersonation", "other"] as const satisfies readonly ReportCategory[];
 
 /** Tick glyph for one of my own messages: one tick sent, two delivered, two blue read. */
 function MessageTicks({ status, color, readColor }: { status?: "sent" | "delivered" | "read" | null; color: string; readColor: string }) {
@@ -914,6 +932,8 @@ export default function HomeScreen() {
     mediaMime: item.mediaMime ?? undefined,
     voiceDurationMs: item.voiceDurationMs ?? undefined,
     starred: item.starred,
+    kept: item.kept,
+    pinnedAt: item.pinnedAt ? new Date(item.pinnedAt).toISOString() : null,
     viewOnce: item.viewOnce === 1,
     status: item.status,
     edited: Boolean(item.editedAt),
@@ -949,6 +969,88 @@ export default function HomeScreen() {
       notify(message.starred ? "Removed from starred" : "Added to starred");
     } catch (error) {
       notify(error instanceof Error && error.message ? error.message : "Could not star that message");
+    }
+  };
+
+  // ---- pins, keeps and reports ----------------------------------------------------------
+  // Message-level actions live on the conversations router, next to the other row operations.
+  const pinMessage = trpc.conversations.pin.useMutation();
+  const keepMessage = trpc.conversations.keep.useMutation();
+  const reportMessage = trpc.reports.submit.useMutation();
+  const pinnedQuery = trpc.conversations.pinned.useQuery(
+    { conversationId: selectedId ?? "" },
+    { enabled: Boolean(selectedId) && isAuthenticated },
+  );
+  // So the pinned banner can scroll the thread to the message it names.
+  const messageListRef = useRef<FlatList<Message>>(null);
+  // The message a report is being filed about, or null while the report sheet is closed.
+  const [reportTarget, setReportTarget] = useState<Message | null>(null);
+  const [reportCategory, setReportCategory] = useState<ReportCategory>("spam");
+  const [reportNote, setReportNote] = useState("");
+
+  const togglePin = async (message: Message) => {
+    setActiveMessageId(null);
+    try {
+      await pinMessage.mutateAsync({ messageId: message.id, pinned: !message.pinnedAt });
+      await Promise.all([liveMessagesQuery.refetch(), pinnedQuery.refetch()]);
+      notify(message.pinnedAt ? "Unpinned" : "Pinned to this chat");
+    } catch (error) {
+      notify(error instanceof Error && error.message ? error.message : "Could not pin that message");
+    }
+  };
+
+  const toggleKeep = async (message: Message) => {
+    setActiveMessageId(null);
+    try {
+      await keepMessage.mutateAsync({ messageId: message.id, kept: !message.kept });
+      await liveMessagesQuery.refetch();
+      notify(message.kept ? "No longer kept" : "Kept in this chat");
+    } catch (error) {
+      notify(error instanceof Error && error.message ? error.message : "Could not keep that message");
+    }
+  };
+
+  /** Unpinning from the banner, which knows the message only by id. */
+  const unpinById = async (messageId: string) => {
+    try {
+      await pinMessage.mutateAsync({ messageId, pinned: false });
+      await Promise.all([liveMessagesQuery.refetch(), pinnedQuery.refetch()]);
+      notify("Unpinned");
+    } catch (error) {
+      notify(error instanceof Error && error.message ? error.message : "Could not unpin that message");
+    }
+  };
+
+  /**
+   * Scrolls the thread to a message the banner names.
+   *
+   * The thread is paged, so a pin from long ago may not be loaded. Saying so is better than
+   * scrolling somewhere that merely looks close.
+   */
+  const jumpToMessage = (messageId: string, loaded: Message[]) => {
+    const index = loaded.findIndex((message) => message.id === messageId);
+    if (index < 0) {
+      notify("That message is further up this chat");
+      return;
+    }
+    messageListRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.5 });
+  };
+
+  const sendReport = async () => {
+    const target = reportTarget;
+    if (!target) return;
+    try {
+      await reportMessage.mutateAsync({
+        category: reportCategory,
+        note: reportNote.trim() || undefined,
+        messageId: target.id,
+      });
+      setReportTarget(null);
+      setReportNote("");
+      setReportCategory("spam");
+      notify("Report sent for review");
+    } catch (error) {
+      notify(error instanceof Error && error.message ? error.message : "Could not send that report");
     }
   };
 
@@ -1137,6 +1239,10 @@ export default function HomeScreen() {
     const peerTyping = peerRows.some((row) => row.typingIn === selectedChat.id);
     const peerOnline = peerRows.some((row) => row.online);
     const peerLastSeen = lastSeenLabel(peerRows.find((row) => row.lastSeenAt)?.lastSeenAt ?? null);
+    // Pins are shared, so the banner shows the newest one. Anything the reader has hidden is already
+    // filtered out server-side, which is why this can be rendered without a second check.
+    const pins = pinnedQuery.data ?? [];
+    const activePin = pins[0] ?? null;
     return (
       <ScreenContainer edges={["top", "bottom", "left", "right"]} containerClassName="bg-background">
         <StatusBar style="light" />
@@ -1151,7 +1257,8 @@ export default function HomeScreen() {
             <IconButton name="call" color={colors.primary} onPress={() => void startCall({ conversationId: selectedChat.id, kind: "audio", peerName: selectedChat.name })} />
           </View>
           {showTimer ? <View style={[styles.timerSheet, { backgroundColor: colors.surface, borderColor: colors.border }]}><Text style={[styles.timerHeading, { color: colors.muted }]}>Disappearing messages</Text>{([[null, "Off"], [86400, "24 hours"], [604800, "7 days"], [7776000, "90 days"]] as Array<[number | null, string]>).map(([seconds, label]) => <Pressable key={label} onPress={() => { setShowTimer(false); if (!selectedId) return; void setDisappearing.mutateAsync({ conversationId: selectedId, seconds }).then(() => conversationListQuery.refetch()).catch((error) => notify(error instanceof Error && error.message ? error.message : "Could not update the timer")); }} style={styles.timerOption}><Text style={[styles.timerLabel, { color: (selectedChat.disappearSeconds ?? null) === seconds ? colors.primary : colors.foreground }]}>{label}</Text>{(selectedChat.disappearSeconds ?? null) === seconds ? <MaterialIcons name="check" size={17} color={colors.primary} /> : null}</Pressable>)}<Text style={[styles.timerNote, { color: colors.muted }]}>New messages disappear for everyone. Already-sent ones are left alone.</Text></View> : null}
-          <FlatList data={chatMessages} keyExtractor={(item) => item.id} contentContainerStyle={styles.messageList} showsVerticalScrollIndicator={false} ListHeaderComponent={<View style={styles.encryptionNote}><MaterialIcons name={selectedChat.disappearSeconds ? "timer" : "lock"} size={13} color={colors.muted} /><Text style={[styles.encryptionText, { color: colors.muted }]}>{selectedChat.disappearSeconds ? `Messages disappear after ${disappearLabel(selectedChat.disappearSeconds)}` : isAuthenticated ? "Live sync enabled" : "Messages are private and secure"}</Text></View>} renderItem={({ item }) => <Pressable onLongPress={() => setActiveMessageId(activeMessageId === item.id ? null : item.id)} style={[styles.messageRow, item.mine ? styles.messageRowMine : styles.messageRowTheirs]}><View style={[styles.bubble, item.mine ? [styles.bubbleMine, { backgroundColor: colors.bubbleOutgoing }] : [styles.bubbleTheirs, { backgroundColor: colors.bubbleIncoming }]]}>
+          {activePin ? <Pressable onPress={() => jumpToMessage(activePin.id, chatMessages)} style={[styles.pinBar, { backgroundColor: colors.surface, borderBottomColor: colors.border }]}><MaterialIcons name="push-pin" size={15} color={colors.primary} style={styles.pin} /><View style={styles.pinCopy}><Text style={[styles.pinSender, { color: colors.primary }]} numberOfLines={1}>{activePin.senderName}</Text><Text style={[styles.pinBody, { color: colors.muted }]} numberOfLines={1}>{activePin.body ?? activePin.mediaName ?? "Attachment"}</Text></View>{pins.length > 1 ? <Text style={[styles.pinCount, { color: colors.muted }]}>{pins.length} pinned</Text> : null}<Pressable onPress={() => void unpinById(activePin.id)} hitSlop={10}><MaterialIcons name="close" size={16} color={colors.muted} /></Pressable></Pressable> : null}
+          <FlatList ref={messageListRef} onScrollToIndexFailed={() => notify("That message is further up this chat")} data={chatMessages} keyExtractor={(item) => item.id} contentContainerStyle={styles.messageList} showsVerticalScrollIndicator={false} ListHeaderComponent={<View style={styles.encryptionNote}><MaterialIcons name={selectedChat.disappearSeconds ? "timer" : "lock"} size={13} color={colors.muted} /><Text style={[styles.encryptionText, { color: colors.muted }]}>{selectedChat.disappearSeconds ? `Messages disappear after ${disappearLabel(selectedChat.disappearSeconds)}` : isAuthenticated ? "Live sync enabled" : "Messages are private and secure"}</Text></View>} renderItem={({ item }) => <Pressable onLongPress={() => setActiveMessageId(activeMessageId === item.id ? null : item.id)} style={[styles.messageRow, item.mine ? styles.messageRowMine : styles.messageRowTheirs]}><View style={[styles.bubble, item.mine ? [styles.bubbleMine, { backgroundColor: colors.bubbleOutgoing }] : [styles.bubbleTheirs, { backgroundColor: colors.bubbleIncoming }]]}>
             {item.quote ? <View style={[styles.quoteBlock, { borderLeftColor: item.mine ? colors.bubbleOutgoingText : colors.primary }]}><Text style={[styles.quoteName, { color: item.mine ? colors.bubbleOutgoingText : colors.primary }]} numberOfLines={1}>{item.quote.senderName}</Text><Text style={[styles.quoteBody, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]} numberOfLines={2}>{item.quote.deleted ? "This message was deleted" : item.quote.body ?? item.quote.mediaName ?? "Attachment"}</Text></View> : null}
             {item.forwarded && !item.deleted ? <View style={styles.forwardRow}><MaterialIcons name="forward" size={12} color={item.mine ? colors.bubbleOutgoingText : colors.muted} /><Text style={[styles.forwardText, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>Forwarded</Text></View> : null}
             {item.deleted ? <Text style={[styles.deletedText, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>This message was deleted</Text> : null}
@@ -1165,10 +1272,12 @@ export default function HomeScreen() {
             {!item.deleted && item.kind === "poll" && item.meta?.kind === "poll" ? <PollBubble meta={item.meta} votes={item.votes ?? []} myUserId={user?.id} mine={Boolean(item.mine)} colors={colors} onVote={(index) => void castVote(item, index)} /> : null}
             {!item.deleted && item.kind === "contact" && item.meta?.kind === "contact" ? <Pressable onPress={() => openSharedContact(item.meta)} style={styles.contactCard}><View style={[styles.contactCardAvatar, { backgroundColor: chatColor(item.meta.name) }]}><Text style={styles.contactCardInitials}>{chatInitials(item.meta.name)}</Text></View><View style={styles.contactCardCopy}><Text style={[styles.contactCardName, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]} numberOfLines={1}>{item.meta.name}</Text><Text style={[styles.contactCardMeta, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]} numberOfLines={1}>{item.meta.username ? `@${item.meta.username}` : item.meta.phone ?? "Varnox contact"}</Text></View><MaterialIcons name="chat-bubble-outline" size={17} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /></Pressable> : null}
             {item.kind !== "voice" && item.kind !== "file" && item.kind !== "poll" && item.kind !== "contact" && item.kind !== "sticker" && (item.kind !== "image" || !item.mediaUrl) ? <MessageText text={item.text} names={mentionNames} style={[styles.messageText, { color: item.mine ? colors.bubbleOutgoingText : colors.foreground }]} mentionStyle={[styles.mention, { color: colors.primary }]} linkStyle={[styles.link, { color: item.mine ? colors.bubbleOutgoingText : colors.primary }]} onPressLink={openLink} /> : null}
-            <View style={styles.messageMeta}>{item.edited ? <Text style={[styles.editedTag, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>edited</Text> : null}<Text style={[styles.messageTime, { color: item.mine ? colors.bubbleOutgoingText : colors.muted, opacity: item.mine ? 0.75 : 1 }]}>{item.time}</Text>{item.starred ? <MaterialIcons name="star" size={13} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /> : null}<MessageTicks status={item.status} color={item.mine ? colors.bubbleOutgoingText : colors.muted} readColor="#53BDEB" /></View>
-          </View>{item.reactions && item.reactions.length > 0 ? <View style={styles.reactionRow}>{item.reactions.map((reaction) => <View key={`${item.id}-${reaction.userId}`} style={[styles.reactionChip, { backgroundColor: colors.surface, borderColor: colors.border }]}><Text style={styles.reactionEmoji}>{reaction.emoji}</Text></View>)}</View> : null}{reactingToId === item.id ? <View style={[styles.reactionPicker, { backgroundColor: colors.surface, borderColor: colors.border }]}>{REACTION_EMOJIS.map((emoji) => <Pressable key={emoji} onPress={() => void applyReaction(item, emoji)} hitSlop={6}><Text style={styles.reactionEmoji}>{emoji}</Text></Pressable>)}</View> : null}{activeMessageId === item.id ? <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.actionsScroll} contentContainerStyle={[styles.messageActions, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => { setReplyTo({ id: item.id, text: item.text, senderName: item.mine ? "You" : selectedChat.name }); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Reply</Text></Pressable><Pressable onPress={() => { setReactingToId(item.id); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>React</Text></Pressable><Pressable onPress={() => void toggleStar(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>{item.starred ? "Unstar" : "Star"}</Text></Pressable><Pressable onPress={() => { setForwarding(item); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Forward</Text></Pressable>{item.kind === "image" && item.mediaUrl && !item.viewOnce ? <Pressable onPress={() => { setActiveMessageId(null); void saveAsSticker(item); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Save as sticker</Text></Pressable> : null}{item.mine && !item.deleted && item.kind === "text" ? <Pressable onPress={() => beginEdit(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>Edit</Text></Pressable> : null}<Pressable onPress={() => void deleteMessage(item, false)}><Text style={[styles.actionText, { color: colors.foreground }]}>Delete for me</Text></Pressable>{item.mine && !item.deleted ? <Pressable onPress={() => void deleteMessage(item, true)}><Text style={[styles.actionText, { color: colors.error }]}>Delete for everyone</Text></Pressable> : null}</ScrollView> : null}</Pressable>} />
+            {!item.deleted && item.kind === "text" && item.text ? <LinkPreviewCard text={item.text} mine={Boolean(item.mine)} /> : null}
+            <View style={styles.messageMeta}>{item.edited ? <Text style={[styles.editedTag, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>edited</Text> : null}<Text style={[styles.messageTime, { color: item.mine ? colors.bubbleOutgoingText : colors.muted, opacity: item.mine ? 0.75 : 1 }]}>{item.time}</Text>{item.starred ? <MaterialIcons name="star" size={13} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /> : null}{item.kept ? <MaterialIcons name="bookmark" size={13} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /> : null}<MessageTicks status={item.status} color={item.mine ? colors.bubbleOutgoingText : colors.muted} readColor="#53BDEB" /></View>
+          </View>{item.reactions && item.reactions.length > 0 ? <View style={styles.reactionRow}>{item.reactions.map((reaction) => <View key={`${item.id}-${reaction.userId}`} style={[styles.reactionChip, { backgroundColor: colors.surface, borderColor: colors.border }]}><Text style={styles.reactionEmoji}>{reaction.emoji}</Text></View>)}</View> : null}{reactingToId === item.id ? <View style={[styles.reactionPicker, { backgroundColor: colors.surface, borderColor: colors.border }]}>{REACTION_EMOJIS.map((emoji) => <Pressable key={emoji} onPress={() => void applyReaction(item, emoji)} hitSlop={6}><Text style={styles.reactionEmoji}>{emoji}</Text></Pressable>)}</View> : null}{activeMessageId === item.id ? <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.actionsScroll} contentContainerStyle={[styles.messageActions, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => { setReplyTo({ id: item.id, text: item.text, senderName: item.mine ? "You" : selectedChat.name }); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Reply</Text></Pressable><Pressable onPress={() => { setReactingToId(item.id); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>React</Text></Pressable><Pressable onPress={() => void toggleStar(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>{item.starred ? "Unstar" : "Star"}</Text></Pressable><Pressable onPress={() => { setForwarding(item); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Forward</Text></Pressable><Pressable onPress={() => void togglePin(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>{item.pinnedAt ? "Unpin" : "Pin"}</Text></Pressable>{item.expiresAt ? <Pressable onPress={() => void toggleKeep(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>{item.kept ? "Stop keeping" : "Keep in chat"}</Text></Pressable> : null}{item.kind === "image" && item.mediaUrl && !item.viewOnce ? <Pressable onPress={() => { setActiveMessageId(null); void saveAsSticker(item); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Save as sticker</Text></Pressable> : null}{item.mine && !item.deleted && item.kind === "text" ? <Pressable onPress={() => beginEdit(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>Edit</Text></Pressable> : null}<Pressable onPress={() => void deleteMessage(item, false)}><Text style={[styles.actionText, { color: colors.foreground }]}>Delete for me</Text></Pressable>{item.mine && !item.deleted ? <Pressable onPress={() => void deleteMessage(item, true)}><Text style={[styles.actionText, { color: colors.error }]}>Delete for everyone</Text></Pressable> : null}{!item.mine && !item.deleted ? <Pressable onPress={() => { setReportTarget(item); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.error }]}>Report</Text></Pressable> : null}</ScrollView> : null}</Pressable>} />
           <View style={[styles.composerArea, { borderTopColor: colors.border, backgroundColor: colors.background }]}>{editingId ? <Pressable onPress={() => { setEditingId(null); setComposerText(""); }} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>Editing message</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{composerText}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : replyTo ? <Pressable onPress={() => setReplyTo(null)} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>{replyTo.senderName}</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{replyTo.text}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : null}{mentionSuggestions.length > 0 ? <View style={[styles.mentionBar, { backgroundColor: colors.surface, borderColor: colors.border }]}>{mentionSuggestions.map((name) => <Pressable key={name} onPress={() => setComposerText((current) => completeMention(current, name))} style={[styles.mentionChip, { borderColor: colors.border }]}><Text style={[styles.mentionChipText, { color: colors.primary }]}>{name}</Text></Pressable>)}</View> : null}<View style={[styles.composer, { backgroundColor: colors.surface, borderColor: colors.border }]}><IconButton name="add" color={colors.muted} onPress={() => setShowAttach((current) => !current)} /><Pressable onPress={() => setViewOnce(!viewOnce)} style={[styles.viewOnce, viewOnce && { backgroundColor: colors.primary }]}><Text style={[styles.viewOnceText, { color: viewOnce ? "#FFFFFF" : colors.muted }]}>1</Text></Pressable><TextInput value={composerText} onChangeText={onComposerChange} onSelectionChange={(event) => setComposerSelection(event.nativeEvent.selection)} placeholder={editingId ? "Edit message" : "Write a message"} placeholderTextColor={colors.muted} style={[styles.composerInput, { color: colors.foreground }]} multiline maxLength={500} /><IconButton name="mood" color={showEmoji ? colors.primary : colors.muted} onPress={() => { setShowAttach(false); setShowEmoji((current) => !current); }} /></View>{showEmoji ? <EmojiPicker colors={colors} onSelect={insertEmoji} onClose={() => setShowEmoji(false)} /> : null}{showAttach ? <View style={styles.attachSheet}><Pressable onPress={() => { setShowAttach(false); void shareMedia(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="perm-media" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Photo or video</Text></Pressable><Pressable onPress={() => { setShowAttach(false); void shareDocument(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="attach-file" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Document</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setPollDraft({ question: "", options: ["", ""] }); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="poll" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Poll</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setShowShareContact(true); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="contact-page" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Contact</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setShowStickers(true); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="emoji-emotions" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Sticker</Text></Pressable></View> : null}<Pressable onPress={editingId ? () => void saveEdit() : composerText.trim() ? () => void sendMessage() : recorderState.isRecording ? () => void stopVoiceNote() : () => void startVoiceNote()} style={({ pressed }) => [styles.sendButton, { backgroundColor: recorderState.isRecording ? colors.error : colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name={editingId ? "check" : composerText.trim() ? "send" : recorderState.isRecording ? "stop" : "mic"} size={21} color="#FFFFFF" /></Pressable></View>
           {onceVideo ? <View style={styles.overlay}><VideoMessage uri={onceVideo} style={styles.overlayVideo} /><Text style={styles.overlayNote}>This video can only be opened once. The stored copy has already been removed.</Text><Pressable onPress={() => setOnceVideo(null)} style={styles.overlayClose}><Text style={styles.overlayCloseText}>Close</Text></Pressable></View> : null}
+          {reportTarget ? <View style={[styles.contactSheet, { backgroundColor: colors.background, borderColor: colors.border }]}><View style={styles.contactHeader}><View><Text style={[styles.contactTitle, { color: colors.foreground }]}>Report this message</Text><Text style={[styles.contactSubtitle, { color: colors.muted }]}>A moderator sees a copy of it, even if it is deleted later</Text></View><IconButton name="close" color={colors.foreground} onPress={() => setReportTarget(null)} /></View><ScrollView contentContainerStyle={styles.pollBuilder} keyboardShouldPersistTaps="handled"><View style={[styles.reportQuote, { borderColor: colors.border, backgroundColor: colors.surface }]}><Text style={[styles.reportQuoteText, { color: colors.muted }]} numberOfLines={3}>{reportTarget.text}</Text></View><View style={styles.reportChips}>{REPORT_CATEGORIES.map((category) => <Pressable key={category} onPress={() => setReportCategory(category)} style={[styles.reportChip, { borderColor: reportCategory === category ? colors.primary : colors.border, backgroundColor: reportCategory === category ? colors.primary : colors.surface }]}><Text style={[styles.reportChipText, { color: reportCategory === category ? "#FFFFFF" : colors.foreground }]}>{category}</Text></Pressable>)}</View><TextInput value={reportNote} onChangeText={setReportNote} placeholder="Anything the moderator should know (optional)" placeholderTextColor={colors.muted} style={[styles.pollInput, { color: colors.foreground, borderColor: colors.border, backgroundColor: colors.surface }]} multiline maxLength={1000} /><Pressable onPress={() => void sendReport()} disabled={reportMessage.isPending} style={({ pressed }) => [styles.pollSend, { backgroundColor: colors.error }, pressed && styles.sendPressed]}><MaterialIcons name="send" size={18} color="#FFFFFF" /><Text style={styles.reportSendText}>{reportMessage.isPending ? "Sending…" : "Send report"}</Text></Pressable></ScrollView></View> : null}
           {showStickers ? <View style={[styles.contactSheet, { backgroundColor: colors.background, borderColor: colors.border }]}><View style={styles.contactHeader}><View><Text style={[styles.contactTitle, { color: colors.foreground }]}>Stickers</Text><Text style={[styles.contactSubtitle, { color: colors.muted }]}>Long-press a photo in a chat and choose Save as sticker</Text></View><IconButton name="close" color={colors.foreground} onPress={() => setShowStickers(false)} /></View><FlatList data={stickersQuery.data ?? []} keyExtractor={(item) => item.id} numColumns={4} columnWrapperStyle={styles.stickerRow} contentContainerStyle={styles.stickerGrid} ListEmptyComponent={<Text style={[styles.emptyCopy, { color: colors.muted }]}>{stickersQuery.isLoading ? "Loading…" : "No stickers yet. Save one from a photo you have sent or received."}</Text>} renderItem={({ item }) => <Pressable onPress={() => void sendSticker(item.id)} style={({ pressed }) => [styles.stickerTile, { backgroundColor: colors.surface, borderColor: colors.border }, pressed && styles.rowPressed]}><Image source={{ uri: `/api/sticker/${item.id}` }} style={styles.stickerThumb} resizeMode="contain" /></Pressable>} /></View> : null}
       {showShareContact ? <View style={[styles.contactSheet, { backgroundColor: colors.background, borderColor: colors.border }]}><View style={styles.contactHeader}><View><Text style={[styles.contactTitle, { color: colors.foreground }]}>Share a contact</Text><Text style={[styles.contactSubtitle, { color: colors.muted }]}>Send a Varnox account as a card</Text></View><IconButton name="close" color={colors.foreground} onPress={() => setShowShareContact(false)} /></View><View style={[styles.searchWrap, styles.contactSearch, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="search" size={20} color={colors.muted}/><TextInput value={contactQuery} onChangeText={setContactQuery} placeholder="Search by name or username" placeholderTextColor={colors.muted} style={[styles.searchInput, { color: colors.foreground }]}/></View><FlatList data={remotePeople} keyExtractor={(item) => item.id} contentContainerStyle={styles.contactList} ListEmptyComponent={<Text style={[styles.emptyCopy, { color: colors.muted }]}>{contactQuery.trim().length < 2 ? "Type at least two characters to search." : peopleSearch.isFetching ? "Searching…" : `No Varnox account matches “${contactQuery.trim()}”.`}</Text>} renderItem={({ item }) => <Pressable onPress={() => void sendContactCard(item)} style={({ pressed }) => [styles.contactRow, pressed && styles.rowPressed]}><View style={[styles.contactAvatar, { backgroundColor: item.color }]}><Text style={styles.contactInitials}>{item.initials}</Text></View><View style={styles.contactCopy}><Text style={[styles.chatName, { color: colors.foreground }]} numberOfLines={1}>{item.name}</Text><Text style={[styles.chatPreview, { color: colors.muted }]} numberOfLines={1}>{item.username ? `@${item.username}` : item.email ?? "Varnox account"}</Text></View><MaterialIcons name="send" size={18} color={colors.primary} /></Pressable>} /></View> : null}
           {pollDraft ? <View style={[styles.contactSheet, { backgroundColor: colors.background, borderColor: colors.border }]}><View style={styles.contactHeader}><View><Text style={[styles.contactTitle, { color: colors.foreground }]}>New poll</Text><Text style={[styles.contactSubtitle, { color: colors.muted }]}>One question, at least two answers</Text></View><IconButton name="close" color={colors.foreground} onPress={() => setPollDraft(null)} /></View><ScrollView contentContainerStyle={styles.pollBuilder} keyboardShouldPersistTaps="handled"><TextInput value={pollDraft.question} onChangeText={(question) => setPollDraft((current) => (current ? { ...current, question } : current))} placeholder="Question" placeholderTextColor={colors.muted} style={[styles.pollInput, { color: colors.foreground, borderColor: colors.border, backgroundColor: colors.surface }]} maxLength={300} />{pollDraft.options.map((option, index) => <TextInput key={`poll-option-${index}`} value={option} onChangeText={(value) => setPollDraft((current) => (current ? { ...current, options: current.options.map((existing, position) => (position === index ? value : existing)) } : current))} placeholder={`Answer ${index + 1}`} placeholderTextColor={colors.muted} style={[styles.pollInput, { color: colors.foreground, borderColor: colors.border, backgroundColor: colors.surface }]} maxLength={120} />)}{pollDraft.options.length < 12 ? <Pressable onPress={() => setPollDraft((current) => (current ? { ...current, options: [...current.options, ""] } : current))} style={({ pressed }) => [styles.pollAddOption, pressed && styles.rowPressed]}><MaterialIcons name="add" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.primary }]}>Add answer</Text></Pressable> : null}<Pressable onPress={() => void sendPoll()} style={({ pressed }) => [styles.pollSend, { backgroundColor: colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name="send" size={18} color="#FFFFFF" /><Text style={styles.pollSendText}>Create poll</Text></Pressable></ScrollView></View> : null}
@@ -1206,6 +1315,17 @@ const styles = StyleSheet.create({
   fileMeta: { fontSize: 11.5, marginTop: 2 },
   overlayVideo: { width: "88%", height: "70%", borderRadius: 14, backgroundColor: "#000" },
   mention: { fontWeight: "800" }, link: { textDecorationLine: "underline" },
+  pinBar: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 9, borderBottomWidth: StyleSheet.hairlineWidth },
+  pinCopy: { flex: 1 },
+  pinSender: { fontSize: 11.5, fontWeight: "800" },
+  pinBody: { fontSize: 12, marginTop: 2 },
+  pinCount: { fontSize: 11, fontWeight: "700" },
+  reportQuote: { borderWidth: 1, borderRadius: 12, padding: 12, marginBottom: 12 },
+  reportQuoteText: { fontSize: 13, lineHeight: 19 },
+  reportChips: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 12 },
+  reportChip: { borderWidth: 1, borderRadius: 15, paddingHorizontal: 13, paddingVertical: 7 },
+  reportChipText: { fontSize: 12.5, fontWeight: "700", textTransform: "capitalize" },
+  reportSendText: { color: "#FFFFFF", fontSize: 14, fontWeight: "800" },
   mentionBar: { flexDirection: "row", flexWrap: "wrap", gap: 6, marginHorizontal: 14, marginBottom: 8, padding: 8, borderRadius: 12, borderWidth: 1 },
   mentionChip: { borderWidth: 1, borderRadius: 10, paddingHorizontal: 9, paddingVertical: 5 },
   mentionChipText: { fontSize: 12.5, fontWeight: "700" },
