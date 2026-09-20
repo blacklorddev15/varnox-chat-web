@@ -1,7 +1,9 @@
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { useLocalSearchParams, useRouter } from "expo-router";
-import { useState } from "react";
-import { ActivityIndicator, Alert, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { useState, type ComponentProps } from "react";
+import * as ImagePicker from "expo-image-picker";
+import { ActivityIndicator, Alert, Image, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { groupIconUrl, shortTime } from "@/lib/media-url";
 import { ScreenContainer } from "@/components/screen-container";
 import { useColors } from "@/hooks/use-colors";
 import { trpc } from "@/lib/trpc";
@@ -22,6 +24,20 @@ function initialFor(member: Member): string {
   const parts = text.split(/\s+/).filter(Boolean);
   return (parts.length > 1 ? parts[0][0] + parts[1][0] : text.slice(0, 2)).toUpperCase();
 }
+
+type IconName = ComponentProps<typeof MaterialIcons>["name"];
+
+/** One icon per event kind, so the log can be scanned without reading every line of it. */
+const ACTIVITY_ICONS: Record<string, IconName> = {
+  created: "group",
+  "member-add": "person-add",
+  "member-remove": "person-remove",
+  "member-leave": "logout",
+  "join-approved": "how-to-reg",
+  "role-change": "admin-panel-settings",
+  "icon-change": "photo-camera",
+  "info-change": "edit",
+};
 
 /** Group settings: members, owner/admin roles, add and remove. */
 export default function GroupInfoScreen() {
@@ -55,6 +71,99 @@ export default function GroupInfoScreen() {
   const canManage = isOwner || myRole === "admin";
   const busy = setRole.isPending || removeMember.isPending || addMembers.isPending || setDescription.isPending || leave.isPending;
   const description = membersQuery.data?.description ?? null;
+
+  // ---- group photo ------------------------------------------------------------------------
+  const iconVersions = trpc.conversations.iconVersions.useQuery();
+  const setIcon = trpc.conversations.setIcon.useMutation();
+  const clearIcon = trpc.conversations.clearIcon.useMutation();
+  const [iconBusy, setIconBusy] = useState(false);
+
+  // Undefined means this group has no photo: iconVersions only lists conversations that have one,
+  // so there is no "still loading" state to distinguish here.
+  const iconUrl = groupIconUrl(
+    conversationId,
+    iconVersions.data?.find((row) => row.conversationId === conversationId)?.updatedAt ?? null,
+  );
+
+  /** Mirrors the server's ceiling, so an oversized pick is refused before anything is uploaded. */
+  const MAX_ICON_BYTES = 4 * 1024 * 1024;
+
+  const changeIcon = async () => {
+    if (!canManage) return;
+    setStatus(null);
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        setStatus("Photo access is needed to choose a group photo.");
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        quality: 0.7,
+        // Square, because a group photo is always rendered in a circle.
+        allowsEditing: true,
+        aspect: [1, 1],
+        base64: true,
+      });
+      const asset = result.canceled ? null : result.assets?.[0];
+      if (!asset?.base64) return;
+      if (Math.floor((asset.base64.length * 3) / 4) > MAX_ICON_BYTES) {
+        setStatus("That image is larger than 4 MB. Pick a smaller one.");
+        return;
+      }
+      setIconBusy(true);
+      await setIcon.mutateAsync({ conversationId, mimeType: asset.mimeType ?? "image/jpeg", data: asset.base64 });
+      await iconVersions.refetch();
+      setStatus("Group photo updated.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not update the group photo");
+    } finally {
+      setIconBusy(false);
+    }
+  };
+
+  const removeIcon = async () => {
+    if (!canManage) return;
+    setIconBusy(true);
+    try {
+      await clearIcon.mutateAsync({ conversationId });
+      await iconVersions.refetch();
+      setStatus("Group photo removed.");
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not remove the group photo");
+    } finally {
+      setIconBusy(false);
+    }
+  };
+
+  // ---- activity ---------------------------------------------------------------------------
+  const activity = trpc.conversations.activity.useQuery({ conversationId }, { enabled: conversationId.length > 0 });
+
+  /** One line per event, phrased from the reader's point of view. */
+  const describeEvent = (event: { kind: string; actorName?: string | null; actorUsername?: string | null; targetUserId?: number | null; detail?: string | null }): string => {
+    const who = event.actorName?.trim() || event.actorUsername || "Someone";
+    // A target is shown by name when they are still a member, and by id when they have left.
+    const targetMember = event.targetUserId ? members.find((member) => member.userId === event.targetUserId) : undefined;
+    const target = targetMember ? label(targetMember) : event.targetUserId ? `user ${event.targetUserId}` : null;
+    switch (event.kind) {
+      case "member-add":
+        return `${who} added ${target ?? "someone"}`;
+      case "member-remove":
+        return `${who} removed ${target ?? "someone"}`;
+      case "member-leave":
+        return `${who} left`;
+      case "role-change":
+        return `${who} made ${target ?? "someone"} ${event.detail ?? "an admin"}`;
+      case "icon-change":
+        return event.detail ? `${who} ${event.detail}` : `${who} changed the group photo`;
+      case "info-change":
+        return event.detail ? `${who} ${event.detail}` : `${who} updated the group`;
+      case "created":
+        return `${who} created this group`;
+      default:
+        return `${who} ${event.detail ?? "changed something"}`;
+    }
+  };
 
   const refresh = () => membersQuery.refetch();
 
@@ -122,6 +231,39 @@ export default function GroupInfoScreen() {
         {membersQuery.error ? (
           <Text style={[styles.error, { color: "#EF4444" }]}>{membersQuery.error.message}</Text>
         ) : null}
+
+        <Text style={[styles.section, { color: colors.muted }]}>GROUP PHOTO</Text>
+        <View style={styles.photoRow}>
+          {iconUrl ? (
+            <Image source={{ uri: iconUrl }} style={styles.photo} />
+          ) : (
+            // Falls back to an icon rather than the group's initials: this screen does not have the
+            // member list rendered as an avatar anywhere else, so initials here would be a new
+            // invention rather than a match for how the group looks in the chat list.
+            <View style={[styles.photo, styles.photoEmpty, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+              <MaterialIcons name="group" size={26} color={colors.muted} />
+            </View>
+          )}
+          <View style={styles.photoActions}>
+            <Pressable
+              disabled={!canManage || iconBusy}
+              onPress={() => void changeIcon()}
+              style={[styles.action, { borderColor: colors.border, opacity: canManage ? 1 : 0.45 }]}
+            >
+              <Text style={[styles.actionText, { color: colors.primary }]}>
+                {iconBusy ? "Working…" : iconUrl ? "Change photo" : "Add photo"}
+              </Text>
+            </Pressable>
+            {iconUrl && canManage ? (
+              <Pressable disabled={iconBusy} onPress={() => void removeIcon()} style={[styles.action, { borderColor: colors.border }]}>
+                <Text style={[styles.actionText, { color: "#EF4444" }]}>Remove</Text>
+              </Pressable>
+            ) : null}
+            {!canManage ? (
+              <Text style={[styles.photoHint, { color: colors.muted }]}>Only admins can change the group photo.</Text>
+            ) : null}
+          </View>
+        </View>
 
         <Text style={[styles.section, { color: colors.muted }]}>DESCRIPTION</Text>
         {editingDescription ? (
@@ -289,6 +431,23 @@ export default function GroupInfoScreen() {
           <Text style={styles.leaveText}>Leave group</Text>
         </Pressable>
 
+        <Text style={[styles.section, { color: colors.muted }]}>RECENT ACTIVITY</Text>
+        {activity.data?.length ? (
+          activity.data.map((event) => (
+            <View key={event.id} style={styles.activityRow}>
+              <MaterialIcons name={ACTIVITY_ICONS[event.kind] ?? "history"} size={15} color={colors.muted} />
+              <Text style={[styles.activityText, { color: colors.foreground }]}>{describeEvent(event)}</Text>
+              <Text style={[styles.activityTime, { color: colors.muted }]}>{shortTime(event.createdAt)}</Text>
+            </View>
+          ))
+        ) : activity.isLoading ? (
+          <ActivityIndicator color={colors.primary} />
+        ) : (
+          <Text style={[styles.activityEmpty, { color: colors.muted }]}>
+            Nothing has happened in this group yet. Members joining, leaving and role changes will be listed here.
+          </Text>
+        )}
+
         {status ? <Text style={[styles.error, { color: colors.muted }]}>{status}</Text> : null}
       </ScrollView>
     </ScreenContainer>
@@ -309,6 +468,15 @@ const styles = StyleSheet.create({
   copy: { flex: 1 },
   name: { fontSize: 15, fontWeight: "700" },
   role: { fontSize: 12, marginTop: 3, fontWeight: "600" },
+  photoRow: { flexDirection: "row", alignItems: "center", gap: 14 },
+  photo: { width: 84, height: 84, borderRadius: 42, overflow: "hidden" },
+  photoEmpty: { borderWidth: 1, alignItems: "center", justifyContent: "center" },
+  photoActions: { flex: 1, gap: 8, alignItems: "flex-start" },
+  photoHint: { fontSize: 11.5, lineHeight: 16 },
+  activityRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 9, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: "rgba(127,127,127,0.2)" },
+  activityText: { flex: 1, fontSize: 13, lineHeight: 18 },
+  activityTime: { fontSize: 11 },
+  activityEmpty: { fontSize: 12.5, lineHeight: 18 },
   action: { borderWidth: 1, borderRadius: 12, paddingHorizontal: 11, paddingVertical: 7 },
   actionText: { fontSize: 12, fontWeight: "800" },
   searchWrap: { height: 48, borderRadius: 16, paddingHorizontal: 14, flexDirection: "row", alignItems: "center", borderWidth: 1 },

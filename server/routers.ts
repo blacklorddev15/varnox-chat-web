@@ -462,6 +462,8 @@ export const appRouter = router({
     leave: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
       const role = await getConversationRole(input.conversationId, ctx.user.id);
       if (!role) throw new Error("You are not a member of this group");
+      // Logged before the removal lands, so the actor is still resolvable by name in the log's join.
+      void logGroupEvent(input.conversationId, ctx.user.id, "member-leave");
       const outcome = await leaveGroup(input.conversationId, ctx.user.id);
       // Tell the others, so their member list is right without waiting for a poll.
       void nudgeConversation(input.conversationId, ctx.user.id, "members");
@@ -472,6 +474,7 @@ export const appRouter = router({
       if (!access) throw new Error("You are not a member of this group");
       if (!permitted(access.whoCanEditInfo, access.role)) throw new Error("Only group admins can change the description");
       await setConversationDescription(input.conversationId, input.description || null);
+      void logGroupEvent(input.conversationId, ctx.user.id, "info-change", null, input.description ? "changed the description" : "cleared the description");
       return { ok: true as const };
     }),
     setDisappearing: protectedProcedure.input(z.object({ conversationId: z.string().min(1), seconds: z.number().int().min(0).max(7776000).nullable() })).mutation(async ({ ctx, input }) => {

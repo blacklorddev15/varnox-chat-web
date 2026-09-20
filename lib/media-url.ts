@@ -22,6 +22,20 @@ export function avatarUrl(userId: number, avatarUpdatedAt?: string | Date | null
   return resolveMediaUrl(`/api/avatar/${userId}?v=${encodeURIComponent(stamp)}`);
 }
 
+/**
+ * Group or community photo.
+ *
+ * Deliberately the same shape as `avatarUrl`, including the version in the URL: an <Image> caches by
+ * URL, so without it a replaced group photo would keep showing the old one until the cache expired.
+ * The version comes from `conversations.iconVersions`, which only lists conversations with a photo,
+ * so an undefined result here means "this group has no photo" rather than "not loaded yet".
+ */
+export function groupIconUrl(conversationId: string, iconUpdatedAt?: string | Date | null): string | undefined {
+  if (!conversationId || !iconUpdatedAt) return undefined;
+  const stamp = typeof iconUpdatedAt === "string" ? iconUpdatedAt : iconUpdatedAt.toISOString();
+  return resolveMediaUrl(`/api/group-icon/${conversationId}?v=${encodeURIComponent(stamp)}`);
+}
+
 /** "3h", "2d" - the short stamps the updates list shows. */
 export function shortTime(value?: string | Date | null): string {
   if (!value) return "";
