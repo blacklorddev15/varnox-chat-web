@@ -260,6 +260,25 @@ export const catalogItems = pgTable("catalogItems", {
 //
 // The code is the entire credential, so it is single-use, short-lived and deliberately short enough
 // to type: whoever holds it can add a device to the account that issued it.
+// A browser push subscription, for notifications with the page closed.
+//
+// Three parts and none are interchangeable: the endpoint is the delivery address, and the two keys
+// are what encrypt the payload so that only that browser can read it - the push service relays a
+// blob it cannot open. `endpoint` is text rather than varchar because FCM endpoints are long and a
+// truncation here would be a subscription that silently never receives anything.
+//
+// Its own table rather than a row in pushTokens: a native push token is one opaque string, while
+// this is a compound value, and squeezing it into a varchar would mean encoding and decoding it.
+export const webPushSubscriptions = pgTable("webPushSubscriptions", {
+  id: serial("id").primaryKey(),
+  userId: integer("userId").notNull(),
+  endpoint: text("endpoint").notNull().unique(),
+  p256dh: text("p256dh").notNull(),
+  auth: text("auth").notNull(),
+  createdAt: timestamp("createdAt").defaultNow().notNull(),
+  updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+});
+
 export const deviceLinkCodes = pgTable("deviceLinkCodes", {
   code: varchar("code", { length: 16 }).primaryKey(),
   userId: integer("userId").notNull(),

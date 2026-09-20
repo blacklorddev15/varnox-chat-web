@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, ilike, inArray, isNotNull, isNull, like, lt, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, broadcastLists, broadcastRecipients, calls, catalogItems, channelFollowers, channelPosts, channels, communities, communityGroups, contacts, conversationIcons, conversationMembers, conversations, deviceLinkCodes, eventRsvps, events, groupEvents, InsertUser, inviteLinks, joinRequests, linkPreviews, liveLocations, messageHides, messageKeeps, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, reports, sessions, statusUpdates, statusViews, stickers, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, broadcastLists, broadcastRecipients, calls, catalogItems, webPushSubscriptions, channelFollowers, channelPosts, channels, communities, communityGroups, contacts, conversationIcons, conversationMembers, conversations, deviceLinkCodes, eventRsvps, events, groupEvents, InsertUser, inviteLinks, joinRequests, linkPreviews, liveLocations, messageHides, messageKeeps, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, reports, sessions, statusUpdates, statusViews, stickers, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -838,6 +838,67 @@ export async function consumeDeviceLinkCode(code: string): Promise<number | null
     .where(and(eq(deviceLinkCodes.code, normalised), isNull(deviceLinkCodes.usedAt), gt(deviceLinkCodes.expiresAt, new Date())))
     .returning({ userId: deviceLinkCodes.userId });
   return rows[0]?.userId ?? null;
+}
+
+// ---------------------------------------------------------------- web push
+/**
+ * Records a browser subscription.
+ *
+ * Upserted on the endpoint, because a browser that subscribes twice produces the same endpoint with
+ * possibly rotated keys. A duplicate row would mean two notifications for one message.
+ */
+export async function saveWebPushSubscription(userId: number, endpoint: string, p256dh: string, auth: string): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  await db
+    .insert(webPushSubscriptions)
+    .values({ userId, endpoint, p256dh, auth })
+    .onConflictDoUpdate({ target: webPushSubscriptions.endpoint, set: { userId, p256dh, auth, updatedAt: new Date() } });
+  return true;
+}
+
+export async function deleteWebPushSubscription(endpoint: string) {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(webPushSubscriptions).where(eq(webPushSubscriptions.endpoint, endpoint));
+}
+
+/**
+ * Unsubscribing, scoped to the caller.
+ *
+ * The endpoint alone would be enough to find the row, but scoping by user means one account cannot
+ * delete another's subscription by presenting an endpoint it should not have.
+ */
+export async function deleteOwnWebPushSubscription(userId: number, endpoint: string) {
+  const db = await getDb();
+  if (!db) return;
+  await db.delete(webPushSubscriptions).where(and(eq(webPushSubscriptions.userId, userId), eq(webPushSubscriptions.endpoint, endpoint)));
+}
+
+/** Whether this user has a browser subscribed, so the settings screen can show the true state. */
+export async function hasWebPushSubscription(userId: number): Promise<boolean> {
+  const db = await getDb();
+  if (!db) return false;
+  const rows = await db.select({ id: webPushSubscriptions.id }).from(webPushSubscriptions).where(eq(webPushSubscriptions.userId, userId)).limit(1);
+  return rows.length > 0;
+}
+
+/**
+ * Subscriptions for these people, gated by the same per-category switch the native tokens use.
+ *
+ * The predicate matches listPushTokensForPreference deliberately: a person who has turned group
+ * notifications off should not hear about a group by a different route just because they happen to
+ * have a browser subscribed as well as a device.
+ */
+export async function listWebPushSubscriptionsForPreference(userIds: number[], category: "messages" | "groups" | "calls") {
+  const db = await getDb();
+  if (!db || userIds.length === 0) return [];
+  const field = category === "messages" ? userSettings.notificationsMessages : category === "groups" ? userSettings.notificationsGroups : userSettings.notificationsCalls;
+  return db
+    .select({ endpoint: webPushSubscriptions.endpoint, p256dh: webPushSubscriptions.p256dh, auth: webPushSubscriptions.auth })
+    .from(webPushSubscriptions)
+    .leftJoin(userSettings, eq(userSettings.userId, webPushSubscriptions.userId))
+    .where(and(inArray(webPushSubscriptions.userId, userIds), or(eq(field, 1), eq(field, null as never))));
 }
 
 // ---------------------------------------------------------------- privacy

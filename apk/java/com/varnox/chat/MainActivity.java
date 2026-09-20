@@ -23,6 +23,7 @@ import android.webkit.PermissionRequest;
 import android.webkit.SslErrorHandler;
 import android.webkit.URLUtil;
 import android.webkit.ValueCallback;
+import android.webkit.GeolocationPermissions;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
@@ -48,12 +49,18 @@ public class MainActivity extends Activity {
 
     private static final int REQ_FILE_CHOOSER = 1001;
     private static final int REQ_RUNTIME_PERMISSIONS = 1002;
+    private static final int REQ_GEO_PERMISSION = 1003;
 
     private WebView webView;
     private ProgressBar progressBar;
     private ValueCallback<Uri[]> pendingFileCallback;
     private PermissionRequest pendingPermissionRequest;
     private NotificationBridge notificationBridge;
+    // Geolocation takes its own pending slot rather than sharing pendingPermissionRequest, because a
+    // location prompt and a camera prompt are different callback types that can be outstanding at
+    // once - a call can start while a live location is being shared.
+    private GeolocationPermissions.Callback pendingGeoCallback;
+    private String pendingGeoOrigin;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -107,7 +114,11 @@ public class MainActivity extends Activity {
         settings.setDisplayZoomControls(false);
         settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(true);
-        settings.setGeolocationEnabled(false);
+        // On, so the page's navigator.geolocation works. This alone is not enough: Android also
+        // requires the runtime permission and an answered onGeolocationPermissionsShowPrompt, and
+        // without all three the call fails silently rather than reporting anything useful.
+        // The site asks for a position only when somebody starts a live location share.
+        settings.setGeolocationEnabled(true);
         // Voice notes / video playback inside chat should not need an extra tap.
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
@@ -202,6 +213,22 @@ public class MainActivity extends Activity {
                     pendingPermissionRequest = null;
                 }
             }
+
+            /**
+             * Android will not hand a page a position unless this is answered, even with
+             * setGeolocationEnabled(true) and the permission granted. Missing this override is why
+             * geolocation "does not work" in WebView shells that look correctly configured.
+             */
+            @Override
+            public void onGeolocationPermissionsShowPrompt(final String origin,
+                                                           final GeolocationPermissions.Callback callback) {
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        handleGeolocationPrompt(origin, callback);
+                    }
+                });
+            }
         });
 
         webView.setDownloadListener(new DownloadListener() {
@@ -274,6 +301,63 @@ public class MainActivity extends Activity {
         requestRuntimePermissions(needsCamera, needsMic);
     }
 
+    /**
+     * Answers the WebView's geolocation prompt.
+     *
+     * The permission is requested only when the page actually asks for a position, which is when
+     * somebody starts a live location share - not on launch. An app that demands location on first
+     * run is one people uninstall.
+     */
+    private void handleGeolocationPrompt(String origin, GeolocationPermissions.Callback callback) {
+        if (hasLocationPermission()) {
+            callback.invoke(origin, true, false);
+            return;
+        }
+
+        pendingGeoOrigin = origin;
+        pendingGeoCallback = callback;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            requestPermissions(new String[] {
+                    android.Manifest.permission.ACCESS_FINE_LOCATION,
+                    android.Manifest.permission.ACCESS_COARSE_LOCATION
+            }, REQ_GEO_PERMISSION);
+        } else {
+            // Below Android 6 these are install-time permissions, so anything reaching here was
+            // refused at install and asking again would achieve nothing.
+            resolveGeoCallback(false);
+        }
+    }
+
+    /** True if either accuracy tier is granted; a coarse fix is still a usable share. */
+    private boolean hasLocationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return true;
+        }
+        return checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED
+                || checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /**
+     * Answers a pending location prompt exactly once and forgets it.
+     *
+     * Clearing before invoking matters: Android may deliver a permission result twice in some
+     * rotation cases, and answering a callback twice is a crash rather than a no-op.
+     */
+    private void resolveGeoCallback(boolean allowed) {
+        GeolocationPermissions.Callback callback = pendingGeoCallback;
+        String origin = pendingGeoOrigin;
+        pendingGeoCallback = null;
+        pendingGeoOrigin = null;
+        if (callback != null && origin != null) {
+            // The third argument is "retain": false means do not remember the answer for this
+            // origin, so the next share asks again rather than silently reusing a stale decision.
+            callback.invoke(origin, allowed, false);
+        }
+    }
+
     private boolean hasPermissions(boolean camera, boolean mic) {
         if (camera && checkSelfPermission(android.Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -308,6 +392,19 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (notificationBridge != null) {
             notificationBridge.onPermissionResult(requestCode, grantResults);
+        }
+        // Before the camera/mic branch below, which returns early whenever no web permission request
+        // is pending - and a location prompt never sets one.
+        if (requestCode == REQ_GEO_PERMISSION) {
+            boolean allowed = false;
+            for (int result : grantResults) {
+                if (result == PackageManager.PERMISSION_GRANTED) {
+                    allowed = true;
+                    break;
+                }
+            }
+            resolveGeoCallback(allowed);
+            return;
         }
         if (requestCode != REQ_RUNTIME_PERMISSIONS || pendingPermissionRequest == null) {
             return;

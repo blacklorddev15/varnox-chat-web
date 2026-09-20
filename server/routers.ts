@@ -27,6 +27,9 @@ import { getConversationSummary, leaveGroup, listConversationMemberIds, listConv
 // Pins, keeps, abuse reports and the link-preview cache. Grouped on their own lines for the same
 // reason as the two blocks above: the main list is already long enough to be hard to scan.
 import { MAX_ICON_BYTES, MAX_PINNED_MESSAGES, REPORT_CATEGORIES, VISIBILITY_VALUES, canAddToGroup, callShouldRing, clearConversationIcon, conversationIconVersions, getLinkPreview, getOrCreateSelfConversation, listGroupEvents, listPinnedMessages, listReportsForAdmin, lockedConversationIds, logGroupEvent, reviewReport, saveLinkPreview, setChatLocked, setConversationIcon, setMessageKept, setMessagePinned, storageUsageForUser, submitReport } from "./db";
+// Web push: the browser subscription store and the VAPID key the client subscribes with.
+import { isWebPushConfigured, webPushPublicKey } from "./webPush";
+import { deleteOwnWebPushSubscription, hasWebPushSubscription, saveWebPushSubscription } from "./db";
 // Live location, saved contacts, events, the catalog and device linking.
 import { LIVE_LOCATION_MAX_MS, RSVP_ANSWERS, addCatalogItem, archiveCatalogItem, cancelEvent, createDeviceLinkCode, createEvent, listCatalog, listContacts, listEvents, listLiveLocations, listPublicCatalog, removeContact, rsvpEvent, setContactName, startLiveLocation, stopLiveLocation, updateCatalogItem, updateLiveLocation } from "./db";
 import { fetchLinkPreview } from "./linkPreview";
@@ -553,6 +556,33 @@ export const appRouter = router({
     }),
   }),
   push: router({
+    /**
+     * Whether web push is available, and the key a browser needs to subscribe.
+     *
+     * Served from the server rather than compiled into the bundle, so rotating the VAPID keypair
+     * takes effect without rebuilding and redeploying the whole web app.
+     */
+    webKey: publicProcedure.query(() => ({ key: webPushPublicKey(), enabled: isWebPushConfigured() })),
+    /** Whether this account has a browser subscribed, so the settings toggle can show the truth. */
+    webStatus: protectedProcedure.query(({ ctx }) => hasWebPushSubscription(ctx.user.id)),
+    /**
+     * Stores a browser subscription.
+     *
+     * All three parts are required: without the keys the payload cannot be encrypted for this
+     * browser, and a row stored without them would accept a message it could never open.
+     */
+    registerWeb: protectedProcedure
+      .input(z.object({ endpoint: z.string().min(16).max(2048), p256dh: z.string().min(16).max(512), auth: z.string().min(8).max(128) }))
+      .mutation(async ({ ctx, input }) => {
+        if (!(await saveWebPushSubscription(ctx.user.id, input.endpoint, input.p256dh, input.auth))) {
+          throw new Error("Notifications are not available");
+        }
+        return { ok: true as const };
+      }),
+    unregisterWeb: protectedProcedure.input(z.object({ endpoint: z.string().min(16).max(2048) })).mutation(async ({ ctx, input }) => {
+      await deleteOwnWebPushSubscription(ctx.user.id, input.endpoint);
+      return { ok: true as const };
+    }),
     register: protectedProcedure.input(z.object({ token: z.string().min(1).max(512), platform: z.string().max(32).optional() })).mutation(({ ctx, input }) => registerPushToken(ctx.user.id, input.token, input.platform)),
   }),
   // ---- link previews: fetched by the server, cached per URL ---------------------------------

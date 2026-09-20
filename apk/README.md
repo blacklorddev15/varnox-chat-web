@@ -29,6 +29,13 @@ Or copy it to the device and open it, allowing "install unknown apps" if prompte
 - File uploads: `<input type="file">` opens the system picker.
 - Camera and microphone: runtime permissions, then `getUserMedia` requests are granted (voice
   notes, calls).
+- Live location: `navigator.geolocation` works, so a live location share started in the app keeps
+  updating. This needs **all three** of the following, and fails silently without any one of them:
+  `setGeolocationEnabled(true)`, `ACCESS_FINE_LOCATION`/`ACCESS_COARSE_LOCATION` in the manifest,
+  and an answered `onGeolocationPermissionsShowPrompt`. That last one is the usual reason WebView
+  geolocation "does not work" in a shell that otherwise looks configured correctly.
+  The permission is requested only when a share is actually started, not at launch. Coarse accuracy
+  is accepted: a share from coarse coordinates is still a usable one.
 - Downloads handed to the system; `mailto:`/`tel:` and other non-http(s) links delegated.
 - Back button walks WebView history before exiting; state survives rotation.
 - Offline and TLS errors show a retry dialog instead of a blank screen.
