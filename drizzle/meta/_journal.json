@@ -85,6 +85,13 @@
       "when": 1789898337841,
       "tag": "0011_red_nightshade",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1789899295648,
+      "tag": "0012_dusty_roughhouse",
+      "breakpoints": true
     }
   ]
 }

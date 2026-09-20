@@ -124,13 +124,17 @@ export async function listConversationsForUser(userId: number) {
       .orderBy(desc(messages.createdAt))
       .limit(20);
     const nowMs = Date.now();
-    const latest = recent.filter((m) => !hiddenIds.has(m.id) && (!m.expiresAt || m.expiresAt.getTime() > nowMs));
+    const latest = recent.filter((m) => !hiddenIds.has(m.id) && (!m.expiresAt || m.expiresAt.getTime() > nowMs) && isDeliveredFor(m, userId, nowMs));
 
     const unreadWhere = mine?.lastReadAt
       ? and(eq(messages.conversationId, conversation.id), ne(messages.senderId, userId), gt(messages.createdAt, mine.lastReadAt))
       : and(eq(messages.conversationId, conversation.id), ne(messages.senderId, userId));
-    const unreadRows = await db.select({ id: messages.id, expiresAt: messages.expiresAt }).from(messages).where(unreadWhere);
-    const unread = unreadRows.filter((row) => !hiddenIds.has(row.id) && (!row.expiresAt || row.expiresAt.getTime() > nowMs));
+    const unreadRows = await db
+      .select({ id: messages.id, expiresAt: messages.expiresAt, senderId: messages.senderId, scheduledAt: messages.scheduledAt })
+      .from(messages)
+      .where(unreadWhere);
+    // A message somebody scheduled for later is not unread yet, and must not raise a badge early.
+    const unread = unreadRows.filter((row) => !hiddenIds.has(row.id) && (!row.expiresAt || row.expiresAt.getTime() > nowMs) && isDeliveredFor(row, userId, nowMs));
 
     result.push({
       id: conversation.id,
@@ -444,6 +448,27 @@ export async function lockedConversationIds(userId: number) {
     .from(conversationMembers)
     .where(and(eq(conversationMembers.userId, userId), isNotNull(conversationMembers.lockedAt)));
   return rows.map((row) => row.conversationId);
+}
+
+// ---------------------------------------------------------------- scheduled messages
+/**
+ * Whether a message is visible to this reader yet.
+ *
+ * A scheduled message is visible to its own sender immediately - so they can see it waiting in the
+ * thread and change their mind - and to everybody else only once its time arrives.
+ *
+ * This lives in one place on purpose. Three separate queries need the same answer: the thread, the
+ * conversation preview, and the unread badge. A rule written out three times is a rule that will
+ * eventually disagree with itself, and the disagreement would look like a message that shows in the
+ * chat but not in the list, or counts as unread a day before it arrives.
+ *
+ * Declared at the end of the file and used above; function declarations hoist, so the order is only
+ * cosmetic.
+ */
+function isDeliveredFor(row: { senderId: number; scheduledAt: Date | null }, userId: number, nowMs: number): boolean {
+  if (row.senderId === userId) return true;
+  if (!row.scheduledAt) return true;
+  return row.scheduledAt.getTime() <= nowMs;
 }
 
 /** Searches message text inside the conversations the user is a member of. */
@@ -1051,7 +1076,13 @@ export async function listMessages(conversationId: string, userId: number, since
 
   return rows
     // A kept message outlives its timer for this reader only; everyone else's copy still expires.
-    .filter((row) => !hiddenIds.has(row.id) && (!row.expiresAt || row.expiresAt.getTime() > nowMs || keptIds.has(row.id)))
+    // A message scheduled for later is withheld from everyone but its sender.
+    .filter(
+      (row) =>
+        !hiddenIds.has(row.id) &&
+        (!row.expiresAt || row.expiresAt.getTime() > nowMs || keptIds.has(row.id)) &&
+        isDeliveredFor(row, userId, nowMs),
+    )
     .map((row) => {
       const quote = row.replyToId ? quotedById.get(row.replyToId) ?? null : null;
       const mine = row.senderId === userId;

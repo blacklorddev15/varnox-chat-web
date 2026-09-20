@@ -334,7 +334,7 @@ export const appRouter = router({
       if (!result) throw new Error("Could not start that conversation");
       return result;
     }),
-    send: protectedProcedure.input(z.object({ conversationId: z.string().min(1), body: z.string().max(10000).optional(), kind: messageKind.default("text"), mediaUrl: z.string().max(2000).optional(), mediaMime: z.string().max(160).optional(), mediaName: z.string().max(255).optional(), voiceDurationMs: z.number().int().min(0).max(3600000).optional(), replyToId: z.string().max(64).optional(), forwardedFromId: z.string().max(64).optional(), viewOnce: z.boolean().default(false), meta: z.unknown().optional() })).mutation(async ({ ctx, input }) => {
+    send: protectedProcedure.input(z.object({ conversationId: z.string().min(1), body: z.string().max(10000).optional(), kind: messageKind.default("text"), mediaUrl: z.string().max(2000).optional(), mediaMime: z.string().max(160).optional(), mediaName: z.string().max(255).optional(), voiceDurationMs: z.number().int().min(0).max(3600000).optional(), replyToId: z.string().max(64).optional(), forwardedFromId: z.string().max(64).optional(), viewOnce: z.boolean().default(false), scheduledAt: z.string().max(40).optional(), meta: z.unknown().optional() })).mutation(async ({ ctx, input }) => {
       const access = await getConversationAccess(input.conversationId, ctx.user.id);
       if (!access) throw new Error("You are not a member of this conversation");
       // Announcement-style groups restrict sending to admins; the setting starts at "all", so every
@@ -348,12 +348,20 @@ export const appRouter = router({
       // Polls, locations and contacts carry their content in `meta`; the media kinds carry none.
       const meta = normalizeMessageMeta(input.kind, input.meta);
       if (!meta && (input.kind === "poll" || input.kind === "location" || input.kind === "contact")) throw new Error("That message arrived without its content");
-      const message: typeof messages.$inferInsert = { id: randomUUID(), conversationId: input.conversationId, senderId: ctx.user.id, body: input.body ?? null, kind: input.kind, mediaUrl: input.mediaUrl ?? null, mediaMime: input.mediaMime ?? null, mediaName: input.mediaName ?? null, voiceDurationMs: input.voiceDurationMs ?? null, replyToId: input.replyToId ?? null, forwardedFromId: input.forwardedFromId ?? null, viewOnce: input.viewOnce ? 1 : 0, meta, expiresAt: disappearSeconds ? new Date(Date.now() + disappearSeconds * 1000) : null };
+      // A scheduled message is stamped with its due time and withheld from everybody else until then.
+      const scheduledAt = input.scheduledAt ? new Date(input.scheduledAt) : null;
+      if (scheduledAt && Number.isNaN(scheduledAt.getTime())) throw new Error("That is not a valid time");
+      if (scheduledAt && scheduledAt.getTime() <= Date.now()) throw new Error("Pick a time in the future");
+      const message: typeof messages.$inferInsert = { id: randomUUID(), conversationId: input.conversationId, senderId: ctx.user.id, body: input.body ?? null, kind: input.kind, mediaUrl: input.mediaUrl ?? null, mediaMime: input.mediaMime ?? null, mediaName: input.mediaName ?? null, voiceDurationMs: input.voiceDurationMs ?? null, replyToId: input.replyToId ?? null, forwardedFromId: input.forwardedFromId ?? null, viewOnce: input.viewOnce ? 1 : 0, meta, scheduledAt, expiresAt: disappearSeconds ? new Date(Date.now() + disappearSeconds * 1000) : null };
       const created = await createMessage(message);
       // A view-once photo must not be described in the notification body.
       const preview = input.viewOnce ? "Photo (view once)" : input.body ?? (input.kind === "voice" ? "Voice note" : meta?.kind === "poll" ? `Poll: ${meta.question}` : meta?.kind === "location" ? "Location" : meta?.kind === "contact" ? `Contact: ${meta.name}` : "Shared media");
-      void notifyConversationMembers({ conversationId: input.conversationId, senderId: ctx.user.id, title: ctx.user.name ?? "New message", body: preview });
-      void nudgeConversation(input.conversationId, ctx.user.id, "message");
+      // Only tell the other members, and only for a message that is arriving now. Notifying at send
+      // time for something scheduled for tomorrow would announce a message nobody can read yet.
+      if (!scheduledAt) {
+        void notifyConversationMembers({ conversationId: input.conversationId, senderId: ctx.user.id, title: ctx.user.name ?? "New message", body: preview });
+        void nudgeConversation(input.conversationId, ctx.user.id, "message");
+      }
       return created;
     }),
 

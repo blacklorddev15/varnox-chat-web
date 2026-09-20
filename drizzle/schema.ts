@@ -39,7 +39,10 @@ export const conversationMembers = pgTable("conversationMembers", { conversation
   lockedAt: timestamp("lockedAt") }, (table) => ({ pk: primaryKey({ columns: [table.conversationId, table.userId] }) }));
 export const messages = pgTable("messages", { id: varchar("id", { length: 64 }).primaryKey(), conversationId: varchar("conversationId", { length: 64 }).notNull(), senderId: integer("senderId").notNull(), body: text("body"), kind: messageKindEnum("kind").default("text").notNull(), mediaUrl: text("mediaUrl"), mediaMime: varchar("mediaMime", { length: 160 }), mediaName: varchar("mediaName", { length: 255 }), voiceDurationMs: integer("voiceDurationMs"), replyToId: varchar("replyToId", { length: 64 }), forwardedFromId: varchar("forwardedFromId", { length: 64 }), viewOnce: integer("viewOnce").default(0).notNull(), editedAt: timestamp("editedAt"), deletedAt: timestamp("deletedAt"), expiresAt: timestamp("expiresAt"), meta: jsonb("meta").$type<MessageMeta>(), createdAt: timestamp("createdAt").defaultNow().notNull(), // A pin belongs to the conversation, not to the person who set it: everyone sees the same banner.
   // Whoever pinned it last is recorded so the sheet can say who did, and unpinning clears both.
-  pinnedAt: timestamp("pinnedAt"), pinnedBy: integer("pinnedBy") });
+  pinnedAt: timestamp("pinnedAt"), pinnedBy: integer("pinnedBy"), // When this message should become visible to everybody other than its sender. Null means now.
+  // The sender sees it straight away so they can watch it waiting and change their mind; see
+  // isDeliveredFor in db.ts, which is the single place that decides who may see it.
+  scheduledAt: timestamp("scheduledAt") });
 export const pushTokens = pgTable("pushTokens", { id: serial("id").primaryKey(), userId: integer("userId").notNull(), token: varchar("token", { length: 512 }).notNull().unique(), platform: varchar("platform", { length: 32 }), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 // ---------------------------------------------------------------- group invites
 // The table already exists in the database from an earlier build; it was dropped from this schema at
