@@ -33,6 +33,8 @@ type CallContextValue = {
   remoteCount: number;
   micOn: boolean;
   cameraOn: boolean;
+  /** True while this device is sharing its screen into the call. */
+  screenSharing: boolean;
   elapsed: number;
   error: string | null;
   startCall: (input: { conversationId: string; kind: CallKind; peerName: string }) => Promise<void>;
@@ -42,6 +44,7 @@ type CallContextValue = {
   hangUp: () => void;
   toggleMic: () => void;
   toggleCamera: () => void;
+  toggleScreenShare: () => void;
   clearError: () => void;
 };
 
@@ -59,10 +62,14 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const [remoteCount, setRemoteCount] = useState(0);
   const [micOn, setMicOn] = useState(true);
   const [cameraOn, setCameraOn] = useState(false);
+  const [screenSharing, setScreenSharing] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const roomRef = useRef<LiveKitRoom | null>(null);
+  // Mirrors screenSharing so the toggle can read the current value without depending on it, which
+  // would rebuild the callback on every change.
+  const screenShareRef = useRef(false);
   const sessionRef = useRef<CallSession | null>(null);
   const phaseRef = useRef<CallPhase>("idle");
   const ringTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -100,6 +107,10 @@ export function CallProvider({ children }: { children: ReactNode }) {
       setRemoteCount(0);
       setMicOn(true);
       setCameraOn(false);
+      // A share belongs to one call: the browser stops capturing when the room closes, so leaving
+      // this set would show the button as pressed on the next call while nothing was being sent.
+      setScreenSharing(false);
+      screenShareRef.current = false;
       setElapsed(0);
       setPhaseBoth("idle");
     },
@@ -214,6 +225,36 @@ export function CallProvider({ children }: { children: ReactNode }) {
       void instance.localParticipant.setCameraEnabled(!on).catch(() => undefined);
       return !on;
     });
+  }, []);
+
+  /**
+   * Shares this device's screen into the call.
+   *
+   * Unlike the mic and camera toggles this cannot be fire-and-forget: the browser shows a picker,
+   * and the user may cancel it. The state is therefore set optimistically and put back when the
+   * promise rejects, so cancelling the picker does not leave the button stuck looking pressed.
+   *
+   * The room is unaffected either way - a share is an extra video track, so a call that was audio
+   * only stays audio only and simply gains a picture.
+   */
+  const toggleScreenShare = useCallback(() => {
+    const instance = roomRef.current;
+    if (!instance) return;
+
+    // Read from the ref rather than from state: reading state here would either need it in the
+    // dependency list, or would read a stale value from the closure.
+    const next = !screenShareRef.current;
+    screenShareRef.current = next;
+    setScreenSharing(next);
+
+    void instance.localParticipant
+      .setScreenShareEnabled(next)
+      .then(() => undefined)
+      .catch(() => {
+        // Cancelled at the picker, or the browser refused. Either way nothing is being sent.
+        screenShareRef.current = !next;
+        setScreenSharing(!next);
+      });
   }, []);
 
   // Poll for an incoming call only while idle, so we never ring over a live call.
@@ -332,6 +373,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     remoteCount,
     micOn,
     cameraOn,
+    screenSharing,
     elapsed,
     error,
     startCall,
@@ -341,6 +383,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     hangUp,
     toggleMic,
     toggleCamera,
+    toggleScreenShare,
     clearError: () => setError(null),
   };
 

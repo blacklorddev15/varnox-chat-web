@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Platform, Pressable, StyleSheet, Text, View } from "react-native";
-import { RoomEvent, type Room as LiveKitRoom } from "livekit-client";
+import { RoomEvent, Track, type Room as LiveKitRoom } from "livekit-client";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 
 import { useColors } from "@/hooks/use-colors";
@@ -34,6 +34,9 @@ function VideoSurface({
   fallbackColor: string;
 }) {
   const holder = useRef<View | null>(null);
+  // The track currently in the DOM, so a change of picture can be told apart from the same picture
+  // being seen again on the next poll.
+  const attachedRef = useRef<unknown>(null);
 
   useEffect(() => {
     if (!room || Platform.OS !== "web") return;
@@ -44,21 +47,49 @@ function VideoSurface({
         const node = holder.current as unknown as HTMLElement | null;
         if (!node) return;
         // Branches kept separate: local and remote publication types do not unify in Array.from.
-        const track = (() => {
-          if (side === "local") return Array.from(room.localParticipant.videoTrackPublications.values())[0]?.track;
-          // Looked up by identity rather than by position: in a group call the participant at index 0
-          // changes as people join and leave, which would slide every other tile's picture sideways.
-          const remote = identity ? room.remoteParticipants.get(identity) : Array.from(room.remoteParticipants.values())[0];
-          if (!remote) return undefined;
-          return Array.from(remote.videoTrackPublications.values())[0]?.track;
-        })();
-        if (!track) return;
-        if (node.firstChild) return;
-        const element = track.attach() as HTMLVideoElement;
+        // The local and remote branches stay written out separately, and the two look almost the
+        // same. They cannot be merged: LocalTrackPublication and RemoteTrackPublication do not
+        // unify, so a single Array.from over either does not typecheck. The original guard here said
+        // the same thing, and merging them is exactly the mistake that broke it.
+        const chosen =
+          side === "local"
+            ? (() => {
+                const published = Array.from(room.localParticipant.videoTrackPublications.values());
+                // A screen share wins over a camera. Somebody publishing both is sharing their screen,
+                // and the screen is what the call is about - showing their face instead would look
+                // like a broken feature rather than a choice.
+                const share = published.find((publication) => isScreenShare(publication.source) && publication.track);
+                const picked = share ?? published.find((publication) => publication.track);
+                return picked?.track ? { track: picked.track, isShare: picked === share } : undefined;
+              })()
+            : (() => {
+                // Looked up by identity rather than by position: in a group call the participant at
+                // index 0 changes as people join and leave, which would slide every other tile's
+                // picture sideways.
+                const remote = identity ? room.remoteParticipants.get(identity) : Array.from(room.remoteParticipants.values())[0];
+                if (!remote) return undefined;
+                const published = Array.from(remote.videoTrackPublications.values());
+                const share = published.find((publication) => isScreenShare(publication.source) && publication.track);
+                const picked = share ?? published.find((publication) => publication.track);
+                return picked?.track ? { track: picked.track, isShare: picked === share } : undefined;
+              })();
+
+        if (!chosen) return;
+
+        // Re-attach when the picture changes - starting a share, or stopping one and falling back to
+        // the camera. Without this the first frame ever attached would stay on screen, because the
+        // guard below exists to avoid re-attaching the same thing on every poll.
+        if (attachedRef.current === chosen.track && node.firstChild) return;
+        node.innerHTML = "";
+
+        const element = chosen.track.attach() as HTMLVideoElement;
         element.style.width = "100%";
         element.style.height = "100%";
-        element.style.objectFit = "cover";
+        // A shared screen is letterboxed rather than cropped: cropping it cuts off exactly the part
+        // being talked about. A camera is cropped, which is what makes a face fill a tile.
+        element.style.objectFit = chosen.isShare ? "contain" : "cover";
         node.appendChild(element);
+        attachedRef.current = chosen.track;
       } catch {
         // video is optional: never let it take the call down
       }
@@ -97,7 +128,7 @@ function VideoSurface({
  * until something else happened to trigger a re-render.
  */
 function useRemoteParticipants(room: LiveKitRoom | null) {
-  const [participants, setParticipants] = useState<Array<{ identity: string; name: string }>>([]);
+  const [participants, setParticipants] = useState<Array<{ identity: string; name: string; sharing: boolean }>>([]);
 
   useEffect(() => {
     if (!room) {
@@ -111,6 +142,11 @@ function useRemoteParticipants(room: LiveKitRoom | null) {
           identity: participant.identity,
           // `name` is what the app set when joining; identity is the user id and is the fallback.
           name: participant.name || participant.identity,
+          // Known here rather than derived later, because whether the video stage should be on
+          // screen at all depends on it: a share on an audio call still needs somewhere to appear.
+          sharing: Array.from(participant.videoTrackPublications.values()).some(
+            (publication) => publication.source === Track.Source.ScreenShare && Boolean(publication.track),
+          ),
         })),
       );
 
@@ -133,6 +169,17 @@ function useRemoteParticipants(room: LiveKitRoom | null) {
   return participants;
 }
 
+/**
+ * Whether a published video track is a shared screen rather than a camera.
+ *
+ * A named helper because the same comparison appears in both the local and remote branches below,
+ * and a typo in one of two string comparisons is the sort of thing that leaves a feature silently
+ * half-working. LiveKit reports it as a source, which is the only reliable way to tell them apart.
+ */
+function isScreenShare(source: string | undefined): boolean {
+  return source === Track.Source.ScreenShare;
+}
+
 /** Columns for the grid, so a two-person call fills the row and a large one does not get tiny. */
 function columnsFor(tiles: number): number {
   if (tiles <= 1) return 1;
@@ -142,7 +189,7 @@ function columnsFor(tiles: number): number {
 
 export function CallOverlay() {
   const colors = useColors();
-  const { phase, session, room, remoteCount, micOn, cameraOn, elapsed, error, accept, decline, hangUp, toggleMic, toggleCamera } = useCall();
+  const { phase, session, room, remoteCount, micOn, cameraOn, screenSharing, elapsed, error, accept, decline, hangUp, toggleMic, toggleCamera, toggleScreenShare } = useCall();
 
   if (phase === "idle" && !error) return null;
 
@@ -154,10 +201,13 @@ export function CallOverlay() {
   // row rather than a percentage width: the card has a maximum width but a shrinking one, and
   // percentages would overflow it on a narrow screen.
   const remotes = useRemoteParticipants(room);
+  // A share needs a stage even on a call with no camera in it, which is the whole point of being
+  // able to share during an audio call.
+  const showStage = isVideo || screenSharing || remotes.some((participant) => participant.sharing);
   const tiles = [
-    ...remotes.map((participant) => ({ key: participant.identity, identity: participant.identity as string | null, label: participant.name })),
+    ...remotes.map((participant) => ({ key: participant.identity, identity: participant.identity as string | null, label: participant.name, sharing: participant.sharing })),
     // Your own tile goes last and is labelled, so a grid needs no legend to be readable.
-    { key: "__self", identity: null as string | null, label: "You" },
+    { key: "__self", identity: null as string | null, label: "You", sharing: screenSharing },
   ];
   const columns = columnsFor(tiles.length);
   const videoRows: Array<typeof tiles> = [];
@@ -179,7 +229,7 @@ export function CallOverlay() {
         <Text style={[styles.name, { color: colors.foreground }]} numberOfLines={1}>{name}</Text>
         <Text style={[styles.status, { color: connected ? colors.success : colors.muted }]}>{status}</Text>
 
-        {isVideo && phase === "active" ? (
+        {showStage && phase === "active" ? (
           <View style={styles.videos}>
             {videoRows.map((row, rowIndex) => (
               <View key={`row-${rowIndex}`} style={styles.videoRow}>
@@ -192,7 +242,9 @@ export function CallOverlay() {
                       fallbackColor={tile.identity === null ? "#1B1B22" : "#111116"}
                     />
                     <Text style={styles.tileLabel} numberOfLines={1}>
-                      {tile.label}
+                      {/* Says which picture this is. In a call where one person is sharing and
+                          another is on camera, the tiles look alike without it. */}
+                      {tile.sharing ? `${tile.label} · screen` : tile.label}
                     </Text>
                   </View>
                 ))}
@@ -225,6 +277,18 @@ export function CallOverlay() {
               {isVideo ? (
                 <Pressable onPress={toggleCamera} style={({ pressed }) => [styles.circle, { backgroundColor: cameraOn ? "#1F2937" : "#EF4444" }, pressed && styles.pressed]}>
                   <MaterialIcons name={cameraOn ? "videocam" : "videocam-off"} size={23} color="#FFFFFF" />
+                </Pressable>
+              ) : null}
+              {/* Sharing a screen is a browser capability - the picker is the browser's - so the
+                  button is withheld where it could not do anything rather than shown and inert.
+                  Offered on audio calls too: sharing a document is a reason to call someone even
+                  when neither side wants to be on camera. */}
+              {Platform.OS === "web" ? (
+                <Pressable
+                  onPress={toggleScreenShare}
+                  style={({ pressed }) => [styles.circle, { backgroundColor: screenSharing ? "#10B981" : "#1F2937" }, pressed && styles.pressed]}
+                >
+                  <MaterialIcons name={screenSharing ? "stop-screen-share" : "screen-share"} size={23} color="#FFFFFF" />
                 </Pressable>
               ) : null}
               <Pressable onPress={hangUp} style={({ pressed }) => [styles.circle, { backgroundColor: "#EF4444" }, pressed && styles.pressed]}>
