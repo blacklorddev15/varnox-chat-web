@@ -13,6 +13,8 @@ import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.PowerManager;
+import android.util.Log;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -42,6 +44,8 @@ import android.widget.Toast;
  */
 public class MainActivity extends Activity {
 
+    private static final String TAG = "VarnoxMain";
+
     static final String START_URL = "https://varnox-chat-web.vercel.app/";
     static final String HOST = "varnox-chat-web.vercel.app";
 
@@ -61,6 +65,15 @@ public class MainActivity extends Activity {
     // once - a call can start while a live location is being shared.
     private GeolocationPermissions.Callback pendingGeoCallback;
     private String pendingGeoOrigin;
+
+    /**
+     * True while a call is connected, told to us by the page.
+     *
+     * Volatile because it is written from the JavaScript bridge's UI-thread post and read from the
+     * lifecycle callbacks, which are not guaranteed to be the same thread.
+     */
+    private volatile boolean callActive;
+    private PowerManager.WakeLock callWakeLock;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -510,11 +523,25 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * Pausing the WebView is what stops a call when the app goes off screen, so it is skipped while
+     * one is connected.
+     *
+     * WebView.onPause() suspends the view's processing, media included - and the call is running
+     * inside that view. Leaving it unpaused is only half the fix, which is why the call service and
+     * the wake lock exist alongside this; without them Android would freeze the process anyway.
+     *
+     * The cookie flush still happens either way. The background message watcher reads the session
+     * cookie, and skipping the flush during a call would mean messages sent during it could be
+     * missed if the process were killed before the next flush.
+     */
     @Override
     protected void onPause() {
         super.onPause();
         if (webView != null) {
-            webView.onPause();
+            if (!callActive) {
+                webView.onPause();
+            }
             CookieManager.getInstance().flush();
         }
     }
@@ -530,6 +557,96 @@ public class MainActivity extends Activity {
             notificationBridge.onActivityResume();
         }
         syncMessageWatcher();
+    }
+
+    /**
+     * Starts or stops everything that keeps a live call running off screen.
+     *
+     * Called by the page whenever a call connects or ends, because nothing on the Android side can
+     * observe a WebRTC connection. Idempotent on purpose: a repeated call with the same value does
+     * nothing, so a page that signals twice cannot acquire two wake locks or start two services.
+     *
+     * The three parts, and why each is needed:
+     *  - the foreground service stops Android freezing the process the call lives in;
+     *  - the wake lock stops the CPU sleeping once the screen times out, which would otherwise drop
+     *    a long call on its own;
+     *  - onPause is left alone, so the WebView is not paused while it is carrying audio.
+     */
+    public void setCallActive(boolean active) {
+        if (callActive == active) {
+            return;
+        }
+        callActive = active;
+
+        if (active) {
+            acquireCallWakeLock();
+            startCallService();
+        } else {
+            stopCallService();
+            releaseCallWakeLock();
+        }
+    }
+
+    /**
+     * A partial wake lock, not a screen wake lock.
+     *
+     * The call needs the CPU, not the display: keeping the screen on would drain the battery for no
+     * reason during an audio call. This is released the moment the call ends, and again in onDestroy
+     * so a crash or a swipe-away cannot leave it held.
+     */
+    private void acquireCallWakeLock() {
+        if (callWakeLock != null && callWakeLock.isHeld()) {
+            return;
+        }
+        try {
+            PowerManager power = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (power == null) {
+                return;
+            }
+            callWakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "varnox:call");
+            callWakeLock.setReferenceCounted(false);
+            callWakeLock.acquire();
+        } catch (SecurityException | IllegalStateException error) {
+            // A denied wake lock degrades the call rather than breaking it, and is not worth taking
+            // the app down over.
+            Log.w(TAG, "Could not hold the CPU awake for the call", error);
+        }
+    }
+
+    private void releaseCallWakeLock() {
+        try {
+            if (callWakeLock != null && callWakeLock.isHeld()) {
+                callWakeLock.release();
+            }
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Could not release the call wake lock", error);
+        } finally {
+            callWakeLock = null;
+        }
+    }
+
+    private void startCallService() {
+        try {
+            Intent intent = new Intent(this, CallService.class);
+            intent.setAction(CallService.ACTION_START);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+        } catch (RuntimeException error) {
+            // On Android 12+ a background start can be refused. The lock and the unpaused WebView
+            // still help, so the call is degraded rather than ended.
+            Log.w(TAG, "Could not start the call service", error);
+        }
+    }
+
+    private void stopCallService() {
+        try {
+            stopService(new Intent(this, CallService.class));
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Could not stop the call service", error);
+        }
     }
 
     /**
@@ -557,6 +674,13 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        // Belt and braces for the call. The page normally signals the end of one, but a crash or a
+        // swipe-away does not - and a foreground service and a wake lock owned by a dead activity
+        // are a battery drain the user can neither see nor stop.
+        stopCallService();
+        releaseCallWakeLock();
+        callActive = false;
+
         if (webView != null) {
             webView.destroy();
             webView = null;

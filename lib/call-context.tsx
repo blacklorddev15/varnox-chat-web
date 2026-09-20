@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState, ty
 import type { Room as LiveKitRoom } from "livekit-client";
 
 import { useAuth } from "@/hooks/use-auth";
+import { setNativeCallActive } from "@/lib/native-call";
 import { trpc } from "@/lib/trpc";
 
 /**
@@ -35,6 +36,8 @@ type CallContextValue = {
   cameraOn: boolean;
   /** True while this device is sharing its screen into the call. */
   screenSharing: boolean;
+  /** True while the transport is being rebuilt. The call is still up; it is catching up. */
+  reconnecting: boolean;
   elapsed: number;
   error: string | null;
   startCall: (input: { conversationId: string; kind: CallKind; peerName: string }) => Promise<void>;
@@ -63,6 +66,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const [micOn, setMicOn] = useState(true);
   const [cameraOn, setCameraOn] = useState(false);
   const [screenSharing, setScreenSharing] = useState(false);
+  /** True while the transport is being rebuilt. The call is not over; it is catching up. */
+  const [reconnecting, setReconnecting] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
@@ -111,6 +116,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
       // this set would show the button as pressed on the next call while nothing was being sent.
       setScreenSharing(false);
       screenShareRef.current = false;
+      // A fresh call starts connected or not; a leftover flag would show "Reconnecting" on a call
+      // that has not begun.
+      setReconnecting(false);
       setElapsed(0);
       setPhaseBoth("idle");
     },
@@ -128,6 +136,17 @@ export function CallProvider({ children }: { children: ReactNode }) {
     instance.on(RoomEvent.Disconnected, () => {
       // The other side hung up, or the room closed underneath us.
       if (roomRef.current === instance) teardown(false);
+    });
+    // LiveKit rebuilds the transport itself when the network blips - which is exactly what a phone
+    // changing between wifi and mobile data, or waking from sleep, looks like. These two only
+    // reflect that so a brief drop reads as "Reconnecting" instead of a call that has frozen.
+    // `Disconnected` above is the one that means it is genuinely over, and remains the only thing
+    // that tears a call down.
+    instance.on(RoomEvent.Reconnecting, () => setReconnecting(true));
+    instance.on(RoomEvent.Reconnected, () => {
+      setReconnecting(false);
+      // Whoever is left, in case anyone dropped while the transport was being rebuilt.
+      setRemoteCount(instance.remoteParticipants.size);
     });
 
     await instance.connect(next.url, next.token);
@@ -206,6 +225,19 @@ export function CallProvider({ children }: { children: ReactNode }) {
     if (current?.callId) declineMutation.mutate({ callId: current.callId });
     teardown(false);
   }, [declineMutation, teardown]);
+
+  /**
+   * Tells the Android shell when a call becomes live, and when it stops being live.
+   *
+   * Keyed on `phase` because that is the only thing that knows: the shell sees a WebView, not a
+   * connection. The cleanup runs both on the next phase change and on unmount, so every path out of
+   * a call - hanging up, the other side leaving, the screen closing - releases the foreground
+   * service and the wake lock the shell is holding.
+   */
+  useEffect(() => {
+    setNativeCallActive(phase === "active");
+    return () => setNativeCallActive(false);
+  }, [phase]);
 
   const hangUp = useCallback(() => teardown(true), [teardown]);
 
@@ -374,6 +406,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
     micOn,
     cameraOn,
     screenSharing,
+    reconnecting,
     elapsed,
     error,
     startCall,

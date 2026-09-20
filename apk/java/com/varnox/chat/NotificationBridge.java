@@ -51,6 +51,29 @@ public class NotificationBridge {
         this.webView = webView;
     }
 
+    /**
+     * Tells the shell whether a call is connected.
+     *
+     * The page is the only thing that knows this - a WebRTC connection has no Android-side signal -
+     * so the shell has to be told. While it is true the activity stops pausing its WebView and a
+     * foreground service holds the process open; while it is false both are undone, so an idle app
+     * behaves exactly as it did before.
+     *
+     * Called from JavaScript, which is never on the UI thread, so the work is posted to it.
+     */
+    @JavascriptInterface
+    public void setCallActive(final String active) {
+        final boolean live = "1".equals(active) || "true".equalsIgnoreCase(active);
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                if (activity instanceof MainActivity) {
+                    ((MainActivity) activity).setCallActive(live);
+                }
+            }
+        });
+    }
+
     // ------------------------------------------------------------------
     // Setup
     // ------------------------------------------------------------------

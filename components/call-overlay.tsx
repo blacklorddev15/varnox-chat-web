@@ -189,7 +189,7 @@ function columnsFor(tiles: number): number {
 
 export function CallOverlay() {
   const colors = useColors();
-  const { phase, session, room, remoteCount, micOn, cameraOn, screenSharing, elapsed, error, accept, decline, hangUp, toggleMic, toggleCamera, toggleScreenShare } = useCall();
+  const { phase, session, room, remoteCount, micOn, cameraOn, screenSharing, reconnecting, elapsed, error, accept, decline, hangUp, toggleMic, toggleCamera, toggleScreenShare } = useCall();
 
   if (phase === "idle" && !error) return null;
 
@@ -214,7 +214,10 @@ export function CallOverlay() {
   for (let index = 0; index < tiles.length; index += columns) videoRows.push(tiles.slice(index, index + columns));
 
   const status =
-    phase === "ringing-out" ? "Ringing…"
+    // Reconnecting comes first: a dropped transport on a live call is the thing a person most needs
+    // told about, and the elapsed timer ticking on regardless would read as the call being fine.
+    reconnecting ? "Reconnecting…"
+    : phase === "ringing-out" ? "Ringing…"
     : phase === "ringing-in" ? `Incoming ${isVideo ? "video" : "voice"} call`
     : connected ? formatElapsed(elapsed)
     : phase === "active" ? "Connecting…"

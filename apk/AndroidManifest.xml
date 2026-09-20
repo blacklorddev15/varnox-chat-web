@@ -17,6 +17,14 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
+    <!-- Keeping a live call alive once the app is off screen.
+         FOREGROUND_SERVICE_MICROPHONE is what allows the "microphone" service type below. WAKE_LOCK
+         stops the CPU sleeping mid-call, which would otherwise drop the connection on a call long
+         enough for the screen to time out. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <!-- Neither is required, so a tablet with no GPS chip still installs and can use everything else. -->
@@ -48,5 +56,14 @@
             android:name=".MessageWatcherService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Holds the process open while a call is connected, so the call survives the app going
+             off screen. The type is "microphone" rather than "phoneCall": the call genuinely uses
+             the microphone, while the phoneCall type carries requirements about being a calling app
+             that this shell has no business claiming. -->
+        <service
+            android:name=".CallService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 </manifest>
