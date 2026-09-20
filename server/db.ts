@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, ilike, inArray, isNull, like, lt, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, inviteLinks, joinRequests, messageHides, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, broadcastLists, broadcastRecipients, calls, channelFollowers, channelPosts, channels, communities, communityGroups, conversationMembers, conversations, InsertUser, inviteLinks, joinRequests, messageHides, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, sessions, statusUpdates, statusViews, stickers, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -1691,4 +1691,434 @@ export async function readPresenceInbox(viewerId: number): Promise<PresenceInbox
     console.warn("[Presence] inbox failed; has the presence table been migrated?", error);
     return [];
   }
+}
+
+// ================================================================ signed-in devices
+/** Records a session as it is issued. Called from the auth flows, never by a route. */
+export async function createSessionRow(params: { id: string; userId: number; userAgent?: string | null; platform?: string | null; expiresAt: Date }) {
+  const db = await getDb();
+  if (!db) return;
+  await db.insert(sessions).values({ id: params.id, userId: params.userId, userAgent: params.userAgent ?? null, platform: params.platform ?? null, expiresAt: params.expiresAt });
+}
+
+/**
+ * Whether a session may still be used.
+ *
+ * This is what makes signing a device out real: without it the token would keep working until it
+ * expired, because a JWT cannot be taken back. An unknown id counts as inactive - a session whose row
+ * has been pruned is one nobody can vouch for.
+ */
+export async function isSessionActive(sessionId: string) {
+  const db = await getDb();
+  if (!db) return false;
+  const [row] = await db.select({ revokedAt: sessions.revokedAt, expiresAt: sessions.expiresAt }).from(sessions).where(eq(sessions.id, sessionId)).limit(1);
+  if (!row) return false;
+  if (row.revokedAt) return false;
+  return row.expiresAt.getTime() > Date.now();
+}
+
+/**
+ * Notes that a device was seen, at most once every five minutes.
+ *
+ * The guard is in the WHERE clause rather than in code so the common case is a no-op the database
+ * decides on, instead of a write on every single request.
+ */
+export async function touchSession(sessionId: string) {
+  const db = await getDb();
+  if (!db) return;
+  await db
+    .update(sessions)
+    .set({ lastSeenAt: new Date() })
+    .where(and(eq(sessions.id, sessionId), lt(sessions.lastSeenAt, new Date(Date.now() - 5 * 60 * 1000))));
+}
+
+export async function listSessions(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select()
+    .from(sessions)
+    .where(and(eq(sessions.userId, userId), isNull(sessions.revokedAt), gt(sessions.expiresAt, new Date())))
+    .orderBy(desc(sessions.lastSeenAt));
+}
+
+/** Ends one session, refusing to touch anybody else's. */
+export async function revokeSession(userId: number, sessionId: string) {
+  const db = await getDb();
+  if (!db) return false;
+  const revoked = await db
+    .update(sessions)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(sessions.userId, userId), eq(sessions.id, sessionId), isNull(sessions.revokedAt)))
+    .returning();
+  return revoked.length > 0;
+}
+
+/** Ends every session except the one asking, which is how "sign out everywhere else" behaves. */
+export async function revokeOtherSessions(userId: number, keepSessionId: string | null) {
+  const db = await getDb();
+  if (!db) return 0;
+  const where = keepSessionId
+    ? and(eq(sessions.userId, userId), isNull(sessions.revokedAt), ne(sessions.id, keepSessionId))
+    : and(eq(sessions.userId, userId), isNull(sessions.revokedAt));
+  const revoked = await db.update(sessions).set({ revokedAt: new Date() }).where(where).returning();
+  return revoked.length;
+}
+
+/** Drops rows that can no longer be used, so the table does not grow forever. */
+export async function pruneExpiredSessions() {
+  const db = await getDb();
+  if (!db) return 0;
+  const removed = await db.delete(sessions).where(lt(sessions.expiresAt, new Date(Date.now() - 30 * 24 * 3600 * 1000))).returning();
+  return removed.length;
+}
+
+// ================================================================ two-step PIN
+export async function getPinHash(userId: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const [row] = await db.select({ pinHash: userSettings.pinHash }).from(userSettings).where(eq(userSettings.userId, userId)).limit(1);
+  return row?.pinHash ?? null;
+}
+
+export async function setPinHash(userId: number, pinHash: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  await db.insert(userSettings).values({ userId, pinHash }).onConflictDoUpdate({ target: userSettings.userId, set: { pinHash, updatedAt: new Date() } });
+}
+
+// ================================================================ conversation and account removal
+/**
+ * Erases one conversation and everything hanging off its messages.
+ *
+ * Written by hand rather than left to the database: this schema declares no foreign keys, so nothing
+ * cascades, and a deleted conversation that left its messages behind would quietly reappear in a search.
+ */
+export async function deleteConversationData(conversationId: string) {
+  const db = await getDb();
+  if (!db) return;
+  const messageIds = (await db.select({ id: messages.id }).from(messages).where(eq(messages.conversationId, conversationId))).map((row) => row.id);
+  if (messageIds.length > 0) {
+    await db.delete(messageReactions).where(inArray(messageReactions.messageId, messageIds));
+    await db.delete(messageStars).where(inArray(messageStars.messageId, messageIds));
+    await db.delete(messageHides).where(inArray(messageHides.messageId, messageIds));
+    await db.delete(pollVotes).where(inArray(pollVotes.messageId, messageIds));
+  }
+  await db.delete(messages).where(eq(messages.conversationId, conversationId));
+  await db.delete(calls).where(eq(calls.conversationId, conversationId));
+  await db.delete(inviteLinks).where(eq(inviteLinks.conversationId, conversationId));
+  await db.delete(joinRequests).where(eq(joinRequests.conversationId, conversationId));
+  await db.delete(communityGroups).where(eq(communityGroups.conversationId, conversationId));
+  await db.delete(conversationMembers).where(eq(conversationMembers.conversationId, conversationId));
+  await db.delete(conversations).where(eq(conversations.id, conversationId));
+}
+
+/**
+ * Deletes an account and everything that was only theirs.
+ *
+ * Two decisions are worth knowing about. Groups survive: somebody else has to own them, so ownership
+ * passes to the longest-standing owner-adjacent member rather than the group vanishing for everyone
+ * still in it. Messages the person sent also survive, in other people's chats - the account is gone and
+ * their name resolves to nothing, but rewriting history other people received would be a different
+ * feature. Direct chats are deleted outright, because there is nobody left on the other end.
+ */
+export async function deleteUserAccount(userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+
+  // Settle conversations first: deciding who owns what needs the memberships still in place.
+  const memberships = await db.select({ conversationId: conversationMembers.conversationId }).from(conversationMembers).where(eq(conversationMembers.userId, userId));
+  for (const { conversationId } of memberships) {
+    const [conversation] = await db.select().from(conversations).where(eq(conversations.id, conversationId)).limit(1);
+    if (!conversation) continue;
+    const others = await db
+      .select({ userId: conversationMembers.userId, role: conversationMembers.role, joinedAt: conversationMembers.joinedAt })
+      .from(conversationMembers)
+      .where(and(eq(conversationMembers.conversationId, conversationId), ne(conversationMembers.userId, userId)))
+      .orderBy(conversationMembers.joinedAt);
+
+    if (conversation.kind === "group" && others.length > 0) {
+      const successor = others.find((other) => other.role === "owner") ?? others.find((other) => other.role === "admin") ?? others[0];
+      if (conversation.createdBy === userId) {
+        await db.update(conversations).set({ createdBy: successor.userId }).where(eq(conversations.id, conversationId));
+      }
+      if (!others.some((other) => other.role === "owner")) {
+        await db.update(conversationMembers).set({ role: "owner" }).where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, successor.userId)));
+      }
+    } else {
+      // Nothing left of it: an empty group, or a direct chat whose other half no longer exists.
+      await deleteConversationData(conversationId);
+    }
+  }
+
+  // The person's own rows.
+  await db.delete(sessions).where(eq(sessions.userId, userId));
+  await db.delete(authTokens).where(eq(authTokens.userId, userId));
+  await db.delete(presence).where(eq(presence.userId, userId));
+  await db.delete(pushTokens).where(eq(pushTokens.userId, userId));
+  await db.delete(userSettings).where(eq(userSettings.userId, userId));
+  await db.delete(userAvatars).where(eq(userAvatars.userId, userId));
+  await db.delete(stickers).where(eq(stickers.userId, userId));
+  await db.delete(blockedContacts).where(or(eq(blockedContacts.userId, userId), eq(blockedContacts.blockedUserId, userId)));
+  await db.delete(appeals).where(eq(appeals.userId, userId));
+  await db.delete(calls).where(eq(calls.initiatorId, userId));
+  await db.delete(messageReactions).where(eq(messageReactions.userId, userId));
+  await db.delete(messageStars).where(eq(messageStars.userId, userId));
+  await db.delete(messageHides).where(eq(messageHides.userId, userId));
+  await db.delete(pollVotes).where(eq(pollVotes.userId, userId));
+  await db.delete(messageMedia).where(eq(messageMedia.ownerId, userId));
+
+  // Status updates take their views with them.
+  const statusIds = (await db.select({ id: statusUpdates.id }).from(statusUpdates).where(eq(statusUpdates.userId, userId))).map((row) => row.id);
+  if (statusIds.length > 0) await db.delete(statusViews).where(inArray(statusViews.statusId, statusIds));
+  await db.delete(statusUpdates).where(eq(statusUpdates.userId, userId));
+  await db.delete(statusViews).where(eq(statusViews.viewerId, userId));
+
+  // Broadcast lists are personal, and being named as somebody's recipient is not a membership.
+  const listIds = (await db.select({ id: broadcastLists.id }).from(broadcastLists).where(eq(broadcastLists.userId, userId))).map((row) => row.id);
+  if (listIds.length > 0) await db.delete(broadcastRecipients).where(inArray(broadcastRecipients.listId, listIds));
+  await db.delete(broadcastLists).where(eq(broadcastLists.userId, userId));
+  await db.delete(broadcastRecipients).where(eq(broadcastRecipients.userId, userId));
+
+  // Channels and communities the person ran.
+  const channelIds = (await db.select({ id: channels.id }).from(channels).where(eq(channels.ownerId, userId))).map((row) => row.id);
+  if (channelIds.length > 0) {
+    await db.delete(channelPosts).where(inArray(channelPosts.channelId, channelIds));
+    await db.delete(channelFollowers).where(inArray(channelFollowers.channelId, channelIds));
+  }
+  await db.delete(channels).where(eq(channels.ownerId, userId));
+  await db.delete(channelFollowers).where(eq(channelFollowers.userId, userId));
+  const communityIds = (await db.select({ id: communities.id }).from(communities).where(eq(communities.createdBy, userId))).map((row) => row.id);
+  if (communityIds.length > 0) await db.delete(communityGroups).where(inArray(communityGroups.communityId, communityIds));
+  await db.delete(communities).where(eq(communities.createdBy, userId));
+
+  // Requests they made, and decisions they signed off on - the pointer is cleared, not the request,
+  // so the other admins can still see who is waiting.
+  await db.delete(joinRequests).where(eq(joinRequests.userId, userId));
+  await db.update(joinRequests).set({ decidedBy: null }).where(eq(joinRequests.decidedBy, userId));
+
+  await db.delete(conversationMembers).where(eq(conversationMembers.userId, userId));
+  await db.delete(users).where(eq(users.id, userId));
+}
+
+// ================================================================ stickers
+/** The largest sticker that will be stored: small by design, since a sticker is not a photograph. */
+export const MAX_STICKER_BYTES = 512 * 1024;
+
+export async function addSticker(params: { userId: number; mimeType: string; data: string; id?: string }) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const id = params.id ?? crypto.randomUUID();
+  const [row] = await db
+    .insert(stickers)
+    .values({ id, userId: params.userId, mimeType: params.mimeType, data: params.data })
+    .returning({ id: stickers.id, mimeType: stickers.mimeType, createdAt: stickers.createdAt });
+  return row ?? null;
+}
+
+export async function listStickers(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  return db.select({ id: stickers.id, mimeType: stickers.mimeType, createdAt: stickers.createdAt }).from(stickers).where(eq(stickers.userId, userId)).orderBy(desc(stickers.createdAt)).limit(200);
+}
+
+export async function getSticker(id: string) {
+  const db = await getDb();
+  if (!db) return null;
+  const [row] = await db.select().from(stickers).where(eq(stickers.id, id)).limit(1);
+  return row ?? null;
+}
+
+export async function removeSticker(userId: number, id: string) {
+  const db = await getDb();
+  if (!db) return false;
+  const removed = await db.delete(stickers).where(and(eq(stickers.userId, userId), eq(stickers.id, id))).returning();
+  return removed.length > 0;
+}
+
+// ================================================================ broadcast lists
+export async function createBroadcastList(userId: number, name: string, recipientIds: number[]) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const id = crypto.randomUUID();
+  // Yourself is never a recipient: sending to a list must not deliver to the sender.
+  const recipients = Array.from(new Set(recipientIds)).filter((value) => Number.isInteger(value) && value !== userId);
+  await db.transaction(async (tx) => {
+    await tx.insert(broadcastLists).values({ id, userId, name });
+    if (recipients.length > 0) await tx.insert(broadcastRecipients).values(recipients.map((value) => ({ listId: id, userId: value })));
+  });
+  return { id, recipientCount: recipients.length };
+}
+
+export async function listBroadcastLists(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const lists = await db.select().from(broadcastLists).where(eq(broadcastLists.userId, userId)).orderBy(desc(broadcastLists.updatedAt));
+  if (lists.length === 0) return [];
+  const recipients = await db
+    .select({ listId: broadcastRecipients.listId, userId: broadcastRecipients.userId, name: users.name, username: users.username })
+    .from(broadcastRecipients)
+    .leftJoin(users, eq(users.id, broadcastRecipients.userId))
+    .where(inArray(broadcastRecipients.listId, lists.map((list) => list.id)));
+  return lists.map((list) => ({
+    id: list.id,
+    name: list.name,
+    createdAt: list.createdAt,
+    recipients: recipients.filter((row) => row.listId === list.id).map((row) => ({ userId: row.userId, name: row.name ?? row.username ?? `User ${row.userId}` })),
+  }));
+}
+
+export async function deleteBroadcastList(userId: number, listId: string) {
+  const db = await getDb();
+  if (!db) return false;
+  const [list] = await db.select({ id: broadcastLists.id }).from(broadcastLists).where(and(eq(broadcastLists.id, listId), eq(broadcastLists.userId, userId))).limit(1);
+  if (!list) return false;
+  await db.delete(broadcastRecipients).where(eq(broadcastRecipients.listId, listId));
+  await db.delete(broadcastLists).where(eq(broadcastLists.id, listId));
+  return true;
+}
+
+/** Recipients of one list, refusing to read somebody else's list. */
+export async function broadcastRecipientsFor(userId: number, listId: string) {
+  const db = await getDb();
+  if (!db) return null;
+  const [list] = await db.select().from(broadcastLists).where(and(eq(broadcastLists.id, listId), eq(broadcastLists.userId, userId))).limit(1);
+  if (!list) return null;
+  const rows = await db.select({ userId: broadcastRecipients.userId }).from(broadcastRecipients).where(eq(broadcastRecipients.listId, listId));
+  await db.update(broadcastLists).set({ updatedAt: new Date() }).where(eq(broadcastLists.id, listId));
+  return { name: list.name, recipientIds: rows.map((row) => row.userId) };
+}
+
+// ================================================================ communities
+/**
+ * Communities the person can see: ones they created, plus ones with a group they are in.
+ *
+ * Membership is derived rather than stored - see the note on the tables - so somebody who leaves the
+ * last group of a community stops seeing it without any roster to update.
+ */
+export async function listCommunitiesForUser(userId: number) {
+  const db = await getDb();
+  if (!db) return [];
+  const mine = await db.select({ conversationId: conversationMembers.conversationId }).from(conversationMembers).where(eq(conversationMembers.userId, userId));
+  const groupIds = mine.map((row) => row.conversationId);
+  const links = groupIds.length
+    ? await db.select({ communityId: communityGroups.communityId }).from(communityGroups).where(inArray(communityGroups.conversationId, groupIds))
+    : [];
+  const visibleIds = new Set(links.map((row) => row.communityId));
+  const rows = await db.select().from(communities).orderBy(desc(communities.createdAt));
+  const visible = rows.filter((row) => visibleIds.has(row.id) || row.createdBy === userId);
+  return visible.map((row) => ({ id: row.id, name: row.name, description: row.description, createdBy: row.createdBy, createdAt: row.createdAt, isOwner: row.createdBy === userId }));
+}
+
+export async function createCommunity(userId: number, name: string, description: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const id = crypto.randomUUID();
+  const [row] = await db.insert(communities).values({ id, name, description, createdBy: userId }).returning();
+  return row ?? null;
+}
+
+/** Whether this person may act on the community: its creator, or an admin of one of its groups. */
+export async function canManageCommunity(communityId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return false;
+  const [community] = await db.select({ createdBy: communities.createdBy }).from(communities).where(eq(communities.id, communityId)).limit(1);
+  if (!community) return false;
+  if (community.createdBy === userId) return true;
+  const links = await db.select({ conversationId: communityGroups.conversationId }).from(communityGroups).where(eq(communityGroups.communityId, communityId));
+  if (links.length === 0) return false;
+  const rows = await db
+    .select({ role: conversationMembers.role })
+    .from(conversationMembers)
+    .where(and(inArray(conversationMembers.conversationId, links.map((link) => link.conversationId)), eq(conversationMembers.userId, userId)));
+  return rows.some((row) => row.role === "owner" || row.role === "admin");
+}
+
+export async function canSeeCommunity(communityId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return false;
+  const [community] = await db.select({ createdBy: communities.createdBy }).from(communities).where(eq(communities.id, communityId)).limit(1);
+  if (!community) return false;
+  if (community.createdBy === userId) return true;
+  const links = await db.select({ conversationId: communityGroups.conversationId }).from(communityGroups).where(eq(communityGroups.communityId, communityId));
+  if (links.length === 0) return false;
+  const rows = await db
+    .select({ userId: conversationMembers.userId })
+    .from(conversationMembers)
+    .where(and(inArray(conversationMembers.conversationId, links.map((link) => link.conversationId)), eq(conversationMembers.userId, userId)))
+    .limit(1);
+  return rows.length > 0;
+}
+
+/** A community with its groups and the people in them. */
+export async function communityDetail(communityId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return null;
+  if (!(await canSeeCommunity(communityId, userId))) return null;
+  const [community] = await db.select().from(communities).where(eq(communities.id, communityId)).limit(1);
+  if (!community) return null;
+
+  const links = await db.select({ conversationId: communityGroups.conversationId }).from(communityGroups).where(eq(communityGroups.communityId, communityId));
+  const groupIds = links.map((link) => link.conversationId);
+  const groups = groupIds.length
+    ? await db
+        .select({ id: conversations.id, title: conversations.title, kind: conversations.kind })
+        .from(conversations)
+        .where(inArray(conversations.id, groupIds))
+    : [];
+  const memberRows = groupIds.length
+    ? await db
+        .select({ userId: conversationMembers.userId, name: users.name, username: users.username })
+        .from(conversationMembers)
+        .innerJoin(users, eq(users.id, conversationMembers.userId))
+        .where(inArray(conversationMembers.conversationId, groupIds))
+    : [];
+  // One entry per person, however many of the community's groups they are in.
+  const members = new Map<number, string>();
+  for (const row of memberRows) members.set(row.userId, row.name ?? row.username ?? `User ${row.userId}`);
+
+  return {
+    id: community.id,
+    name: community.name,
+    description: community.description,
+    createdBy: community.createdBy,
+    isOwner: community.createdBy === userId,
+    canManage: await canManageCommunity(communityId, userId),
+    groups,
+    members: Array.from(members.entries()).map(([id, name]) => ({ userId: id, name })),
+  };
+}
+
+/** Links a group into a community. Only a group admin acting on a community they can manage may do it. */
+export async function linkCommunityGroup(communityId: string, conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  if (!(await canManageCommunity(communityId, userId))) throw new Error("Only a community admin can do that");
+  const [conversation] = await db.select({ id: conversations.id, kind: conversations.kind }).from(conversations).where(eq(conversations.id, conversationId)).limit(1);
+  if (!conversation) throw new Error("That group no longer exists");
+  if (conversation.kind !== "group") throw new Error("Only groups can join a community");
+  const access = await getConversationAccess(conversationId, userId);
+  if (!access || !permitted("admins", access.role)) throw new Error("Only an admin of that group can add it to a community");
+  await db.insert(communityGroups).values({ communityId, conversationId }).onConflictDoNothing();
+  return true;
+}
+
+export async function unlinkCommunityGroup(communityId: string, conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return false;
+  if (!(await canManageCommunity(communityId, userId))) throw new Error("Only a community admin can do that");
+  const removed = await db.delete(communityGroups).where(and(eq(communityGroups.communityId, communityId), eq(communityGroups.conversationId, conversationId))).returning();
+  return removed.length > 0;
+}
+
+export async function deleteCommunity(communityId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return false;
+  const [community] = await db.select({ createdBy: communities.createdBy }).from(communities).where(eq(communities.id, communityId)).limit(1);
+  if (!community) return false;
+  // Only the creator may dissolve it, not merely any group admin.
+  if (community.createdBy !== userId) throw new Error("Only the person who created this community can delete it");
+  await db.delete(communityGroups).where(eq(communityGroups.communityId, communityId));
+  await db.delete(communities).where(eq(communities.id, communityId));
+  return true;
 }

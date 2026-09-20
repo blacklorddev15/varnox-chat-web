@@ -2,7 +2,7 @@ import { integer, jsonb, pgEnum, pgTable, primaryKey, serial, text, timestamp, v
 
 export const roleEnum = pgEnum("role", ["user", "admin"]);
 export const conversationKindEnum = pgEnum("conversation_kind", ["direct", "group"]);
-export const messageKindEnum = pgEnum("message_kind", ["text", "image", "video", "file", "voice", "poll", "location", "contact"]);
+export const messageKindEnum = pgEnum("message_kind", ["text", "image", "video", "file", "voice", "poll", "location", "contact", "sticker"]);
 /**
  * What a poll, location or contact message carries.
  *
@@ -57,7 +57,8 @@ export const messageHides = pgTable("messageHides", { messageId: varchar("messag
 export const pollVotes = pgTable("pollVotes", { messageId: varchar("messageId", { length: 64 }).notNull(), userId: integer("userId").notNull(), optionIndex: integer("optionIndex").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.messageId, table.userId] }) }));
 // autoDownloadMedia and defaultDisappearSeconds are the account-wide defaults that any single chat can
 // override. Both start at what the app did before they could be changed: downloads on, timer off.
-export const userSettings = pgTable("userSettings", { userId: integer("userId").primaryKey(), readReceipts: integer("readReceipts").default(1).notNull(), lastSeen: integer("lastSeen").default(1).notNull(), darkTheme: integer("darkTheme").default(0).notNull(), notificationsMessages: integer("notificationsMessages").default(1).notNull(), notificationsGroups: integer("notificationsGroups").default(1).notNull(), notificationsCalls: integer("notificationsCalls").default(1).notNull(), autoDownloadMedia: integer("autoDownloadMedia").default(1).notNull(), defaultDisappearSeconds: integer("defaultDisappearSeconds").default(0).notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
+export const userSettings = pgTable("userSettings", { userId: integer("userId").primaryKey(), readReceipts: integer("readReceipts").default(1).notNull(), lastSeen: integer("lastSeen").default(1).notNull(), darkTheme: integer("darkTheme").default(0).notNull(), notificationsMessages: integer("notificationsMessages").default(1).notNull(), notificationsGroups: integer("notificationsGroups").default(1).notNull(), notificationsCalls: integer("notificationsCalls").default(1).notNull(), autoDownloadMedia: integer("autoDownloadMedia").default(1).notNull(), defaultDisappearSeconds: integer("defaultDisappearSeconds").default(0).notNull(), // Hashed with the same scrypt scheme as the account password. Null means no two-step PIN is set.
+  pinHash: text("pinHash"), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 // ---------------------------------------------------------------- presence
 // "Is this person reachable right now." One upserted row per user rather than an append-only log,
 // because only the latest value is ever read - history would grow for data nothing consumes.
@@ -68,6 +69,36 @@ export type Presence = typeof presence.$inferSelect;
 export const blockedContacts = pgTable("blockedContacts", { userId: integer("userId").notNull(), blockedUserId: integer("blockedUserId").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.userId, table.blockedUserId] }) }));
 export const appeals = pgTable("appeals", { id: serial("id").primaryKey(), userId: integer("userId").notNull(), reason: text("reason").notNull(), status: varchar("status", { length: 16 }).default("pending").notNull(), reviewedBy: integer("reviewedBy"), reviewNote: text("reviewNote"), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 export const authTokens = pgTable("authTokens", { id: serial("id").primaryKey(), userId: integer("userId").notNull(), kind: varchar("kind", { length: 32 }).notNull(), tokenHash: varchar("tokenHash", { length: 128 }).notNull().unique(), expiresAt: timestamp("expiresAt").notNull(), usedAt: timestamp("usedAt"), createdAt: timestamp("createdAt").defaultNow().notNull() });
+
+// ---------------------------------------------------------------- signed-in devices
+// One row per issued session, so a person can see where their account is signed in and end any of it.
+//
+// Sessions are otherwise stateless JWTs, which are impossible to withdraw: the token stays valid until
+// it expires, and nothing can tell it apart from a token that was issued legitimately. The row is what
+// makes "sign out that device" mean something - the id travels in the token as `jti`, and a request
+// whose session row is revoked or gone is refused.
+export const sessions = pgTable("sessions", { id: varchar("id", { length: 64 }).primaryKey(), userId: integer("userId").notNull(), userAgent: varchar("userAgent", { length: 255 }), platform: varchar("platform", { length: 32 }), createdAt: timestamp("createdAt").defaultNow().notNull(), lastSeenAt: timestamp("lastSeenAt").defaultNow().notNull(), revokedAt: timestamp("revokedAt"), expiresAt: timestamp("expiresAt").notNull() });
+
+// ---------------------------------------------------------------- stickers
+// A personal sticker library. There is no artwork to ship and no object storage to host a pack in, so a
+// sticker is something the person makes: an image they already sent or received, kept in their own
+// library and trimmed to a square by the client before it is stored. That keeps the feature real without
+// inventing a pack gallery that has no images behind it.
+export const stickers = pgTable("stickers", { id: varchar("id", { length: 64 }).primaryKey(), userId: integer("userId").notNull(), mimeType: text("mimeType").notNull(), data: text("data").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() });
+
+// ---------------------------------------------------------------- broadcast lists
+// A list is personal and one-way: it names a set of people, and sending to it delivers an ordinary
+// direct message to each of them. Nobody sees that the message went to more than one person, which is
+// the whole point of the feature and the reason recipients are just user ids rather than a conversation.
+export const broadcastLists = pgTable("broadcastLists", { id: varchar("id", { length: 64 }).primaryKey(), userId: integer("userId").notNull(), name: varchar("name", { length: 64 }).notNull(), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
+export const broadcastRecipients = pgTable("broadcastRecipients", { listId: varchar("listId", { length: 64 }).notNull(), userId: integer("userId").notNull() }, (table) => ({ pk: primaryKey({ columns: [table.listId, table.userId] }) }));
+
+// ---------------------------------------------------------------- communities
+// A community gathers existing groups rather than owning its own membership. Who belongs is therefore
+// derived from the linked groups instead of being stored again: a second roster would drift the moment
+// somebody left a group, and there would be two answers to the same question.
+export const communities = pgTable("communities", { id: varchar("id", { length: 64 }).primaryKey(), name: varchar("name", { length: 80 }).notNull(), description: varchar("description", { length: 255 }), createdBy: integer("createdBy").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() });
+export const communityGroups = pgTable("communityGroups", { communityId: varchar("communityId", { length: 64 }).notNull(), conversationId: varchar("conversationId", { length: 64 }).notNull() }, (table) => ({ pk: primaryKey({ columns: [table.communityId, table.conversationId] }) }));
 
 export type User = typeof users.$inferSelect;
 export type InsertUser = typeof users.$inferInsert;

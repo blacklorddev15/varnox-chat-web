@@ -57,6 +57,13 @@
       "when": 1789879860558,
       "tag": "0007_sturdy_microchip",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1789880631320,
+      "tag": "0008_wealthy_winter_soldier",
+      "breakpoints": true
     }
   ]
 }

@@ -1,18 +1,28 @@
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { isObjectStorageConfigured } from "./storage";
 import { MAX_DB_MEDIA_BYTES } from "./_core/mediaRoutes";
 import { COOKIE_NAME } from "../shared/const.js";
 import { getSessionCookieOptions } from "./_core/cookies";
+import { hashPassword, sendEmail, verifyPassword } from "./_core/passwordAuth";
+import { normalizePhone } from "./_core/phoneAuth";
+import { sdk } from "./_core/sdk";
 import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { createRoomToken, isLiveKitConfigured, liveKitUrl } from "./livekit";
 import { addConversationMembers, clearUserAvatar, createAppeal, createCallRecord, createGroupConversation, createMessage, createConversation, findOrCreateDirectConversation, expireStaleCalls, getCallRecord, getConversationRole, getIncomingCallForUser, getUserByUsername, getUserById, getUserSettings, isConversationMember, listRecentCalls, setCallStatus, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings, adminRemoveStatus, createChannel, createChannelPost, createStatus, deleteStatus, deleteChannel, followChannel, getChannel, getChannelDetail, getChannelPost, getStatus, isChannelFollower, saveMessageMedia, listActiveStatusesByAuthors, listChannelFollowers, listChannelPosts, listChannelPostsForAdmin, listChannelsForAdmin, listChannelsForUser, listContactIdsForUser, listStatusesForAdmin, listStatusViewers, listViewedStatusIds, markChannelRead, markStatusViewed, removeChannelPost, searchChannels, setChannelSuspended, unfollowChannel } from "./db";
 import { storagePut } from "./storage";
 import { notifyConversationMembers } from "./push";
-import { messages } from "../drizzle/schema";
+import { messages, type User } from "../drizzle/schema";
 // Message actions (reactions, stars, edits, deletes, per-chat preferences) sit with the other
 // row-level operations in db.ts; imported on their own line so the list above stays readable.
 import { castPollVote, chatSettingsFor, consumeViewOnce, conversationNeedsApproval, createInviteLink, decideJoinRequest, deleteMessageForEveryone, editMessageBody, effectiveDisappearSeconds, exportConversationTranscript, getConversationAccess, getConversationPermissions, getMessageById, hideMessageForUser, listInviteLinks, listJoinRequests, listStarredMessages, markConversationDelivered, permitted, reactToMessage, redeemInviteLink, revokeInviteLink, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setConversationPermissions, setMessageStar } from "./db";
 // Presence: who is around right now, and who is mid-sentence. Also in db.ts, for the same reason.
+import {
+  addSticker, broadcastRecipientsFor, communityDetail, consumeAuthToken, createAuthToken, createBroadcastList, createCommunity,
+  deleteBroadcastList, deleteCommunity, deleteUserAccount, getPinHash, linkCommunityGroup, listBroadcastLists, listCommunitiesForUser,
+  listSessions, listStickers, MAX_STICKER_BYTES, removeSticker, revokeOtherSessions, revokeSession, setPinHash,
+  unlinkCommunityGroup,
+} from "./db";
 import { getConversationSummary, leaveGroup, listConversationMemberIds, listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
 // Server-Sent Events nudge channel; see nudgeConversation below.
 import { isRealtimeEnabled, publishToUsers } from "./realtime";
@@ -46,7 +56,7 @@ async function nudgeConversation(conversationId: string, actorId: number, type: 
   }
 }
 
-const messageKind = z.enum(["text", "image", "video", "file", "voice", "poll", "location", "contact"]);
+const messageKind = z.enum(["text", "image", "video", "file", "voice", "poll", "location", "contact", "sticker"]);
 
 // ---- poll / location / contact payloads --------------------------------------------------------
 // These three kinds carry no file, so their content rides in `messages.meta`. It is validated here
@@ -76,6 +86,35 @@ function normalizeMessageMeta(kind: string, raw: unknown) {
 }
 
 /** Who a group setting allows to act: everyone in the group, or only its admins. */
+/** PIN failures per account. See verifyPin for why this is a speed bump rather than a wall. */
+const pinAttempts = new Map<number, { failures: number; lockedUntil: number }>();
+
+function lockedForMsOf(lockedUntil: number, now: number) {
+  return lockedUntil > now ? lockedUntil - now : 0;
+}
+
+/** Confirms the account password before anything irreversible or security-relevant happens. */
+async function requireAccountPassword(user: User, password: string) {
+  if (!user.passwordHash) throw new Error("This account does not sign in with a password, so this cannot be confirmed here");
+  if (!(await verifyPassword(password, user.passwordHash))) throw new Error("That password is not right");
+}
+
+/**
+ * Binds a one-time code to the number it was requested for, by hashing the two together.
+ *
+ * The table stores only the hash, so a code that leaks on its own cannot be spent on a different
+ * number - the confirmation has to present the same pair.
+ */
+function bindCodeToPhone(code: string, phone: string) {
+  return createHash("sha256").update(`${code}:${phone}`).digest("hex");
+}
+
+function maskEmail(email: string) {
+  const [name, domain] = email.split("@");
+  if (!domain) return "your email";
+  return `${name.slice(0, 1)}${"*".repeat(Math.max(1, name.length - 1))}@${domain}`;
+}
+
 const permissionWho = z.enum(["all", "admins"]);
 
 /** Options of a stored poll, read defensively: `meta` is JSON that an older or newer build wrote. */
@@ -267,7 +306,7 @@ export const appRouter = router({
       // Polls, locations and contacts carry their content in `meta`; the media kinds carry none.
       const meta = normalizeMessageMeta(input.kind, input.meta);
       if (!meta && (input.kind === "poll" || input.kind === "location" || input.kind === "contact")) throw new Error("That message arrived without its content");
-      const message: typeof messages.$inferInsert = { id: crypto.randomUUID(), conversationId: input.conversationId, senderId: ctx.user.id, body: input.body ?? null, kind: input.kind, mediaUrl: input.mediaUrl ?? null, mediaMime: input.mediaMime ?? null, mediaName: input.mediaName ?? null, voiceDurationMs: input.voiceDurationMs ?? null, replyToId: input.replyToId ?? null, forwardedFromId: input.forwardedFromId ?? null, viewOnce: input.viewOnce ? 1 : 0, meta, expiresAt: disappearSeconds ? new Date(Date.now() + disappearSeconds * 1000) : null };
+      const message: typeof messages.$inferInsert = { id: randomUUID(), conversationId: input.conversationId, senderId: ctx.user.id, body: input.body ?? null, kind: input.kind, mediaUrl: input.mediaUrl ?? null, mediaMime: input.mediaMime ?? null, mediaName: input.mediaName ?? null, voiceDurationMs: input.voiceDurationMs ?? null, replyToId: input.replyToId ?? null, forwardedFromId: input.forwardedFromId ?? null, viewOnce: input.viewOnce ? 1 : 0, meta, expiresAt: disappearSeconds ? new Date(Date.now() + disappearSeconds * 1000) : null };
       const created = await createMessage(message);
       // A view-once photo must not be described in the notification body.
       const preview = input.viewOnce ? "Photo (view once)" : input.body ?? (input.kind === "voice" ? "Voice note" : meta?.kind === "poll" ? `Poll: ${meta.question}` : meta?.kind === "location" ? "Location" : meta?.kind === "contact" ? `Contact: ${meta.name}` : "Shared media");
@@ -499,6 +538,231 @@ export const appRouter = router({
      */
     setMessageTimer: protectedProcedure.input(z.object({ seconds: z.number().int().min(0).max(7776000) })).mutation(({ ctx, input }) => updateUserSettings(ctx.user.id, { defaultDisappearSeconds: input.seconds })),
   }),
+
+  security: router({
+    /** Whether a two-step PIN is set, so the lock screen knows whether it has anything to ask for. */
+    status: protectedProcedure.query(async ({ ctx }) => ({ pinSet: Boolean(await getPinHash(ctx.user.id)) })),
+
+    /** Every device currently signed in, with the one asking marked so it cannot be ended by mistake. */
+    devices: protectedProcedure.query(async ({ ctx }) => {
+      const [rows, current] = await Promise.all([listSessions(ctx.user.id), sdk.sessionIdFromRequest(ctx.req)]);
+      return rows.map((row) => ({ id: row.id, userAgent: row.userAgent, platform: row.platform, createdAt: row.createdAt, lastSeenAt: row.lastSeenAt, current: row.id === current }));
+    }),
+
+    revokeDevice: protectedProcedure.input(z.object({ sessionId: z.string().min(1).max(64) })).mutation(async ({ ctx, input }) => {
+      const revoked = await revokeSession(ctx.user.id, input.sessionId);
+      if (!revoked) throw new Error("That device is not signed in any more");
+      return { ok: true as const };
+    }),
+
+    revokeOtherDevices: protectedProcedure.mutation(async ({ ctx }) => {
+      const count = await revokeOtherSessions(ctx.user.id, await sdk.sessionIdFromRequest(ctx.req));
+      return { count };
+    }),
+
+    setPin: protectedProcedure.input(z.object({ password: z.string().min(1).max(128), pin: z.string().regex(/^\d{4,8}$/, "Use 4 to 8 digits") })).mutation(async ({ ctx, input }) => {
+      await requireAccountPassword(ctx.user, input.password);
+      await setPinHash(ctx.user.id, await hashPassword(input.pin));
+      return { ok: true as const };
+    }),
+
+    removePin: protectedProcedure.input(z.object({ password: z.string().min(1).max(128) })).mutation(async ({ ctx, input }) => {
+      await requireAccountPassword(ctx.user, input.password);
+      await setPinHash(ctx.user.id, null);
+      return { ok: true as const };
+    }),
+
+    /**
+     * Checks a PIN to unlock the app.
+     *
+     * Failures are counted in memory per account and the fifth attempt onwards is refused for a while.
+     * A per-instance counter is a speed bump rather than a wall - it resets when the serverless function
+     * recycles - but the alternative is unlimited guesses at a four digit code, and the session is
+     * already required to get this far.
+     */
+    verifyPin: protectedProcedure.input(z.object({ pin: z.string().min(1).max(16) })).mutation(async ({ ctx, input }) => {
+      const hash = await getPinHash(ctx.user.id);
+      if (!hash) return { ok: true, pinSet: false };
+      const now = Date.now();
+      const record = pinAttempts.get(ctx.user.id);
+      if (record && record.lockedUntil > now) {
+        return { ok: false, pinSet: true, lockedForMs: record.lockedUntil - now };
+      }
+      const ok = await verifyPassword(input.pin, hash);
+      if (ok) {
+        pinAttempts.delete(ctx.user.id);
+        return { ok: true, pinSet: true };
+      }
+      const failures = (record && record.lockedUntil <= now ? record.failures : 0) + 1;
+      // Five tries, then a pause that doubles from a minute up to fifteen.
+      const lockedUntil = failures >= 5 ? now + Math.min(60_000 * 2 ** (failures - 5), 15 * 60_000) : 0;
+      pinAttempts.set(ctx.user.id, { failures, lockedUntil });
+      return { ok: false, pinSet: true, attemptsLeft: Math.max(0, 5 - failures), lockedForMs: lockedForMsOf(lockedUntil, now) };
+    }),
+  }),
+
+  account: router({
+    /**
+     * Starts a phone-number change. The code goes to the email on the account and is bound to the number
+     * being claimed, so a code that leaks cannot be used to move the account somewhere else.
+     */
+    startNumberChange: protectedProcedure.input(z.object({ password: z.string().min(1).max(128), phone: z.string().trim().regex(/^\+?\d{7,15}$/, "Enter a valid phone number") })).mutation(async ({ ctx, input }) => {
+      await requireAccountPassword(ctx.user, input.password);
+      if (!ctx.user.email) throw new Error("This account has no email address to send a code to");
+      const normalized = normalizePhone(input.phone);
+      const code = String(Math.floor(100000 + Math.random() * 900000));
+      await createAuthToken(ctx.user.id, "change-phone", bindCodeToPhone(code, normalized), new Date(Date.now() + 30 * 60 * 1000));
+      const delivered = await sendEmail(ctx.user.email, "Confirm your new Varnox number", code, "number change");
+      return { sent: true, phone: normalized, delivered, devCode: delivered ? undefined : code, emailHint: maskEmail(ctx.user.email) };
+    }),
+
+    confirmNumberChange: protectedProcedure.input(z.object({ code: z.string().trim().min(4).max(8), phone: z.string().trim().regex(/^\+?\d{7,15}$/) })).mutation(async ({ ctx, input }) => {
+      const normalized = normalizePhone(input.phone);
+      const record = await consumeAuthToken("change-phone", bindCodeToPhone(input.code, normalized));
+      if (!record || record.userId !== ctx.user.id) throw new Error("That code is not valid or has expired");
+      await updateUserProfile(ctx.user.id, { phone: normalized });
+      return { phone: normalized };
+    }),
+
+    /**
+     * Deletes the account for good.
+     *
+     * Two confirmations on purpose: the account password, and a phrase typed out in full. A single
+     * button next to "Sign out" is how people delete an account they meant to keep.
+     */
+    deleteAccount: protectedProcedure.input(z.object({ password: z.string().min(1).max(128), confirm: z.string() })).mutation(async ({ ctx, input }) => {
+      if (input.confirm.trim() !== "DELETE") throw new Error('Type DELETE to confirm');
+      await requireAccountPassword(ctx.user, input.password);
+      await deleteUserAccount(ctx.user.id);
+      const cookieOptions = getSessionCookieOptions(ctx.req);
+      ctx.res.clearCookie(COOKIE_NAME, { ...cookieOptions, maxAge: -1 });
+      return { ok: true as const };
+    }),
+  }),
+
+  stickers: router({
+    list: protectedProcedure.query(({ ctx }) => listStickers(ctx.user.id)),
+
+    /**
+     * Keeps a sticker. The image arrives as base64 exactly like an attachment, but with a much lower
+     * ceiling: a sticker is a small graphic, and letting photographs in would turn a picker into a
+     * second photo library.
+     */
+    add: protectedProcedure.input(z.object({ base64: z.string().min(1).max(4_000_000), mimeType: z.string().regex(/^image\/(png|jpe?g|webp|gif)$/) })).mutation(async ({ ctx, input }) => {
+      const bytes = Buffer.from(input.base64, "base64");
+      if (bytes.length > MAX_STICKER_BYTES) throw new Error(`Stickers have to be under ${Math.round(MAX_STICKER_BYTES / 1024)} KB. Try a smaller image.`);
+      const sticker = await addSticker({ userId: ctx.user.id, mimeType: input.mimeType, data: input.base64 });
+      if (!sticker) throw new Error("Could not save that sticker");
+      // The client sends this straight back as the message's mediaUrl, so it is absolute from here.
+      return { id: sticker.id, url: `/api/sticker/${sticker.id}`, createdAt: sticker.createdAt };
+    }),
+
+    remove: protectedProcedure.input(z.object({ id: z.string().min(1).max(64) })).mutation(async ({ ctx, input }) => {
+      const removed = await removeSticker(ctx.user.id, input.id);
+      if (!removed) throw new Error("That sticker is not in your library");
+      return { ok: true as const };
+    }),
+  }),
+
+  broadcasts: router({
+    list: protectedProcedure.query(({ ctx }) => listBroadcastLists(ctx.user.id)),
+
+    create: protectedProcedure.input(z.object({ name: z.string().trim().min(1).max(64), memberIds: z.array(z.number().int().positive()).min(1).max(256) })).mutation(async ({ ctx, input }) => {
+      const blocked = new Set((await listBlockedContacts(ctx.user.id)).map((row) => row.id));
+      const allowed = input.memberIds.filter((id) => !blocked.has(id) && id !== ctx.user.id);
+      if (allowed.length === 0) throw new Error("A list needs at least one contact you have not blocked");
+      return createBroadcastList(ctx.user.id, input.name.trim(), allowed);
+    }),
+
+    remove: protectedProcedure.input(z.object({ listId: z.string().min(1).max(64) })).mutation(async ({ ctx, input }) => {
+      const removed = await deleteBroadcastList(ctx.user.id, input.listId);
+      if (!removed) throw new Error("That list does not exist");
+      return { ok: true as const };
+    }),
+
+    /**
+     * Sends one message to everybody on a list.
+     *
+     * Each recipient gets an ordinary direct message, and nothing in it says it went to more than one
+     * person - that is the point of the feature. A recipient who cannot be reached (never messaged
+     * before, or now blocked) is reported rather than silently dropped.
+     */
+    send: protectedProcedure.input(z.object({ listId: z.string().min(1).max(64), body: z.string().trim().min(1).max(10000) })).mutation(async ({ ctx, input }) => {
+      const list = await broadcastRecipientsFor(ctx.user.id, input.listId);
+      if (!list) throw new Error("That list does not exist");
+      if (list.recipientIds.length === 0) throw new Error("That list has nobody on it");
+
+      const blocked = new Set((await listBlockedContacts(ctx.user.id)).map((row) => row.id));
+      let delivered = 0;
+      const failed: number[] = [];
+      for (const recipientId of list.recipientIds) {
+        if (blocked.has(recipientId)) {
+          failed.push(recipientId);
+          continue;
+        }
+        try {
+          const direct = await findOrCreateDirectConversation(ctx.user.id, recipientId);
+          if (!direct) {
+            failed.push(recipientId);
+            continue;
+          }
+          const conversationId = direct.conversationId;
+          const message = await createMessage({
+            id: randomUUID(),
+            conversationId,
+            senderId: ctx.user.id,
+            kind: "text",
+            body: input.body,
+            expiresAt: null,
+          });
+          if (message) {
+            delivered += 1;
+            void nudgeConversation(conversationId, ctx.user.id, "message");
+          } else {
+            failed.push(recipientId);
+          }
+        } catch {
+          failed.push(recipientId);
+        }
+      }
+      return { delivered, failed, listName: list.name };
+    }),
+  }),
+
+  communities: router({
+    list: protectedProcedure.query(({ ctx }) => listCommunitiesForUser(ctx.user.id)),
+
+    create: protectedProcedure.input(z.object({ name: z.string().trim().min(1).max(80), description: z.string().trim().max(255).optional() })).mutation(async ({ ctx, input }) => {
+      const created = await createCommunity(ctx.user.id, input.name.trim(), input.description?.trim() || null);
+      if (!created) throw new Error("Could not create that community");
+      return { id: created.id, name: created.name };
+    }),
+
+    detail: protectedProcedure.input(z.object({ communityId: z.string().min(1).max(64) })).query(async ({ ctx, input }) => {
+      const detail = await communityDetail(input.communityId, ctx.user.id);
+      if (!detail) throw new Error("You cannot see that community");
+      return detail;
+    }),
+
+    linkGroup: protectedProcedure.input(z.object({ communityId: z.string().min(1).max(64), conversationId: z.string().min(1).max(64) })).mutation(async ({ ctx, input }) => {
+      await linkCommunityGroup(input.communityId, input.conversationId, ctx.user.id);
+      void nudgeConversation(input.conversationId, ctx.user.id, "group-updated");
+      return { ok: true as const };
+    }),
+
+    unlinkGroup: protectedProcedure.input(z.object({ communityId: z.string().min(1).max(64), conversationId: z.string().min(1).max(64) })).mutation(async ({ ctx, input }) => {
+      const removed = await unlinkCommunityGroup(input.communityId, input.conversationId, ctx.user.id);
+      if (!removed) throw new Error("That group is not in this community");
+      return { ok: true as const };
+    }),
+
+    remove: protectedProcedure.input(z.object({ communityId: z.string().min(1).max(64) })).mutation(async ({ ctx, input }) => {
+      const removed = await deleteCommunity(input.communityId, ctx.user.id);
+      if (!removed) throw new Error("That community does not exist");
+      return { ok: true as const };
+    }),
+  }),
+
   blocks: router({
     list: protectedProcedure.query(({ ctx }) => listBlockedContacts(ctx.user.id)),
     block: protectedProcedure.input(z.object({ userId: z.number().int().positive() })).mutation(({ ctx, input }) => setBlockedContact(ctx.user.id, input.userId, true)),
@@ -592,7 +856,7 @@ export const appRouter = router({
       if (!channel) throw new Error("That channel no longer exists");
       if (channel.ownerId !== ctx.user.id) throw new Error("Only the channel owner can post");
       if (channel.suspendedAt) throw new Error("This channel is suspended, so it cannot post");
-      const id = await createChannelPost({ id: crypto.randomUUID(), channelId: channel.id, authorId: ctx.user.id, body: input.body, mediaUrl: input.mediaUrl ?? null });
+      const id = await createChannelPost({ id: randomUUID(), channelId: channel.id, authorId: ctx.user.id, body: input.body, mediaUrl: input.mediaUrl ?? null });
       return { id };
     }),
     removePost: protectedProcedure.input(z.object({ postId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
