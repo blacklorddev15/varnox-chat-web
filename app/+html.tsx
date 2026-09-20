@@ -12,17 +12,31 @@ import type { PropsWithChildren } from "react";
  * that shell means carrying it over.
  */
 
-/** Matches theme.config.js, so the page does not flash white before the app paints. */
+/**
+ * The page behind the app, and it is the dark value unconditionally.
+ *
+ * This used to paint the light `#F0F2F5` unless the device was set to dark mode, on the assumption
+ * that it matched theme.config.js. It matched the *light* half of it. The app is fixed to dark -
+ * ThemeProvider hardcodes the scheme, it does not follow the system - so on a phone in light mode
+ * the document behind the app was white, and any part of the screen the app does not paint was
+ * white with it. That is the surface that showed up as "the app has gone white": nothing was
+ * themed wrongly, the page underneath simply did not agree with the app on top of it.
+ *
+ * Hardcoding it also removes a flash of the wrong colour between the document painting and React
+ * mounting, which is what the media query was trying to avoid in the first place.
+ */
 const background = `
-html, body { background-color: #F0F2F5; }
-@media (prefers-color-scheme: dark) { html, body { background-color: #0B141A; } }
+html, body { background-color: #0B141A; color-scheme: dark; }
 input, textarea { background-color: transparent; }
 input:focus, textarea:focus { outline: none; }
 `;
 
 export default function Root({ children }: PropsWithChildren) {
   return (
-    <html lang="en">
+    // `className="dark"` from the first paint rather than a moment after mount. ThemeProvider toggles
+    // this class on the client, and any `dark:`-scoped style was therefore resolving to its light
+    // value until React got there.
+    <html lang="en" className="dark">
       <head>
         <meta charSet="utf-8" />
         <meta httpEquiv="X-UA-Compatible" content="IE=edge" />

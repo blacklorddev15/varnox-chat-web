@@ -186,12 +186,26 @@ export function CallProvider({ children }: { children: ReactNode }) {
      * keeps "Ringing…" while it rings and switches the moment somebody joins.
      */
     const promoteOnAnswer = () => {
-      setRemoteCount(instance.remoteParticipants.size);
+      const others = instance.remoteParticipants.size;
+      setRemoteCount(others);
       // Somebody has to actually be there. This is called once after connecting as well, to cover a
       // room that already had people in it, and without the count it promoted every outgoing call to
       // "active" the instant it connected - replacing "Ringing…" with "Connecting…" and hiding that
       // nobody had picked up, which is precisely what the caller needs to see while they wait.
-      if (instance.remoteParticipants.size > 0 && phaseRef.current === "ringing-out") setPhaseBoth("active");
+      if (others === 0) return;
+
+      // Somebody is here, so this is no longer a ringing call - and the ring timeout must go with
+      // that, because what it does is hang up.
+      //
+      // It was left armed. startCall sets a 45 second timer to abandon an unanswered call, and
+      // nothing cancelled it when the call was answered, so a call picked up at 40 seconds was torn
+      // down at 45 - the caller's side closing itself mid-conversation. From the other end that is a
+      // person who answers, connects, and then finds nobody there and no sound, which is exactly the
+      // report: answered, and could not hear anybody.
+      if (ringTimer.current) clearTimeout(ringTimer.current);
+      ringTimer.current = null;
+
+      if (phaseRef.current === "ringing-out") setPhaseBoth("active");
     };
     instance.on(RoomEvent.ParticipantConnected, promoteOnAnswer);
     // Deliberately not the same handler: somebody else leaving does not make this side stop being a
