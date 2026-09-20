@@ -38,6 +38,12 @@ export default function ChatSettingsScreen() {
   const setDisappearing = trpc.conversations.setDisappearing.useMutation();
   const utils = trpc.useUtils();
 
+  // Chat lock is per person: this reads the reader's own membership flag, not anything shared with
+  // the conversation, so locking a chat here never locks it for anybody else.
+  const lockedChats = trpc.conversations.lockedChats.useQuery();
+  const setChatLock = trpc.conversations.setChatLock.useMutation({ onSuccess: () => lockedChats.refetch() });
+  const locked = Boolean(lockedChats.data?.includes(conversationId));
+
   // A local copy so a switch does not flick back while the mutation is in flight.
   const [mediaAutoLoad, setMediaAutoLoad] = useState<boolean | null>(null);
   useEffect(() => {
@@ -111,6 +117,26 @@ export default function ChatSettingsScreen() {
                   </Text>
                 </View>
                 <Switch value={effectiveMedia} onValueChange={toggleMedia} disabled={working} trackColor={{ false: colors.border, true: "#A7E8CD" }} thumbColor={effectiveMedia ? colors.success : "#fff"} />
+              </View>
+            </View>
+
+            <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
+              <View style={styles.row}>
+                <View style={styles.copy}>
+                  <Text style={[styles.rowTitle, { color: colors.foreground }]}>Chat lock</Text>
+                  <Text style={[styles.sub, { color: colors.muted }]}>
+                    {locked
+                      ? "This chat asks for your PIN before it opens. It relocks when you close the app."
+                      : "Ask for your PIN before this chat opens."}
+                  </Text>
+                </View>
+                <Switch
+                  value={locked}
+                  onValueChange={() => void setChatLock.mutate({ conversationId, locked: !locked })}
+                  disabled={setChatLock.isPending}
+                  trackColor={{ false: colors.border, true: "#A7E8CD" }}
+                  thumbColor={locked ? colors.success : "#fff"}
+                />
               </View>
             </View>
 
