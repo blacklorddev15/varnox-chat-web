@@ -3,6 +3,8 @@ import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { appeals, authTokens, blockedContacts, broadcastLists, broadcastRecipients, calls, catalogItems, webPushSubscriptions, channelFollowers, channelPosts, channels, communities, communityGroups, contacts, conversationIcons, conversationMembers, conversations, deviceLinkCodes, eventRsvps, events, groupEvents, InsertUser, inviteLinks, joinRequests, linkPreviews, liveLocations, messageHides, messageKeeps, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, reports, sessions, statusUpdates, statusViews, stickers, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
+import { PASSWORD_OPEN_ID_PREFIX } from "../shared/const.js";
+import { isOwnerUsername } from "../shared/owners.js";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 let _pool: Pool | null = null;
@@ -13,6 +15,23 @@ export async function getDb() {
     catch (error) { console.warn("[Database] Failed to connect:", error); _db = null; }
   }
   return _db;
+}
+
+/**
+ * The username on the row being upserted, or the one its openId encodes.
+ *
+ * Sign-in calls upsertUser with nothing but the openId, so an allowlist check reading `user.username`
+ * would find nothing to match and an account that is meant to be an admin would never be promoted on
+ * a login that happened before its first registration path ran. Password accounts carry their
+ * username in the openId, so it can be recovered from there.
+ *
+ * Returns null when there is genuinely no username to be had - a phone or OAuth account signing in -
+ * which simply means the allowlist does not apply and the openId comparison is the only grant.
+ */
+function accountUsername(user: InsertUser): string | null {
+  if (user.username) return user.username;
+  const openId = user.openId ?? "";
+  return openId.startsWith(PASSWORD_OPEN_ID_PREFIX) ? openId.slice(PASSWORD_OPEN_ID_PREFIX.length) : null;
 }
 
 export async function upsertUser(user: InsertUser): Promise<void> {
@@ -29,7 +48,7 @@ export async function upsertUser(user: InsertUser): Promise<void> {
   }
   if (user.lastSignedIn !== undefined) { values.lastSignedIn = user.lastSignedIn; updateSet.lastSignedIn = user.lastSignedIn; }
   if (user.role !== undefined) { values.role = user.role; updateSet.role = user.role; }
-  else if (user.openId === ENV.ownerOpenId) { values.role = "admin"; updateSet.role = "admin"; }
+  else if (user.openId === ENV.ownerOpenId || isOwnerUsername(accountUsername(user))) { values.role = "admin"; updateSet.role = "admin"; }
   if (user.moderationStatus !== undefined) { values.moderationStatus = user.moderationStatus; updateSet.moderationStatus = user.moderationStatus; }
   if (user.suspendedUntil !== undefined) { values.suspendedUntil = user.suspendedUntil; updateSet.suspendedUntil = user.suspendedUntil; }
   if (!values.lastSignedIn) values.lastSignedIn = new Date();

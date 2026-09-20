@@ -7,7 +7,7 @@ import { getSessionCookieOptions } from "./_core/cookies";
 import { hashPassword, sendEmail, verifyPassword } from "./_core/passwordAuth";
 import { normalizePhone } from "./_core/phoneAuth";
 import { sdk } from "./_core/sdk";
-import { adminProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
+import { ownerProcedure, protectedProcedure, publicProcedure, router } from "./_core/trpc";
 import { createRoomToken, isLiveKitConfigured, liveKitUrl } from "./livekit";
 import { addConversationMembers, appealStatusForUsername, clearUserAvatar, createAppeal, createCallRecord, createGroupConversation, createMessage, createConversation, findOrCreateDirectConversation, expireStaleCalls, getCallRecord, getConversationRole, getIncomingCallForUser, getUserByUsername, getUserById, getUserSettings, isConversationMember, listRecentCalls, setCallStatus, listAppealsForAdmin, listAppealsForUser, listBlockedContacts, listConversationMembersDetailed, listConversationsForUser, listMessages, listUsersForAdmin, markConversationRead, moderateUser, registerPushToken, removeConversationMember, reviewAppeal, searchMessages, searchUsers, setBlockedContact, setConversationMemberRole, setUserAvatar, updateUserProfile, updateUserSettings, adminRemoveStatus, createChannel, createChannelPost, createStatus, deleteStatus, deleteChannel, followChannel, getChannel, getChannelDetail, getChannelPost, getStatus, isChannelFollower, saveMessageMedia, listActiveStatusesByAuthors, listChannelFollowers, listChannelPosts, listChannelPostsForAdmin, listChannelsForAdmin, listChannelsForUser, listContactIdsForUser, listStatusesForAdmin, listStatusViewers, listViewedStatusIds, markChannelRead, markStatusViewed, removeChannelPost, searchChannels, setChannelSuspended, unfollowChannel } from "./db";
 import { storagePut } from "./storage";
@@ -1321,15 +1321,15 @@ export const appRouter = router({
     }),
   }),
   admin: router({
-    users: adminProcedure.query(() => listUsersForAdmin()),
-    appeals: adminProcedure.query(() => listAppealsForAdmin()),
-    reviewAppeal: adminProcedure.input(z.object({ id: z.number().int().positive(), status: z.enum(["approved", "rejected"]), note: z.string().max(1000).optional() })).mutation(({ ctx, input }) => reviewAppeal(input.id, ctx.user.id, input.status, input.note?.trim() || null)),
+    users: ownerProcedure.query(() => listUsersForAdmin()),
+    appeals: ownerProcedure.query(() => listAppealsForAdmin()),
+    reviewAppeal: ownerProcedure.input(z.object({ id: z.number().int().positive(), status: z.enum(["approved", "rejected"]), note: z.string().max(1000).optional() })).mutation(({ ctx, input }) => reviewAppeal(input.id, ctx.user.id, input.status, input.note?.trim() || null)),
     // The abuse-report queue. Deciding a report does not itself punish anyone: a suspension is a
     // separate, deliberate call through `moderate`, so one moderator cannot quietly ban on a
     // single unverified complaint.
-    reports: adminProcedure.query(() => listReportsForAdmin()),
-    reviewReport: adminProcedure.input(z.object({ id: z.number().int().positive(), status: z.enum(["closed", "actioned"]), note: z.string().max(1000).optional() })).mutation(({ ctx, input }) => reviewReport(input.id, ctx.user.id, input.status, input.note?.trim() || null)),
-    moderate: adminProcedure.input(z.object({ userId: z.number().int().positive(), status: z.enum(["active", "suspended", "banned"]), durationHours: z.number().int().min(1).max(8760).optional(), reason: z.string().max(500).optional() })).mutation(async ({ ctx, input }) => {
+    reports: ownerProcedure.query(() => listReportsForAdmin()),
+    reviewReport: ownerProcedure.input(z.object({ id: z.number().int().positive(), status: z.enum(["closed", "actioned"]), note: z.string().max(1000).optional() })).mutation(({ ctx, input }) => reviewReport(input.id, ctx.user.id, input.status, input.note?.trim() || null)),
+    moderate: ownerProcedure.input(z.object({ userId: z.number().int().positive(), status: z.enum(["active", "suspended", "banned"]), durationHours: z.number().int().min(1).max(8760).optional(), reason: z.string().max(500).optional() })).mutation(async ({ ctx, input }) => {
       if (input.userId === ctx.user.id) throw new Error("Administrators cannot moderate their own account");
       const until = input.status === "suspended" ? new Date(Date.now() + (input.durationHours ?? 24) * 60 * 60 * 1000) : null;
       const user = await moderateUser(input.userId, input.status, until, input.reason?.trim() || null);
@@ -1337,22 +1337,22 @@ export const appRouter = router({
       return { id: user.id, status: user.moderationStatus, suspendedUntil: user.suspendedUntil };
     }),
     // ---- status + channel moderation: list, then remove or suspend ----------------------
-    statuses: adminProcedure.query(() => listStatusesForAdmin()),
-    removeStatus: adminProcedure.input(z.object({ statusId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+    statuses: ownerProcedure.query(() => listStatusesForAdmin()),
+    removeStatus: ownerProcedure.input(z.object({ statusId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
       await adminRemoveStatus(input.statusId, ctx.user.id);
       return { ok: true as const };
     }),
-    channels: adminProcedure.query(() => listChannelsForAdmin()),
-    channelPosts: adminProcedure.query(() => listChannelPostsForAdmin()),
-    suspendChannel: adminProcedure.input(z.object({ channelId: z.string().min(1), suspended: z.boolean(), reason: z.string().max(500).optional() })).mutation(async ({ input }) => {
+    channels: ownerProcedure.query(() => listChannelsForAdmin()),
+    channelPosts: ownerProcedure.query(() => listChannelPostsForAdmin()),
+    suspendChannel: ownerProcedure.input(z.object({ channelId: z.string().min(1), suspended: z.boolean(), reason: z.string().max(500).optional() })).mutation(async ({ input }) => {
       await setChannelSuspended(input.channelId, input.suspended, input.reason?.trim() || null);
       return { ok: true as const };
     }),
-    removeChannelPost: adminProcedure.input(z.object({ postId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
+    removeChannelPost: ownerProcedure.input(z.object({ postId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
       await removeChannelPost(input.postId, ctx.user.id);
       return { ok: true as const };
     }),
-    deleteChannel: adminProcedure.input(z.object({ channelId: z.string().min(1) })).mutation(async ({ input }) => {
+    deleteChannel: ownerProcedure.input(z.object({ channelId: z.string().min(1) })).mutation(async ({ input }) => {
       await deleteChannel(input.channelId);
       return { ok: true as const };
     }),

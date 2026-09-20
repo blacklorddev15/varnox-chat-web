@@ -1,4 +1,5 @@
 import { useMemo, useState, type ComponentProps } from "react";
+import { isOwnerAccount } from "@shared/owners";
 import { useRouter } from "expo-router";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
@@ -23,9 +24,9 @@ export default function SettingsSearchScreen() {
   const { user } = useAuth();
   const [query, setQuery] = useState("");
 
-  const isAdmin = (user as (typeof user & { role?: string }) | null)?.role === "admin";
+  const isOwner = isOwnerAccount(user as (typeof user & { role?: string; username?: string }) | null);
   // The catalogue is static, so the only work per keystroke is the filter itself.
-  const results = useMemo(() => searchSettings(query, isAdmin), [query, isAdmin]);
+  const results = useMemo(() => searchSettings(query, isOwner), [query, isOwner]);
 
   const open = (entry: SettingsEntry) => {
     if (entry.target.kind === "route") {
