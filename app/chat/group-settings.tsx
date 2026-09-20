@@ -1,7 +1,7 @@
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { useLocalSearchParams } from "expo-router";
 import { useState } from "react";
-import { ActivityIndicator, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import { ScreenContainer } from "@/components/screen-container";
 import { useColors } from "@/hooks/use-colors";
 import { trpc } from "@/lib/trpc";
@@ -40,10 +40,37 @@ export default function GroupSettingsScreen() {
   const settings = trpc.conversations.settings.useQuery({ conversationId }, { enabled: conversationId.length > 0 });
   const isAdmin = Boolean(settings.data?.isAdmin);
   const invites = trpc.conversations.invites.useQuery({ conversationId }, { enabled: conversationId.length > 0 && isAdmin });
+  const requests = trpc.conversations.joinRequests.useQuery({ conversationId }, { enabled: conversationId.length > 0 && isAdmin });
   const setPermissions = trpc.conversations.setPermissions.useMutation();
   const createInvite = trpc.conversations.createInvite.useMutation();
   const revokeInvite = trpc.conversations.revokeInvite.useMutation();
+  const decideRequest = trpc.conversations.decideJoinRequest.useMutation();
   const utils = trpc.useUtils();
+
+  const answerRequest = async (userId: number, approve: boolean) => {
+    setWorking(true);
+    try {
+      await decideRequest.mutateAsync({ conversationId, userId, approve });
+      await requests.refetch();
+      await utils.conversations.members.invalidate();
+      setStatus(approve ? "Added to the group" : "Request declined");
+    } catch (error) {
+      setStatus(error instanceof Error && error.message ? error.message : "Could not answer that request");
+    }
+    setWorking(false);
+  };
+
+  const toggleApproval = async (value: boolean) => {
+    setWorking(true);
+    try {
+      await setPermissions.mutateAsync({ conversationId, approveNewMembers: value });
+      await settings.refetch();
+      setStatus(value ? "New members will need approval" : "Links now add people straight away");
+    } catch (error) {
+      setStatus(error instanceof Error && error.message ? error.message : "Could not change that setting");
+    }
+    setWorking(false);
+  };
 
   const applyPermission = async (key: PermissionKey, value: "all" | "admins") => {
     setWorking(true);
@@ -98,6 +125,7 @@ export default function GroupSettingsScreen() {
   };
 
   const rows = invites.data ?? [];
+  const requestRows = requests.data ?? [];
 
   return (
     <ScreenContainer>
@@ -138,9 +166,39 @@ export default function GroupSettingsScreen() {
 
         {isAdmin ? (
           <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-            <View style={styles.cardHead}>
+            <View style={styles.row}>
+              <View style={styles.cardHead}>
+                <Text style={[styles.cardTitle, { color: colors.foreground }]}>Approve new members</Text>
+                <Text style={[styles.cardHint, { color: colors.muted }]}>A link then files a request an admin answers, instead of adding people straight away</Text>
+              </View>
+              <Switch value={Boolean(settings.data?.approveNewMembers)} onValueChange={(value) => void toggleApproval(value)} disabled={working} trackColor={{ false: colors.border, true: "#A7E8CD" }} thumbColor={settings.data?.approveNewMembers ? colors.success : "#fff"} />
+            </View>
+
+            {requestRows.length > 0 ? (
+              <>
+                <Text style={[styles.cardTitle, { color: colors.foreground }]}>Waiting for approval</Text>
+                {requestRows.map((row) => (
+                  <View key={row.userId} style={[styles.inviteRow, { borderTopColor: colors.border }]}>
+                    <Text style={[styles.link, { color: colors.foreground }]}>{row.name?.trim() || row.username || `User ${row.userId}`}</Text>
+                    <Text style={[styles.cardHint, { color: colors.muted }]}>Asked {new Date(row.requestedAt).toLocaleString()}</Text>
+                    <View style={styles.inviteActions}>
+                      <Pressable onPress={() => void answerRequest(row.userId, true)} disabled={working} style={[styles.smallButton, { borderColor: colors.border }]}>
+                        <MaterialIcons name="check" size={16} color={colors.primary} />
+                        <Text style={[styles.smallButtonText, { color: colors.primary }]}>Approve</Text>
+                      </Pressable>
+                      <Pressable onPress={() => void answerRequest(row.userId, false)} disabled={working} style={[styles.smallButton, { borderColor: colors.border }]}>
+                        <MaterialIcons name="close" size={16} color={colors.error ?? "#DC2626"} />
+                        <Text style={[styles.smallButtonText, { color: colors.error ?? "#DC2626" }]}>Decline</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+                ))}
+              </>
+            ) : null}
+
+            <View style={[styles.cardHead, { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.border, paddingTop: 10 }]}>
               <Text style={[styles.cardTitle, { color: colors.foreground }]}>Invite link</Text>
-              <Text style={[styles.cardHint, { color: colors.muted }]}>Anyone with the link can join this group</Text>
+              <Text style={[styles.cardHint, { color: colors.muted }]}>{settings.data?.approveNewMembers ? "Anyone with the link can ask to join" : "Anyone with the link can join this group"}</Text>
             </View>
             {invites.isLoading ? <ActivityIndicator color={colors.primary} /> : null}
             {rows.map((row) => (
@@ -182,6 +240,7 @@ const styles = StyleSheet.create({
   body: { padding: 16, gap: 12, paddingBottom: 48 },
   loader: { marginTop: 24 },
   card: { borderWidth: 1, borderRadius: 14, padding: 14, gap: 10 },
+  row: { flexDirection: "row", alignItems: "center", gap: 10 },
   cardHead: { gap: 2 },
   cardTitle: { fontSize: 15, fontWeight: "700" },
   cardHint: { fontSize: 12.5 },

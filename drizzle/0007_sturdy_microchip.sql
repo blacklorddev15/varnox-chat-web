@@ -1,0 +1,1 @@
+ALTER TABLE "joinRequests" ADD COLUMN "inviteCode" varchar(32);

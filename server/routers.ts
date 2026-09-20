@@ -11,7 +11,7 @@ import { notifyConversationMembers } from "./push";
 import { messages } from "../drizzle/schema";
 // Message actions (reactions, stars, edits, deletes, per-chat preferences) sit with the other
 // row-level operations in db.ts; imported on their own line so the list above stays readable.
-import { castPollVote, consumeViewOnce, conversationDisappearSeconds, createInviteLink, deleteMessageForEveryone, editMessageBody, getConversationAccess, getConversationPermissions, getMessageById, hideMessageForUser, listInviteLinks, listStarredMessages, markConversationDelivered, permitted, reactToMessage, redeemInviteLink, revokeInviteLink, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setConversationPermissions, setMessageStar } from "./db";
+import { castPollVote, chatSettingsFor, consumeViewOnce, conversationNeedsApproval, createInviteLink, decideJoinRequest, deleteMessageForEveryone, editMessageBody, effectiveDisappearSeconds, exportConversationTranscript, getConversationAccess, getConversationPermissions, getMessageById, hideMessageForUser, listInviteLinks, listJoinRequests, listStarredMessages, markConversationDelivered, permitted, reactToMessage, redeemInviteLink, revokeInviteLink, setConversationDescription, setConversationDisappearing, setConversationMemberFlags, setConversationPermissions, setMessageStar } from "./db";
 // Presence: who is around right now, and who is mid-sentence. Also in db.ts, for the same reason.
 import { getConversationSummary, leaveGroup, listConversationMemberIds, listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
 // Server-Sent Events nudge channel; see nudgeConversation below.
@@ -154,22 +154,40 @@ export const appRouter = router({
     settings: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(async ({ ctx, input }) => {
       const access = await getConversationAccess(input.conversationId, ctx.user.id);
       if (!access) throw new Error("You are not a member of this group");
-      return { role: access.role, isAdmin: access.role === "admin" || access.role === "owner", whoCanSend: access.whoCanSend, whoCanEditInfo: access.whoCanEditInfo, whoCanAddMembers: access.whoCanAddMembers };
+      return { role: access.role, isAdmin: access.role === "admin" || access.role === "owner", whoCanSend: access.whoCanSend, whoCanEditInfo: access.whoCanEditInfo, whoCanAddMembers: access.whoCanAddMembers, approveNewMembers: access.approveNewMembers !== 0 };
     }),
 
     /** Turns one or more group settings. Admins only, because that is precisely what they gate. */
-    setPermissions: protectedProcedure.input(z.object({ conversationId: z.string().min(1), whoCanSend: permissionWho.optional(), whoCanEditInfo: permissionWho.optional(), whoCanAddMembers: permissionWho.optional() })).mutation(async ({ ctx, input }) => {
+    setPermissions: protectedProcedure.input(z.object({ conversationId: z.string().min(1), whoCanSend: permissionWho.optional(), whoCanEditInfo: permissionWho.optional(), whoCanAddMembers: permissionWho.optional(), approveNewMembers: z.boolean().optional() })).mutation(async ({ ctx, input }) => {
       const access = await getConversationAccess(input.conversationId, ctx.user.id);
       if (!access) throw new Error("You are not a member of this group");
       if (!permitted("admins", access.role)) throw new Error("Only group admins can change these settings");
-      const patch: { whoCanSend?: string; whoCanEditInfo?: string; whoCanAddMembers?: string } = {};
+      const patch: { whoCanSend?: string; whoCanEditInfo?: string; whoCanAddMembers?: string; approveNewMembers?: number } = {};
       if (input.whoCanSend) patch.whoCanSend = input.whoCanSend;
       if (input.whoCanEditInfo) patch.whoCanEditInfo = input.whoCanEditInfo;
       if (input.whoCanAddMembers) patch.whoCanAddMembers = input.whoCanAddMembers;
+      if (input.approveNewMembers !== undefined) patch.approveNewMembers = input.approveNewMembers ? 1 : 0;
       if (Object.keys(patch).length > 0) {
         await setConversationPermissions(input.conversationId, patch);
         void nudgeConversation(input.conversationId, ctx.user.id, "group-updated");
       }
+      return { ok: true as const };
+    }),
+
+    /** People waiting on an admin before they can get in. Admins only; others get an empty list. */
+    joinRequests: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(async ({ ctx, input }) => {
+      const access = await getConversationAccess(input.conversationId, ctx.user.id);
+      if (!access || !permitted("admins", access.role)) return [];
+      return listJoinRequests(input.conversationId);
+    }),
+
+    /** Approves or rejects one request. Approving is what actually creates the membership. */
+    decideJoinRequest: protectedProcedure.input(z.object({ conversationId: z.string().min(1), userId: z.number().int().positive(), approve: z.boolean() })).mutation(async ({ ctx, input }) => {
+      const access = await getConversationAccess(input.conversationId, ctx.user.id);
+      if (!access) throw new Error("You are not a member of this group");
+      if (!permitted("admins", access.role)) throw new Error("Only group admins can answer join requests");
+      await decideJoinRequest({ conversationId: input.conversationId, userId: input.userId, approve: input.approve, decidedBy: ctx.user.id });
+      void nudgeConversation(input.conversationId, ctx.user.id, "group-updated");
       return { ok: true as const };
     }),
 
@@ -201,12 +219,25 @@ export const appRouter = router({
       return { ok: true as const };
     }),
 
-    /** Redeems an invite link: whoever holds the code joins the group. */
+    /** Redeems an invite link: whoever holds the code joins, or asks to if the group reviews people. */
     redeemInvite: protectedProcedure.input(z.object({ code: z.string().trim().min(1).max(64) })).mutation(async ({ ctx, input }) => {
       const conversationId = await redeemInviteLink(input.code, ctx.user.id);
-      void nudgeConversation(conversationId, ctx.user.id, "group-updated");
-      return { conversationId };
+      // Joined outright, or filed a request the admins still have to answer. The caller is told which,
+      // because "you joined" would be a lie in the second case.
+      const pending = await conversationNeedsApproval(conversationId) && !(await isConversationMember(conversationId, ctx.user.id));
+      void nudgeConversation(conversationId, ctx.user.id, pending ? "join-request" : "group-updated");
+      return { conversationId, pending };
     }),
+
+    /** What this chat's settings screen needs: the chat's own values plus the defaults behind them. */
+    chatSettings: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(async ({ ctx, input }) => {
+      const settings = await chatSettingsFor(input.conversationId, ctx.user.id);
+      if (!settings) throw new Error("You are not a member of this conversation");
+      return settings;
+    }),
+
+    /** A readable transcript of the chat, for the export screen to show and save. */
+    exportChat: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).mutation(async ({ ctx, input }) => exportConversationTranscript(input.conversationId, ctx.user.id)),
 
     messages: protectedProcedure.input(z.object({ conversationId: z.string().min(1), since: z.string().datetime().optional() })).query(({ ctx, input }) => listMessages(input.conversationId, ctx.user.id, input.since ? new Date(input.since) : undefined)),
     ensure: protectedProcedure.input(z.object({ conversationId: z.string().min(1), title: z.string().max(255).optional() })).mutation(async ({ ctx, input }) => {
@@ -230,7 +261,9 @@ export const appRouter = router({
       if (!permitted(access.whoCanSend, access.role)) throw new Error("Only admins can send messages in this group");
       // The disappearing clock is stamped at send time, so changing the setting later cannot
       // retroactively expire messages somebody already received.
-      const disappearSeconds = await conversationDisappearSeconds(input.conversationId);
+      // Falls back to the sender's account-wide default when the chat itself has no setting. Without
+      // the fallback that default would be a control that changes nothing.
+      const disappearSeconds = await effectiveDisappearSeconds(input.conversationId, ctx.user.id);
       // Polls, locations and contacts carry their content in `meta`; the media kinds carry none.
       const meta = normalizeMessageMeta(input.kind, input.meta);
       if (!meta && (input.kind === "poll" || input.kind === "location" || input.kind === "contact")) throw new Error("That message arrived without its content");
@@ -300,9 +333,9 @@ export const appRouter = router({
     }),
 
     // ---- per-chat preferences and receipts ----------------------------------------------
-    setFlags: protectedProcedure.input(z.object({ conversationId: z.string().min(1), archived: z.boolean().optional(), muted: z.boolean().optional(), pinned: z.boolean().optional(), draft: z.string().max(2000).nullable().optional() })).mutation(async ({ ctx, input }) => {
+    setFlags: protectedProcedure.input(z.object({ conversationId: z.string().min(1), archived: z.boolean().optional(), muted: z.boolean().optional(), pinned: z.boolean().optional(), draft: z.string().max(2000).nullable().optional(), mediaAutoLoad: z.boolean().optional() })).mutation(async ({ ctx, input }) => {
       if (!(await isConversationMember(input.conversationId, ctx.user.id))) throw new Error("You are not a member of this conversation");
-      await setConversationMemberFlags(input.conversationId, ctx.user.id, { archived: input.archived, muted: input.muted, pinned: input.pinned, draft: input.draft });
+      await setConversationMemberFlags(input.conversationId, ctx.user.id, { archived: input.archived, muted: input.muted, pinned: input.pinned, draft: input.draft, mediaAutoLoad: input.mediaAutoLoad });
       return { ok: true as const };
     }),
     markDelivered: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).mutation(async ({ ctx, input }) => {
@@ -459,7 +492,12 @@ export const appRouter = router({
   }),
   settings: router({
     get: protectedProcedure.query(({ ctx }) => getUserSettings(ctx.user.id)),
-    update: protectedProcedure.input(z.object({ readReceipts: z.boolean().optional(), lastSeen: z.boolean().optional(), darkTheme: z.boolean().optional(), notificationsMessages: z.boolean().optional(), notificationsGroups: z.boolean().optional(), notificationsCalls: z.boolean().optional() })).mutation(({ ctx, input }) => updateUserSettings(ctx.user.id, Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined).map(([key, value]) => [key, value ? 1 : 0])) as any)),
+    update: protectedProcedure.input(z.object({ readReceipts: z.boolean().optional(), lastSeen: z.boolean().optional(), darkTheme: z.boolean().optional(), notificationsMessages: z.boolean().optional(), notificationsGroups: z.boolean().optional(), notificationsCalls: z.boolean().optional(), autoDownloadMedia: z.boolean().optional() })).mutation(({ ctx, input }) => updateUserSettings(ctx.user.id, Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined).map(([key, value]) => [key, value ? 1 : 0])) as any)),
+    /**
+     * The account-wide message timer, kept apart from `update` because that route treats every field
+     * as a boolean and would flatten a number of seconds into 1.
+     */
+    setMessageTimer: protectedProcedure.input(z.object({ seconds: z.number().int().min(0).max(7776000) })).mutation(({ ctx, input }) => updateUserSettings(ctx.user.id, { defaultDisappearSeconds: input.seconds })),
   }),
   blocks: router({
     list: protectedProcedure.query(({ ctx }) => listBlockedContacts(ctx.user.id)),

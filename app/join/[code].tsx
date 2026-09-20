@@ -22,15 +22,16 @@ export default function JoinGroupScreen() {
   const redeem = trpc.conversations.redeemInvite.useMutation();
   const attempted = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  const [joined, setJoined] = useState(false);
+  // "Joined" and "asked to join" are different outcomes, and must not be reported as each other.
+  const [outcome, setOutcome] = useState<"joined" | "pending" | null>(null);
 
   useEffect(() => {
     if (attempted.current || !code) return;
     attempted.current = true;
     redeem
       .mutateAsync({ code })
-      .then(() => {
-        setJoined(true);
+      .then((result) => {
+        setOutcome(result.pending ? "pending" : "joined");
         void utils.conversations.list.invalidate();
       })
       .catch((failure: unknown) => {
@@ -47,22 +48,29 @@ export default function JoinGroupScreen() {
     <ScreenContainer>
       <View style={styles.body}>
         <View style={[styles.iconWrap, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-          <MaterialIcons name={joined ? "check" : error ? "link-off" : "group-add"} size={30} color={joined ? colors.primary : error ? colors.error ?? "#DC2626" : colors.primary} />
+          <MaterialIcons name={outcome ? (outcome === "joined" ? "check" : "hourglass-empty") : error ? "link-off" : "group-add"} size={30} color={error ? colors.error ?? "#DC2626" : colors.primary} />
         </View>
 
         {!code ? <Text style={[styles.title, { color: colors.foreground }]}>That invite link is incomplete</Text> : null}
 
-        {code && !joined && !error ? (
+        {code && !outcome && !error ? (
           <>
             <Text style={[styles.title, { color: colors.foreground }]}>Joining the group…</Text>
             <ActivityIndicator color={colors.primary} style={styles.spinner} />
           </>
         ) : null}
 
-        {joined ? (
+        {outcome === "joined" ? (
           <>
             <Text style={[styles.title, { color: colors.foreground }]}>You joined the group</Text>
             <Text style={[styles.copy, { color: colors.muted }]}>It is in your chat list, and its history is available from now on.</Text>
+          </>
+        ) : null}
+
+        {outcome === "pending" ? (
+          <>
+            <Text style={[styles.title, { color: colors.foreground }]}>Your request was sent</Text>
+            <Text style={[styles.copy, { color: colors.muted }]}>This group reviews new members, so an admin has to approve you before you can read or post in it.</Text>
           </>
         ) : null}
 
@@ -73,7 +81,7 @@ export default function JoinGroupScreen() {
           </>
         ) : null}
 
-        {error || joined ? (
+        {error || outcome ? (
           <Pressable
             onPress={() => router.replace(needsSignIn ? "/login" : "/(tabs)")}
             style={[styles.button, { backgroundColor: colors.primary }]}

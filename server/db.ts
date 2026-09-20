@@ -1,7 +1,7 @@
 import { and, desc, eq, gt, ilike, inArray, isNull, like, lt, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, inviteLinks, messageHides, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, calls, channelFollowers, channelPosts, channels, conversationMembers, conversations, InsertUser, inviteLinks, joinRequests, messageHides, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, statusUpdates, statusViews, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -149,6 +149,9 @@ export async function listConversationsForUser(userId: number) {
       muted: member.muted === 1,
       pinned: member.pinned === 1,
       draft: member.draft ?? null,
+      // Carried on the list rather than behind its own query: the chat screen needs it to decide
+      // whether to load media, and the list is already being fetched.
+      mediaAutoLoad: member.mediaAutoLoad === 1,
     });
   }
   return result;
@@ -227,7 +230,7 @@ export async function getConversationRole(conversationId: string, userId: number
 
 /** Members of a conversation, with the profile fields the group screen needs. */
 /** The three group settings an admin can turn, and what each of them allows. */
-export type GroupPermissions = { whoCanSend: string; whoCanEditInfo: string; whoCanAddMembers: string };
+export type GroupPermissions = { whoCanSend: string; whoCanEditInfo: string; whoCanAddMembers: string; approveNewMembers: number };
 
 /**
  * Role and group settings for one person in one conversation, read together.
@@ -239,7 +242,7 @@ export async function getConversationAccess(conversationId: string, userId: numb
   const db = await getDb();
   if (!db) return null;
   const [row] = await db
-    .select({ role: conversationMembers.role, whoCanSend: conversations.whoCanSend, whoCanEditInfo: conversations.whoCanEditInfo, whoCanAddMembers: conversations.whoCanAddMembers })
+    .select({ role: conversationMembers.role, whoCanSend: conversations.whoCanSend, whoCanEditInfo: conversations.whoCanEditInfo, whoCanAddMembers: conversations.whoCanAddMembers, approveNewMembers: conversations.approveNewMembers })
     .from(conversationMembers)
     .innerJoin(conversations, eq(conversations.id, conversationMembers.conversationId))
     .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)))
@@ -249,9 +252,9 @@ export async function getConversationAccess(conversationId: string, userId: numb
 
 export async function getConversationPermissions(conversationId: string): Promise<GroupPermissions> {
   const db = await getDb();
-  if (!db) return { whoCanSend: "all", whoCanEditInfo: "all", whoCanAddMembers: "all" };
-  const [row] = await db.select({ whoCanSend: conversations.whoCanSend, whoCanEditInfo: conversations.whoCanEditInfo, whoCanAddMembers: conversations.whoCanAddMembers }).from(conversations).where(eq(conversations.id, conversationId)).limit(1);
-  return row ?? { whoCanSend: "all", whoCanEditInfo: "all", whoCanAddMembers: "all" };
+  if (!db) return { whoCanSend: "all", whoCanEditInfo: "all", whoCanAddMembers: "all", approveNewMembers: 0 };
+  const [row] = await db.select({ whoCanSend: conversations.whoCanSend, whoCanEditInfo: conversations.whoCanEditInfo, whoCanAddMembers: conversations.whoCanAddMembers, approveNewMembers: conversations.approveNewMembers }).from(conversations).where(eq(conversations.id, conversationId)).limit(1);
+  return row ?? { whoCanSend: "all", whoCanEditInfo: "all", whoCanAddMembers: "all", approveNewMembers: 0 };
 }
 
 export async function setConversationPermissions(conversationId: string, patch: Partial<GroupPermissions>) {
@@ -314,6 +317,16 @@ export async function redeemInviteLink(code: string, userId: number) {
   // Already in the group: nothing to do, and no use spent on a link they did not need.
   if (await isConversationMember(invite.conversationId, userId)) return invite.conversationId;
 
+  // A group that reviews people files a request instead. Checked before any use is claimed, so asking
+  // cannot exhaust the link; the use is spent on approval instead.
+  if (await conversationNeedsApproval(invite.conversationId)) {
+    await db
+      .insert(joinRequests)
+      .values({ conversationId: invite.conversationId, userId, inviteCode: invite.code })
+      .onConflictDoUpdate({ target: [joinRequests.conversationId, joinRequests.userId], set: { status: "pending", inviteCode: invite.code, requestedAt: new Date(), decidedAt: null, decidedBy: null } });
+    return invite.conversationId;
+  }
+
   const claimed = await db
     .update(inviteLinks)
     .set({ uses: sql`${inviteLinks.uses} + 1` })
@@ -323,6 +336,186 @@ export async function redeemInviteLink(code: string, userId: number) {
 
   await addConversationMember(invite.conversationId, userId);
   return invite.conversationId;
+}
+
+export async function conversationNeedsApproval(conversationId: string) {
+  const db = await getDb();
+  if (!db) return false;
+  const [row] = await db.select({ approve: conversations.approveNewMembers }).from(conversations).where(eq(conversations.id, conversationId)).limit(1);
+  return (row?.approve ?? 0) !== 0;
+}
+
+/** Requests still waiting on a decision, newest first, with the name needed to render each one. */
+export async function listJoinRequests(conversationId: string) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({ userId: joinRequests.userId, requestedAt: joinRequests.requestedAt, name: users.name, username: users.username })
+    .from(joinRequests)
+    .leftJoin(users, eq(users.id, joinRequests.userId))
+    .where(and(eq(joinRequests.conversationId, conversationId), eq(joinRequests.status, "pending")))
+    .orderBy(desc(joinRequests.requestedAt));
+}
+
+/**
+ * Approves or rejects a request.
+ *
+ * The request is moved out of "pending" with a conditional UPDATE before anything else happens, so two
+ * admins tapping approve at the same moment cannot both act on it - the second matches no row and is
+ * refused. Only an approval creates a member.
+ *
+ * An approval is also where a limited invite link spends its use, which is why the request carries the
+ * code it came from. Asking to join must not consume the link: with a one-use link and five people
+ * asking, spending a use per request would let the first person to ask exhaust a link that had not
+ * admitted anybody yet. If the link has since been revoked or has run out, the approval is refused
+ * rather than quietly adding someone the link no longer authorises.
+ */
+export async function decideJoinRequest(params: { conversationId: string; userId: number; approve: boolean; decidedBy: number }) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  const claimed = await db
+    .update(joinRequests)
+    .set({ status: params.approve ? "approved" : "rejected", decidedAt: new Date(), decidedBy: params.decidedBy })
+    .where(and(eq(joinRequests.conversationId, params.conversationId), eq(joinRequests.userId, params.userId), eq(joinRequests.status, "pending")))
+    .returning();
+  if (claimed.length === 0) throw new Error("That request has already been answered");
+
+  if (params.approve) {
+    const code = claimed[0].inviteCode;
+    if (code) {
+      const spent = await db
+        .update(inviteLinks)
+        .set({ uses: sql`${inviteLinks.uses} + 1` })
+        .where(and(eq(inviteLinks.code, code), or(isNull(inviteLinks.maxUses), lt(inviteLinks.uses, inviteLinks.maxUses))))
+        .returning();
+      if (spent.length === 0) throw new Error("The invite link that person used has expired or been revoked");
+    }
+    await addConversationMember(params.conversationId, params.userId);
+  }
+  return true;
+}
+
+// ---- per-chat settings and export ---------------------------------------------------------------
+/**
+ * The settings one chat answers to, including the account defaults it may be following.
+ *
+ * A chat that has never been touched has no values of its own, so the screen needs both the chat's
+ * value and the default behind it to be able to say "following the default" instead of showing the
+ * default as though the chat had chosen it.
+ */
+export async function chatSettingsFor(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const [row] = await db
+    .select({
+      title: conversations.title,
+      kind: conversations.kind,
+      conversationDisappear: conversations.disappearSeconds,
+      mediaAutoLoad: conversationMembers.mediaAutoLoad,
+      autoDownloadMedia: userSettings.autoDownloadMedia,
+      defaultDisappearSeconds: userSettings.defaultDisappearSeconds,
+    })
+    .from(conversationMembers)
+    .innerJoin(conversations, eq(conversations.id, conversationMembers.conversationId))
+    .leftJoin(userSettings, eq(userSettings.userId, conversationMembers.userId))
+    .where(and(eq(conversationMembers.conversationId, conversationId), eq(conversationMembers.userId, userId)))
+    .limit(1);
+  if (!row) return null;
+  const mediaAutoLoad = row.mediaAutoLoad !== 0;
+  const autoDownloadMedia = (row.autoDownloadMedia ?? 1) !== 0;
+  const defaultDisappearSeconds = row.defaultDisappearSeconds ?? 0;
+  return {
+    title: row.title,
+    kind: row.kind,
+    // null means "follow the account default", which is what an untouched chat is.
+    conversationDisappear: row.conversationDisappear ?? null,
+    mediaAutoLoad,
+    autoDownloadMedia,
+    defaultDisappearSeconds,
+    effectiveDisappearSeconds: row.conversationDisappear ?? (defaultDisappearSeconds > 0 ? defaultDisappearSeconds : null),
+    effectiveMediaAutoLoad: mediaAutoLoad && autoDownloadMedia,
+  };
+}
+
+/**
+ * The timer a message should be stamped with: the chat's own setting if it has one, otherwise the
+ * account default. Without the fallback the account-wide default would change nothing.
+ */
+export async function effectiveDisappearSeconds(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db) return null;
+  const [row] = await db
+    .select({ conversationDisappear: conversations.disappearSeconds, defaultDisappearSeconds: userSettings.defaultDisappearSeconds })
+    .from(conversations)
+    .leftJoin(userSettings, eq(userSettings.userId, userId))
+    .where(eq(conversations.id, conversationId))
+    .limit(1);
+  if (!row) return null;
+  if (row.conversationDisappear) return row.conversationDisappear;
+  return (row.defaultDisappearSeconds ?? 0) > 0 ? row.defaultDisappearSeconds : null;
+}
+
+function transcriptStamp(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}, ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/**
+ * A readable transcript of a chat, for the export feature.
+ *
+ * Built from the same rows the chat itself reads, so an exported file cannot contain anything the
+ * exporter could not already see. Media becomes a placeholder carrying its name: the bytes live inline
+ * in the database, and inlining them here would produce a file too large to be of any use.
+ */
+export async function exportConversationTranscript(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db) throw new Error("Account storage is not available");
+  if (!(await isConversationMember(conversationId, userId))) throw new Error("You are not a member of this conversation");
+
+  const [conversation] = await db.select().from(conversations).where(eq(conversations.id, conversationId)).limit(1);
+  if (!conversation) throw new Error("That conversation no longer exists");
+
+  const members = await listConversationMembersDetailed(conversationId);
+  const nameFor = new Map<number, string>();
+  for (const entry of members) nameFor.set(entry.userId, entry.name?.trim() || entry.username || `User ${entry.userId}`);
+  const me = nameFor.get(userId) ?? "You";
+
+  const history = await listMessages(conversationId, userId);
+  const sorted = history.slice().sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  const others = Array.from(nameFor.entries()).filter(([id]) => id !== userId).map(([, name]) => name);
+
+  let lastDay = "";
+  const lines: string[] = [];
+  for (const message of sorted) {
+    const day = transcriptStamp(message.createdAt).split(",")[0];
+    if (day !== lastDay) {
+      lines.push(lines.length ? `\n--- ${day} ---` : `--- ${day} ---`);
+      lastDay = day;
+    }
+    let text: string;
+    if (message.deletedAt) text = "This message was deleted";
+    else if (message.kind === "voice") text = `<voice note> ${Math.round((message.voiceDurationMs ?? 0) / 1000)}s`;
+    else if (message.kind === "poll") text = `<poll> ${message.body ?? ""}`;
+    else if (message.kind === "location") text = "<location shared>";
+    else if (message.kind === "contact") text = "<contact card shared>";
+    else if (message.mediaUrl) text = `<${message.kind}>${message.mediaName ? ` ${message.mediaName}` : ""}`;
+    else text = message.body ?? "";
+    const suffix = `${message.starred ? " ★" : ""}${message.editedAt ? " (edited)" : ""}`;
+    const who = message.senderId === userId ? "You" : nameFor.get(message.senderId) ?? `User ${message.senderId}`;
+    const time = transcriptStamp(message.createdAt).split(", ")[1];
+    lines.push(`[${time}] ${who}: ${text}${suffix}`);
+  }
+
+  const [conversationRow] = await db.select({ title: conversations.title, kind: conversations.kind }).from(conversations).where(eq(conversations.id, conversationId)).limit(1);
+  const heading = conversationRow?.kind === "group" ? `Group: ${conversationRow.title ?? "Untitled group"}` : `Chat with ${others.join(", ") || me}`;
+  const header = [heading, `Exported: ${transcriptStamp(new Date())}`, `Participants: ${Array.from(nameFor.values()).join(", ")}`, `Messages: ${sorted.length}`].join("\n");
+
+  return {
+    filename: `varnox-${conversationRow?.kind === "group" ? "group" : "chat"}-${new Date().toISOString().slice(0, 10)}.txt`,
+    heading,
+    content: `${header}\n\n${lines.join("\n")}\n`,
+    messageCount: sorted.length,
+  };
 }
 
 export async function listConversationMembersDetailed(conversationId: string) {
@@ -1206,7 +1399,7 @@ export async function consumeViewOnce(messageId: string, userId: number) {
 export async function setConversationMemberFlags(
   conversationId: string,
   userId: number,
-  flags: { archived?: boolean; muted?: boolean; pinned?: boolean; draft?: string | null },
+  flags: { archived?: boolean; muted?: boolean; pinned?: boolean; draft?: string | null; mediaAutoLoad?: boolean },
 ) {
   const db = await getDb();
   if (!db) return;
@@ -1214,6 +1407,7 @@ export async function setConversationMemberFlags(
   if (flags.archived !== undefined) patch.archived = flags.archived ? 1 : 0;
   if (flags.muted !== undefined) patch.muted = flags.muted ? 1 : 0;
   if (flags.pinned !== undefined) patch.pinned = flags.pinned ? 1 : 0;
+  if (flags.mediaAutoLoad !== undefined) patch.mediaAutoLoad = flags.mediaAutoLoad ? 1 : 0;
   if (flags.draft !== undefined) patch.draft = flags.draft ? flags.draft.slice(0, 2000) : null;
   if (Object.keys(patch).length === 0) return;
   await db
