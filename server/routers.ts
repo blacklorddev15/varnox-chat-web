@@ -859,6 +859,23 @@ export const appRouter = router({
       };
     }),
     history: protectedProcedure.input(z.object({ limit: z.number().int().min(1).max(50).default(30) }).optional()).query(({ ctx, input }) => listRecentCalls(ctx.user.id, input?.limit ?? 30)),
+
+    /**
+     * TEMPORARY. Remove once calls are confirmed working on a device.
+     *
+     * The call screen prints its own state, but a screenshot has to be taken, sent and read. This
+     * puts the same line in the server log instead, where it can be read directly from the
+     * deployment - so a call placed on a phone reports back on its own.
+     *
+     * Bounded and authenticated like anything else: 300 characters, signed in, and prefixed, so it
+     * cannot be used to write arbitrary text into the log at length.
+     */
+    diag: protectedProcedure
+      .input(z.object({ snapshot: z.string().max(300) }))
+      .mutation(({ ctx, input }) => {
+        console.log(`[call-diag] user=${ctx.user.id} ${input.snapshot}`);
+        return { ok: true };
+      }),
     // A shareable room. The link carries only an unguessable room name and anyone signed in
     // who opens it gets their own token, so no row is written until somebody actually joins.
     createLink: protectedProcedure.input(z.object({ kind: z.enum(["audio", "video"]).default("audio") })).mutation(async ({ ctx, input }) => {

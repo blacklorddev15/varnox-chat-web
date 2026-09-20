@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { Platform } from "react-native";
 import type { Room as LiveKitRoom } from "livekit-client";
 
 import { useAuth } from "@/hooks/use-auth";
@@ -336,6 +337,38 @@ export function CallProvider({ children }: { children: ReactNode }) {
         setScreenSharing(!next);
       });
   }, []);
+
+  /**
+   * TEMPORARY. Remove once calls are confirmed working on a device.
+   *
+   * Report the call's state to the server log as it changes, so a call placed on a phone can be
+   * diagnosed without a screenshot. Reported on every phase change, and once more five seconds into
+   * a live call - tracks take a moment to publish, and the first report would say `pub=0/0` for a
+   * call that was about to work perfectly.
+   */
+  const diagMutation = trpc.calls.diag.useMutation();
+  const reportDiag = useCallback(() => {
+    const snapshot = [
+      `phase=${phaseRef.current}`,
+      `room=${roomRef.current ? "yes" : "no"}`,
+      `remote=${roomRef.current?.remoteParticipants.size ?? 0}`,
+      `mic=${roomRef.current?.localParticipant.isMicrophoneEnabled ? "on" : "off"}`,
+      `cam=${roomRef.current?.localParticipant.isCameraEnabled ? "on" : "off"}`,
+      `pub=${roomRef.current?.localParticipant.videoTrackPublications.size ?? 0}/${roomRef.current ? Array.from(roomRef.current.remoteParticipants.values()).reduce((total, participant) => total + participant.videoTrackPublications.size, 0) : 0}`,
+      `plat=${Platform.OS}`,
+    ].join(" ");
+    diagMutation.mutate({ snapshot });
+  }, [diagMutation]);
+  const reportDiagOnce = useRef(reportDiag);
+  reportDiagOnce.current = reportDiag;
+
+  useEffect(() => {
+    if (!isAuthenticated || phase === "idle") return;
+    reportDiagOnce.current();
+    if (phase !== "active") return;
+    const settled = setTimeout(() => reportDiagOnce.current(), 5000);
+    return () => clearTimeout(settled);
+  }, [isAuthenticated, phase]);
 
   // Poll for an incoming call only while idle, so we never ring over a live call.
   const incoming = trpc.calls.incoming.useQuery(undefined, {
