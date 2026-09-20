@@ -120,8 +120,8 @@ export default function ContactInfoScreen() {
             <Text style={[styles.warningTitle, { color: colors.foreground }]}>Nobody else is in this chat</Text>
             <Text style={[styles.warningBody, { color: colors.muted }]}>
               You are its only member, so messages you send here are not delivered to anyone. Close this chat and start it
-              again from the person's entry in the new-conversation sheet - that creates a one-to-one chat, which is not
-              affected by group privacy settings.
+              again from the entry for that person in the new-conversation sheet - that creates a one-to-one chat, which is
+              not affected by group privacy settings.
             </Text>
           </View>
         ) : null}

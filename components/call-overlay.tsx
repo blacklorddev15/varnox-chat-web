@@ -192,6 +192,20 @@ export function CallOverlay() {
   const colors = useColors();
   const { phase, session, room, remoteCount, micOn, cameraOn, screenSharing, reconnecting, elapsed, error, accept, decline, hangUp, toggleMic, toggleCamera, toggleScreenShare } = useCall();
 
+  // One tile per remote participant plus your own, laid out in rows. Tiles are `flex: 1` inside a
+  // row rather than a percentage width: the card has a maximum width but a shrinking one, and
+  // percentages would overflow it on a narrow screen.
+  //
+  // Above the early return, and it has to stay there.
+  //
+  // A hook after a conditional return runs on some renders and not others. Idle renders stopped at
+  // the line below having called only the two hooks above; the first call skipped that return,
+  // reached this one, and React threw #310 - "Rendered more hooks than during the previous render"
+  // - and unmounted the entire tree. That is not a visible glitch: it takes the whole app down to a
+  // blank screen. It is why a call on this app was reported blank four times while nothing in the
+  // call logic was at fault, and why every fix aimed at the call itself changed nothing.
+  const remotes = useRemoteParticipants(room);
+
   if (phase === "idle" && !error) return null;
 
   const name = session?.peerName ?? "Call";
@@ -199,10 +213,6 @@ export function CallOverlay() {
   const connected = phase === "active" && remoteCount > 0;
   const peerPhoto = session?.peerId ? avatarUrl(session.peerId, session.avatarUpdatedAt) : undefined;
 
-  // One tile per remote participant plus your own, laid out in rows. Tiles are `flex: 1` inside a
-  // row rather than a percentage width: the card has a maximum width but a shrinking one, and
-  // percentages would overflow it on a narrow screen.
-  const remotes = useRemoteParticipants(room);
   // A share needs a stage even on a call with no camera in it, which is the whole point of being
   // able to share during an audio call.
   const showStage = isVideo || screenSharing || remotes.some((participant) => participant.sharing);
