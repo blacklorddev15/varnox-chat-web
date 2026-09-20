@@ -84,3 +84,8 @@ Thumbs.db
 .webdev/
 .project-config.json
 .vercel
+
+# The release keystore is deliberately kept here: the owner chose to make the repo the single place a
+# build can be run from, knowing the repo is public and that this exposes the signing key. See the
+# commit that added it. The debug key and any other keystore stay ignored.
+!apk/varnox-release.keystore
