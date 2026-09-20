@@ -6,27 +6,38 @@
 #
 # Deploy: Render dashboard -> New -> Blueprint -> pick this repo.
 #
+# Why run the API here at all, when Vercel already serves it: realtime. The event bus in
+# server/realtime.ts is deliberately process-local, which requires one long-lived process.
+# `isRealtimeEnabled()` returns false when VERCEL=1, and on Vercel it always is - so the API there
+# silently falls back to polling and live updates arrive late. Running it here sets realtime
+# correctly with no code change; the flag keys off VERCEL, which a Render service does not set.
+#
 # Note: this repository is also the Expo project, so the install pulls the web toolchain too.
-# That makes the Render build slower than an API-only repo would be. It is the price of not
-# having two copies of the server code.
+# That makes the build slower than an API-only repo would be. It is the price of not having two
+# copies of the server code.
 
 services:
   - type: web
     name: varnox-chat-api
     runtime: node
-    # `starter` or above: the free tier sleeps after ~15 minutes idle, which drops every open
-    # event stream and makes the next request wait for a cold start.
+    # `starter` or above. The free tier sleeps after ~15 minutes idle, which drops every open event
+    # stream - and a dropped stream is exactly the failure this service exists to avoid. It also
+    # makes the first request after a sleep wait for a cold start.
     plan: starter
     region: singapore
     branch: main
     autoDeploy: true
-    # `pnpm build` here is the server bundle (server-dist/index.mjs); the web app is exported
-    # separately by `pnpm build:web` for Vercel.
+    # `pnpm build` is the server bundle. The web app is exported separately by `pnpm build:web` and
+    # served from Vercel, so a successful deploy here does not rebuild it.
     buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm build
-    # Applies pending migrations before the new version takes traffic.
-    preDeployCommand: pnpm db:migrate
-    startCommand: node server-dist/index.mjs
+    # `pnpm start` is `node server-dist/index.cjs`. It must not be `index.mjs`: the esbuild step
+    # emits CJS, and pointing at an .mjs that is never written fails the deploy at start-up.
+    startCommand: pnpm start
     healthCheckPath: /api/health
+    # No preDeployCommand on purpose. The server applies pending migrations itself on boot
+    # (server/_core/migrate.ts, skipped only when RUN_MIGRATIONS=0), so a separate migration step
+    # would run the same migrations twice. It would also have failed every deploy: the command
+    # referred to `pnpm db:migrate`, a script that does not exist in package.json.
     envVars:
       - key: NODE_ENV
         value: production
@@ -44,3 +55,35 @@ services:
       # Pinned so it is not mis-typed; varnoxapp.blacklord.tech is verified.
       - key: RESEND_FROM
         value: "Varnox Chat <no-reply@varnoxapp.blacklord.tech>"
+
+      # --- Calls -----------------------------------------------------------------------------
+      # Without these, calls fail with "Calls are not configured on this server" rather than
+      # silently misbehaving. Copy them from the existing LiveKit project; the same three values
+      # are already set on Vercel for the web app.
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+
+      # --- Phone verification (optional) ------------------------------------------------------
+      # Only needed if phone-number sign-in is in use. The email path works without them.
+      - key: VONAGE_API_KEY
+        sync: false
+      - key: VONAGE_API_SECRET
+        sync: false
+      - key: VONAGE_BRAND
+        sync: false
+
+      # --- Escape hatch -----------------------------------------------------------------------
+      # Set to "0" ONLY to stop the boot-time migration. Left unset, migrations run on every boot,
+      # which is what keeps the deployed schema in step with drizzle/ without a manual step.
+      # - key: RUN_MIGRATIONS
+      #   value: "0"
+
+# After this service is live, the web app must be pointed at it or none of the above matters:
+# in Vercel -> Settings -> Environment Variables, set
+#   EXPO_PUBLIC_API_BASE_URL = https://<this-service>.onrender.com
+# and redeploy. It is an EXPO_PUBLIC_ variable, so it is baked into the bundle at build time -
+# changing it has no effect until the web app is rebuilt.

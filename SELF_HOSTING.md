@@ -89,7 +89,8 @@ which points at this bundle. Nothing else is needed.
 `SERVER_PORT` is provided by the panel automatically, so nothing needs configuring for the port.
 
 Migrations are the one thing that still needs a full install (`drizzle-kit` is a dev dependency), so
-run `pnpm db:migrate` from a machine that has the repo, against the same `DATABASE_URL`.
+run `pnpm db:push` from a machine that has the repo, against the same `DATABASE_URL`. The server also
+applies pending migrations itself on boot, so this is only needed when that step fails.
 
 ## Environment variables
 

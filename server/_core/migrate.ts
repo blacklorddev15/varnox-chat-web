@@ -68,7 +68,9 @@ export async function runMigrationsOnBoot(): Promise<void> {
     console.log("[Migrate] Schema is up to date.");
   } catch (error) {
     console.error("[Migrate] Could not apply migrations:", error instanceof Error ? error.message : error);
-    console.error("[Migrate] Starting anyway. Run `pnpm db:migrate` from a machine with the repository to fix this.");
+    // Points at the script that exists. The previous wording named `pnpm db:migrate`, which is not
+    // in package.json, so following the advice led nowhere at exactly the moment someone needed it.
+    console.error("[Migrate] Starting anyway. Run `pnpm db:push` from a machine with the repository to fix this.");
   } finally {
     await pool.end().catch(() => undefined);
   }
