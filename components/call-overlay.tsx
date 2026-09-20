@@ -316,6 +316,31 @@ export function CallOverlay() {
             {connected ? "Connected" : "Waiting for the other side to pick up"}
           </Text>
         ) : null}
+
+        {/*
+          TEMPORARY. Remove once calls are confirmed working on a device.
+ 
+          "The call screen is blank" could be five different faults, and they were being diagnosed by
+          reading this file and guessing. This prints the state instead: which phase the call is in,
+          whether the LiveKit room exists at all, how many other people are in it, whether this side
+          actually has a camera track published, and how many the others are publishing. Between them
+          those distinguish a call that never started from one that started and has no media to draw,
+          which is the difference between fixing the connection and fixing the picture.
+ 
+          `cam` is the switch's own state; `pub` is whether a track exists for it. If `cam=on` and
+          `pub=0/0`, the camera was asked for and nothing came back - a permission problem, not a
+          rendering one.
+        */}
+        <Text style={[styles.diagnostics, { color: colors.muted }]} numberOfLines={3}>
+          {[
+            `phase=${phase}`,
+            `room=${room ? "yes" : "no"}`,
+            `remote=${remoteCount}`,
+            `cam=${cameraOn ? "on" : "off"}`,
+            `pub=${room ? room.localParticipant.videoTrackPublications.size : 0}/${room ? Array.from(room.remoteParticipants.values()).reduce((total, participant) => total + participant.videoTrackPublications.size, 0) : 0}`,
+            `err=${error ? "yes" : "no"}`,
+          ].join("  ")}
+        </Text>
       </View>
     </View>
   );
@@ -338,6 +363,9 @@ const styles = StyleSheet.create({
   // Dark chip rather than a plain label, so a name stays readable over whatever the camera shows.
   tileLabel: { position: "absolute", left: 6, bottom: 6, right: 6, fontSize: 10, fontWeight: "700", color: "#FFFFFF", backgroundColor: "rgba(0,0,0,0.45)", borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2, overflow: "hidden" },
   error: { fontSize: 12, lineHeight: 17, marginTop: 12, textAlign: "center" },
+  // Monospace so a screenshot is unambiguous about which value is which - a proportional font makes
+  // "1" and "l" and "0" and "O" a guess, and this line exists to be read off a screenshot.
+  diagnostics: { fontSize: 10, lineHeight: 14, marginTop: 14, textAlign: "center", fontFamily: Platform.OS === "web" ? "monospace" : undefined },
   actions: { flexDirection: "row", gap: 18, marginTop: 22 },
   circle: { width: 60, height: 60, borderRadius: 30, alignItems: "center", justifyContent: "center" },
   pressed: { opacity: 0.75, transform: [{ scale: 0.96 }] },
