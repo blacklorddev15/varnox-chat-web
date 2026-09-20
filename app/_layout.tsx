@@ -18,6 +18,7 @@ import {
 import type { EdgeInsets, Metrics, Rect } from "react-native-safe-area-context";
 
 import { trpc, createTRPCClient } from "@/lib/trpc";
+import { createCachePersister, restoreQueryCache } from "@/lib/query-cache";
 import { initManusRuntime, subscribeSafeAreaInsets } from "@/lib/_core/manus-runtime";
 import { useAuth } from "@/hooks/use-auth";
 import { CallProvider } from "@/lib/call-context";
@@ -91,20 +92,37 @@ export default function RootLayout() {
   }, [handleSafeAreaUpdate]);
 
   // Create clients once and reuse them
-  const [queryClient] = useState(
-    () =>
-      new QueryClient({
-        defaultOptions: {
-          queries: {
-            // Disable automatic refetching on window focus for mobile
-            refetchOnWindowFocus: false,
-            // Retry failed requests once
-            retry: 1,
-          },
+  const [queryClient] = useState(() => {
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: {
+          // Disable automatic refetching on window focus for mobile
+          refetchOnWindowFocus: false,
+          // Retry failed requests once
+          retry: 1,
         },
-      }),
-  );
+        mutations: {
+          // Reads keep the default "online" mode, so offline they pause instead of failing and
+          // resume by themselves on reconnect. Writes do not: a paused mutation is a tap that never
+          // resolves and never reports anything, and a message that appears to be sending while it
+          // is really parked in memory is worse than one that is plainly refused. `lib/trpc.ts`
+          // turns a write attempted offline into an immediate, readable error.
+          networkMode: "always",
+        },
+      },
+    });
+    // Whatever was on screen last time goes back in before the first render. This is what makes the
+    // app readable when it is opened with no connection: without it every query starts empty, the
+    // screens show a spinner that never resolves, and there is nothing to read. Restored entries
+    // keep their original `updatedAt`, so React Query still treats stale data as stale and refetches
+    // it the moment there is a connection again.
+    restoreQueryCache(client);
+    return client;
+  });
   const [trpcClient] = useState(() => createTRPCClient());
+
+  // Writes the cache back to storage after it settles, so the next launch has something to restore.
+  useEffect(() => createCachePersister(queryClient), [queryClient]);
 
   // Ensure minimum 8px padding for top and bottom on mobile
   const providerInitialMetrics = useMemo(() => {

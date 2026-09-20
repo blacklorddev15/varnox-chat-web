@@ -1,5 +1,6 @@
 import * as Api from "@/lib/_core/api";
 import * as Auth from "@/lib/_core/auth";
+import { clearQueryCache } from "@/lib/query-cache";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Platform } from "react-native";
 
@@ -60,6 +61,10 @@ export function useAuth(options?: UseAuthOptions) {
             console.log("[useAuth] Web: No authenticated user from API");
             setUser(null);
             await Auth.clearUserInfo();
+            // The server has just said nobody is signed in, so the cached copy of somebody's chats
+            // must go too. Leaving it would mean a signed-out browser still has the last account's
+            // conversations sitting in localStorage in readable form.
+            clearQueryCache();
           }
         }
         return;
@@ -108,6 +113,10 @@ export function useAuth(options?: UseAuthOptions) {
     } finally {
       await Auth.removeSessionToken();
       await Auth.clearUserInfo();
+      // Signing out has to take the offline copies with it. They are plain localStorage, readable by
+      // anyone who opens the browser next, and they are the whole point of the offline cache - so
+      // this is the one place where clearing them is not optional.
+      clearQueryCache();
       setUser(null);
       setError(null);
     }

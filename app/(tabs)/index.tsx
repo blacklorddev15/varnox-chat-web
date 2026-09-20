@@ -30,6 +30,7 @@ import { EmojiPicker } from "@/components/emoji-picker";
 import { LinkPreviewCard } from "@/components/link-preview-card";
 import { LiveLocationBar, type LiveShare } from "@/components/live-location-bar";
 import { VideoMessage } from "@/components/video-message";
+import { OfflineBanner } from "@/components/offline-banner";
 import { completeMention, mentionQuery, parseMentions } from "@/lib/mentions";
 import { parseRichText, type RichNode, type RichStyle } from "@/lib/rich-text";
 // Type-only, so nothing from the server bundle is pulled into the client. `lib/trpc.ts` already
@@ -39,7 +40,9 @@ import { useColors } from "@/hooks/use-colors";
 import { useAppVisible } from "@/hooks/use-app-visible";
 import { useRealtime } from "@/hooks/use-realtime";
 import { useAuth } from "@/hooks/use-auth";
+import { useOnline } from "@/hooks/use-online";
 import { appendMessage, filterConversations } from "@/lib/pulse-chat";
+import { isOnline, OFFLINE_ACTION_MESSAGE, OFFLINE_CALL_MESSAGE, OFFLINE_SEND_MESSAGE, OFFLINE_UPLOAD_MESSAGE } from "@/lib/offline";
 import { MAX_ATTACHMENT_BYTES, pickDocumentFile, prepareAttachment, prepareDocument } from "@/lib/media-upload";
 import { getApiBaseUrl } from "@/constants/oauth";
 import { trpc } from "@/lib/trpc";
@@ -194,8 +197,15 @@ function Avatar({ item, size = 52 }: { item: Pick<Conversation, "initials" | "co
   return <View style={[styles.avatar, { width: size, height: size, borderRadius: size / 2, backgroundColor: item.color }]}><Text style={[styles.avatarText, { fontSize: size * 0.31 }]}>{item.initials}</Text></View>;
 }
 
-function IconButton({ name, color, onPress }: { name: React.ComponentProps<typeof MaterialIcons>["name"]; color: string; onPress: () => void }) {
-  return <Pressable onPress={onPress} style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]} hitSlop={8}><MaterialIcons name={name} size={23} color={color} /></Pressable>;
+/**
+ * An icon control in a header or the composer.
+ *
+ * `dimmed` fades a control without disabling it, which is what the call buttons use when there is
+ * no connection. A wholly disabled button says nothing; a faded one that still answers with "no
+ * connection" is the difference between a broken-looking app and one that has simply lost signal.
+ */
+function IconButton({ name, color, onPress, dimmed = false }: { name: React.ComponentProps<typeof MaterialIcons>["name"]; color: string; onPress: () => void; dimmed?: boolean }) {
+  return <Pressable onPress={onPress} style={({ pressed }) => [styles.iconButton, dimmed && styles.dimmed, pressed && styles.pressed]} hitSlop={8}><MaterialIcons name={name} size={23} color={color} /></Pressable>;
 }
 
 /**
@@ -607,11 +617,16 @@ export default function HomeScreen() {
     return () => clearInterval(timer);
   }, [isAuthenticated, appVisible]);
 
+  // Drives the offline banner and the dimmed controls. The handlers below deliberately do not read
+  // this value - they call isOnline() at the moment they run, so a tap is never judged against a
+  // render that has since gone stale.
+  const online = useOnline();
+
   // Typing: announced on the first keystroke, re-sent every 4s while keys keep arriving (the
   // server lease is 8s), and dropped the moment the box empties. If this client vanishes
   // mid-sentence the lease expires on its own, so nobody is left watching a stuck indicator.
   useEffect(() => {
-    if (!isAuthenticated || !appVisible) return;
+    if (!isAuthenticated || !appVisible || !online) return;
     const want = selectedId && composerText.trim().length > 0 ? selectedId : null;
     if (want === null && typingTargetRef.current === null) return;
     const now = Date.now();
@@ -626,7 +641,9 @@ export default function HomeScreen() {
         heartbeatRef.current.mutate({ typingConversationId: null });
       }, 6000);
     }
-  }, [composerText, selectedId, isAuthenticated, appVisible]);
+    // `online` is a dependency as well as a guard: with the connection gone there is nothing to
+    // announce, and React Query would only pause the heartbeat anyway.
+  }, [composerText, selectedId, isAuthenticated, appVisible, online]);
 
   useEffect(() => () => { if (typingClearTimer.current) clearTimeout(typingClearTimer.current); }, []);
 
@@ -636,6 +653,24 @@ export default function HomeScreen() {
     setToast(message);
     setTimeout(() => setToast(null), 2200);
     if (Platform.OS !== "web") Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  };
+
+  /**
+   * Refuses a write while offline and returns true when the caller should stop.
+   *
+   * This is not belt-and-braces around a failing request. React Query pauses a mutation while
+   * offline rather than failing it, so the `await mutation.mutateAsync(...)` that every send in this
+   * screen ends with would never settle - the message would not send, no error would appear, and
+   * anything after the await (clearing the composer, closing a sheet) would never run. Refusing
+   * before the mutation is fired is what makes an offline tap a clear answer instead of a hang.
+   *
+   * The signal is the same one React Query pauses on, so the two cannot disagree: if this says
+   * online, the mutation really will go out.
+   */
+  const blockedOffline = (message: string = OFFLINE_SEND_MESSAGE) => {
+    if (isOnline()) return false;
+    notify(message);
+    return true;
   };
 
   const requestWebNotifications = async () => {
@@ -801,6 +836,8 @@ export default function HomeScreen() {
     const options = pollDraft.options.map((option) => option.trim()).filter(Boolean);
     if (!question) { notify("A poll needs a question"); return; }
     if (options.length < 2) { notify("A poll needs at least two answers"); return; }
+    // Before the sheet is dismissed, so the poll somebody just wrote is still there to send again.
+    if (blockedOffline()) return;
     setPollDraft(null);
     await sendMessage({ text: question, kind: "poll", meta: { kind: "poll", question, options } });
   };
@@ -813,6 +850,9 @@ export default function HomeScreen() {
    */
   const sendContactCard = async (person: ContactSuggestion) => {
     if (!person.userId || !selectedId) return;
+    // Before the sheet closes and the search is cleared: the person just chosen should still be on
+    // screen when the toast says it did not send.
+    if (blockedOffline()) return;
     setShowShareContact(false);
     setContactQuery("");
     await sendMessage({ text: person.name, kind: "contact", meta: { kind: "contact", userId: person.userId, name: person.name, username: person.username, phone: person.phone } });
@@ -829,6 +869,7 @@ export default function HomeScreen() {
 
   /** Records my answer to a poll. Changing my mind is the same call; the server replaces the row. */
   const castVote = async (message: Message, optionIndex: number) => {
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       await votePoll.mutateAsync({ messageId: message.id, optionIndex });
       await liveMessagesQuery.refetch();
@@ -840,6 +881,9 @@ export default function HomeScreen() {
   const sendMessage = async (override?: Partial<Message>) => {
     const trimmed = composerText.trim();
     if ((!trimmed && !override?.mediaUrl && !override?.text) || !selectedId) return;
+    // Checked before the text is cleared below, so an offline send leaves the message in the box to
+    // be typed again rather than swallowing it.
+    if (blockedOffline()) return;
     const now = new Date();
     const time = now.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
     const localMessage: Message = { id: `new-${Date.now()}`, text: trimmed || override?.text || "Shared media", time, mine: true, read: true, viewOnce, quote: replyTo ? { id: replyTo.id, body: replyTo.text, kind: "text", senderId: user?.id ?? 0, senderName: replyTo.senderName, deleted: false } : undefined, ...override };
@@ -863,6 +907,10 @@ export default function HomeScreen() {
 
   /** Picks a document and sends it as an attachment. */
   const shareDocument = async () => {
+    // Before the file picker, not after the upload. The upload is a mutation like any other, so
+    // offline it would pause and the sheet would sit on "uploading" forever with the picked file
+    // already in memory.
+    if (blockedOffline(OFFLINE_UPLOAD_MESSAGE)) return;
     try {
       const asset = await pickDocumentFile();
       if (!asset || !selectedId) return;
@@ -886,6 +934,7 @@ export default function HomeScreen() {
   };
 
   const shareMedia = async () => {
+    if (blockedOffline(OFFLINE_UPLOAD_MESSAGE)) return;
     try {
       const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ImagePicker.MediaTypeOptions.All, quality: 0.82, allowsEditing: false });
       if (result.canceled || !result.assets[0] || !selectedId) return;
@@ -904,6 +953,9 @@ export default function HomeScreen() {
 
   const startVoiceNote = async () => {
     if (Platform.OS === "web") { notify("Voice notes are available in the mobile build"); return; }
+    // Refused before the recorder starts. Letting somebody speak a note that cannot be uploaded
+    // would waste the recording and leave the mic on for nothing.
+    if (blockedOffline(OFFLINE_UPLOAD_MESSAGE)) return;
     const permission = await requestRecordingPermissionsAsync();
     if (!permission.granted) { notify("Microphone permission is needed for voice notes"); return; }
     await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
@@ -916,6 +968,9 @@ export default function HomeScreen() {
     await recorder.stop();
     const uri = recorder.uri;
     if (!uri || !selectedId) return;
+    // Stopping always stops the recorder - the recording happened and the mic has to be released.
+    // Only the upload is refused, and the toast says so rather than the note vanishing silently.
+    if (blockedOffline(OFFLINE_UPLOAD_MESSAGE)) return;
     const durationMs = Math.max(1000, Math.round((recorderState.durationMillis ?? 1000)));
     try {
       if (!isAuthenticated) { await sendMessage({ text: `Voice note · ${Math.round(durationMs / 1000)}s`, kind: "voice", mediaUrl: uri, voiceDurationMs: durationMs }); return; }
@@ -958,6 +1013,7 @@ export default function HomeScreen() {
   // nothing, so the buttons looked functional while the other side never learned about them.
   const applyReaction = async (message: Message, emoji: string) => {
     setReactingToId(null);
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     const existing = (message.reactions ?? []).find((reaction) => reaction.userId === user?.id);
     // Tapping the reaction you already gave removes it, which is what people expect.
     try {
@@ -970,6 +1026,7 @@ export default function HomeScreen() {
 
   const toggleStar = async (message: Message) => {
     setActiveMessageId(null);
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       await starMessage.mutateAsync({ messageId: message.id, starred: !message.starred });
       await liveMessagesQuery.refetch();
@@ -1024,6 +1081,9 @@ export default function HomeScreen() {
 
   const startSharing = async (durationMs: number) => {
     if (!selectedId) return;
+    // A share is a live feed. Starting one offline would publish a position that is already stale by
+    // the time it arrives, so it is refused rather than started and left frozen.
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     setShowLocation(false);
     try {
       const { lat, lng } = await readPosition();
@@ -1046,8 +1106,12 @@ export default function HomeScreen() {
   };
 
   const stopSharing = async (id: string) => {
+    // Local state is torn down either way - the timer must stop whether or not the server hears
+    // about it. Refusing outright would leave a live share running on a device that thinks it
+    // stopped.
     clearLocationTimer();
     setMyShareId(null);
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       await stopLocation.mutateAsync({ id });
       await locationQuery.refetch();
@@ -1100,6 +1164,7 @@ export default function HomeScreen() {
   const scheduleComposer = async (when: Date) => {
     const text = composerText.trim();
     if (!text || !selectedId) return;
+    if (blockedOffline()) return;
     setShowSchedule(false);
     try {
       await sendRemoteMessage.mutateAsync({ conversationId: selectedId, body: text, kind: "text", scheduledAt: when.toISOString() });
@@ -1147,6 +1212,9 @@ export default function HomeScreen() {
 
   const tryUnlockChat = async () => {
     if (!selectedId) return;
+    // The PIN is checked on the server. Offline the check would pause and the box would sit on
+    // "Checking…" indefinitely, which reads as a wrong PIN.
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     setChatPinError(null);
     try {
       await verifyPin.mutateAsync({ pin: chatPin.trim() });
@@ -1166,6 +1234,7 @@ export default function HomeScreen() {
 
   const togglePin = async (message: Message) => {
     setActiveMessageId(null);
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       await pinMessage.mutateAsync({ messageId: message.id, pinned: !message.pinnedAt });
       await Promise.all([liveMessagesQuery.refetch(), pinnedQuery.refetch()]);
@@ -1177,6 +1246,7 @@ export default function HomeScreen() {
 
   const toggleKeep = async (message: Message) => {
     setActiveMessageId(null);
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       await keepMessage.mutateAsync({ messageId: message.id, kept: !message.kept });
       await liveMessagesQuery.refetch();
@@ -1188,6 +1258,7 @@ export default function HomeScreen() {
 
   /** Unpinning from the banner, which knows the message only by id. */
   const unpinById = async (messageId: string) => {
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       await pinMessage.mutateAsync({ messageId, pinned: false });
       await Promise.all([liveMessagesQuery.refetch(), pinnedQuery.refetch()]);
@@ -1215,6 +1286,7 @@ export default function HomeScreen() {
   const sendReport = async () => {
     const target = reportTarget;
     if (!target) return;
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       await reportMessage.mutateAsync({
         category: reportCategory,
@@ -1240,6 +1312,9 @@ export default function HomeScreen() {
     if (!editingId) return;
     const body = composerText.trim();
     if (!body) return;
+    // The edit stays in the composer and the banner stays up, so nothing typed is lost and the
+    // message is still in edit mode to try again.
+    if (blockedOffline()) return;
     try {
       await editMessage.mutateAsync({ messageId: editingId, body });
       await liveMessagesQuery.refetch();
@@ -1252,6 +1327,7 @@ export default function HomeScreen() {
 
   const deleteMessage = async (message: Message, forEveryone: boolean) => {
     setActiveMessageId(null);
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       await removeMessage.mutateAsync({ messageId: message.id, forEveryone });
       await liveMessagesQuery.refetch();
@@ -1262,8 +1338,11 @@ export default function HomeScreen() {
 
   const forwardTo = async (conversationId: string) => {
     const message = forwarding;
-    setForwarding(null);
     if (!message) return;
+    // Checked before the picker closes, so the message being forwarded is not dropped when the
+    // forward is refused.
+    if (blockedOffline()) return;
+    setForwarding(null);
     try {
       await sendRemoteMessage.mutateAsync({ conversationId, body: message.text, kind: message.kind ?? "text", mediaUrl: message.mediaUrl, mediaName: message.mediaName, forwardedFromId: message.id });
       await liveMessagesQuery.refetch();
@@ -1285,6 +1364,7 @@ export default function HomeScreen() {
    * fetch-and-encode is what makes "save that as a sticker" possible without an upload endpoint of its own.
    */
   const saveAsSticker = async (message: Message) => {
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     const url = resolveMediaUrl(message.mediaUrl);
     if (!url) {
       notify("That image is no longer available");
@@ -1312,6 +1392,7 @@ export default function HomeScreen() {
   /** Sends one sticker to the open chat. */
   const sendSticker = async (stickerId: string) => {
     if (!selectedId) return;
+    if (blockedOffline()) return;
     setShowStickers(false);
     try {
       await sendRemoteMessage.mutateAsync({ conversationId: selectedId, kind: "sticker", mediaUrl: `/api/sticker/${stickerId}` });
@@ -1357,6 +1438,10 @@ export default function HomeScreen() {
    * play cannot leave the media readable afterwards.
    */
   const openVideoOnce = async (message: Message) => {
+    // Opening a view-once message is a write: the server consumes the stored copy as it hands it
+    // over. Offline that exchange cannot happen, and showing the media anyway would leave a copy
+    // that the server still believes is unopened - readable again on the next launch.
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       const opened = await openViewOnce.mutateAsync({ messageId: message.id });
       setOnceVideo(resolveMediaUrl(opened.mediaUrl) ?? null);
@@ -1367,6 +1452,8 @@ export default function HomeScreen() {
   };
 
   const openOnce = async (message: Message) => {
+    // See openVideoOnce: the copy is consumed server-side, so this cannot be served offline.
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       const opened = await openViewOnce.mutateAsync({ messageId: message.id });
       setOncePreview(resolveMediaUrl(opened.mediaUrl) ?? null);
@@ -1378,6 +1465,9 @@ export default function HomeScreen() {
 
   const toggleChatFlag = async (conversationId: string, flags: { pinned?: boolean; muted?: boolean; archived?: boolean }) => {
     setRowMenuId(null);
+    // The row menu is dismissed above so it does not stay open over the list. The change itself is
+    // refused, because a pinned chat that silently un-pins on the next sync is worse than a refusal.
+    if (blockedOffline(OFFLINE_ACTION_MESSAGE)) return;
     try {
       await setFlags.mutateAsync({ conversationId, ...flags });
       await conversationListQuery.refetch();
@@ -1429,9 +1519,12 @@ export default function HomeScreen() {
             <Pressable onPress={() => router.push({ pathname: "/chat/group-info", params: { conversationId: selectedChat.id } })} style={styles.chatTitleBlock}><Text style={[styles.chatTitle, { color: colors.foreground }]}>{selectedChat.name}</Text><Text style={[styles.chatSubtitle, { color: peerTyping || peerOnline ? colors.primary : colors.muted }]}>{peerTyping ? "typing…" : peerOnline ? "online" : selectedChat.group ? "tap for group info" : peerLastSeen ?? (isAuthenticated ? "messages sync automatically" : "not signed in")}</Text></Pressable>
             <IconButton name="timer" color={selectedChat.disappearSeconds ? colors.primary : colors.muted} onPress={() => setShowTimer((current) => !current)} />
             <IconButton name="more-vert" color={colors.muted} onPress={() => router.push({ pathname: "/chat/chat-settings", params: { conversationId: selectedChat.id } })} />
-            <IconButton name="videocam" color={colors.primary} onPress={() => void startCall({ conversationId: selectedChat.id, kind: "video", peerName: selectedChat.name })} />
-            <IconButton name="call" color={colors.primary} onPress={() => void startCall({ conversationId: selectedChat.id, kind: "audio", peerName: selectedChat.name })} />
+            {/* Refused here rather than inside startCall so the answer is a toast in the header
+                rather than the full call overlay appearing only to report an error. */}
+            <IconButton name="videocam" dimmed={!online} color={online ? colors.primary : colors.muted} onPress={() => { if (blockedOffline(OFFLINE_CALL_MESSAGE)) return; void startCall({ conversationId: selectedChat.id, kind: "video", peerName: selectedChat.name }); }} />
+            <IconButton name="call" dimmed={!online} color={online ? colors.primary : colors.muted} onPress={() => { if (blockedOffline(OFFLINE_CALL_MESSAGE)) return; void startCall({ conversationId: selectedChat.id, kind: "audio", peerName: selectedChat.name }); }} />
           </View>
+          <OfflineBanner />
           {showTimer ? <View style={[styles.timerSheet, { backgroundColor: colors.surface, borderColor: colors.border }]}><Text style={[styles.timerHeading, { color: colors.muted }]}>Disappearing messages</Text>{([[null, "Off"], [86400, "24 hours"], [604800, "7 days"], [7776000, "90 days"]] as Array<[number | null, string]>).map(([seconds, label]) => <Pressable key={label} onPress={() => { setShowTimer(false); if (!selectedId) return; void setDisappearing.mutateAsync({ conversationId: selectedId, seconds }).then(() => conversationListQuery.refetch()).catch((error) => notify(error instanceof Error && error.message ? error.message : "Could not update the timer")); }} style={styles.timerOption}><Text style={[styles.timerLabel, { color: (selectedChat.disappearSeconds ?? null) === seconds ? colors.primary : colors.foreground }]}>{label}</Text>{(selectedChat.disappearSeconds ?? null) === seconds ? <MaterialIcons name="check" size={17} color={colors.primary} /> : null}</Pressable>)}<Text style={[styles.timerNote, { color: colors.muted }]}>New messages disappear for everyone. Already-sent ones are left alone.</Text></View> : null}
           <LiveLocationBar shares={(locationQuery.data ?? []) as LiveShare[]} myUserId={myUserId} onStop={(id) => void stopSharing(id)} />
           {isChatLocked ? <View style={[styles.chatLock, { backgroundColor: colors.background }]}><MaterialIcons name="lock" size={30} color={colors.primary} /><Text style={[styles.chatLockTitle, { color: colors.foreground }]}>This chat is locked</Text><Text style={[styles.chatLockCopy, { color: colors.muted }]}>Enter your PIN to open it. It locks again when you close the app.</Text><TextInput value={chatPin} onChangeText={setChatPin} placeholder="PIN" placeholderTextColor={colors.muted} secureTextEntry keyboardType="number-pad" maxLength={16} style={[styles.chatLockInput, { color: colors.foreground, borderColor: colors.border, backgroundColor: colors.surface }]} />{chatPinError ? <Text style={[styles.chatLockError, { color: colors.error }]}>{chatPinError}</Text> : null}<Pressable disabled={!chatPin.trim() || verifyPin.isPending} onPress={() => void tryUnlockChat()} style={[styles.chatLockButton, { backgroundColor: colors.primary, opacity: !chatPin.trim() || verifyPin.isPending ? 0.5 : 1 }]}><Text style={styles.chatLockButtonText}>{verifyPin.isPending ? "Checking…" : "Unlock"}</Text></Pressable></View> : null}
@@ -1453,7 +1546,7 @@ export default function HomeScreen() {
             {!item.deleted && item.kind === "text" && item.text ? <LinkPreviewCard text={item.text} mine={Boolean(item.mine)} /> : null}
             <View style={styles.messageMeta}>{item.edited ? <Text style={[styles.editedTag, { color: item.mine ? colors.bubbleOutgoingText : colors.muted }]}>edited</Text> : null}<Text style={[styles.messageTime, { color: item.mine ? colors.bubbleOutgoingText : colors.muted, opacity: item.mine ? 0.75 : 1 }]}>{item.time}</Text>{item.starred ? <MaterialIcons name="star" size={13} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /> : null}{item.kept ? <MaterialIcons name="bookmark" size={13} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /> : null}{item.scheduledAt && new Date(item.scheduledAt).getTime() > Date.now() ? <MaterialIcons name="schedule" size={13} color={item.mine ? colors.bubbleOutgoingText : colors.primary} /> : null}<MessageTicks status={item.status} color={item.mine ? colors.bubbleOutgoingText : colors.muted} readColor="#53BDEB" /></View>
           </View>{item.reactions && item.reactions.length > 0 ? <View style={styles.reactionRow}>{item.reactions.map((reaction) => <View key={`${item.id}-${reaction.userId}`} style={[styles.reactionChip, { backgroundColor: colors.surface, borderColor: colors.border }]}><Text style={styles.reactionEmoji}>{reaction.emoji}</Text></View>)}</View> : null}{reactingToId === item.id ? <View style={[styles.reactionPicker, { backgroundColor: colors.surface, borderColor: colors.border }]}>{REACTION_EMOJIS.map((emoji) => <Pressable key={emoji} onPress={() => void applyReaction(item, emoji)} hitSlop={6}><Text style={styles.reactionEmoji}>{emoji}</Text></Pressable>)}</View> : null}{activeMessageId === item.id ? <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.actionsScroll} contentContainerStyle={[styles.messageActions, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => { setReplyTo({ id: item.id, text: item.text, senderName: item.mine ? "You" : selectedChat.name }); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Reply</Text></Pressable><Pressable onPress={() => { setReactingToId(item.id); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>React</Text></Pressable><Pressable onPress={() => void toggleStar(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>{item.starred ? "Unstar" : "Star"}</Text></Pressable><Pressable onPress={() => { setForwarding(item); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Forward</Text></Pressable><Pressable onPress={() => void togglePin(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>{item.pinnedAt ? "Unpin" : "Pin"}</Text></Pressable>{item.expiresAt ? <Pressable onPress={() => void toggleKeep(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>{item.kept ? "Stop keeping" : "Keep in chat"}</Text></Pressable> : null}{item.kind === "image" && item.mediaUrl && !item.viewOnce ? <Pressable onPress={() => { setActiveMessageId(null); void saveAsSticker(item); }}><Text style={[styles.actionText, { color: colors.foreground }]}>Save as sticker</Text></Pressable> : null}{item.mine && !item.deleted && item.kind === "text" ? <Pressable onPress={() => beginEdit(item)}><Text style={[styles.actionText, { color: colors.foreground }]}>Edit</Text></Pressable> : null}<Pressable onPress={() => void deleteMessage(item, false)}><Text style={[styles.actionText, { color: colors.foreground }]}>Delete for me</Text></Pressable>{item.mine && !item.deleted ? <Pressable onPress={() => void deleteMessage(item, true)}><Text style={[styles.actionText, { color: colors.error }]}>Delete for everyone</Text></Pressable> : null}{!item.mine && !item.deleted ? <Pressable onPress={() => { setReportTarget(item); setActiveMessageId(null); }}><Text style={[styles.actionText, { color: colors.error }]}>Report</Text></Pressable> : null}</ScrollView> : null}</Pressable>} />
-          <View style={[styles.composerArea, { borderTopColor: colors.border, backgroundColor: colors.background }]}>{editingId ? <Pressable onPress={() => { setEditingId(null); setComposerText(""); }} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>Editing message</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{composerText}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : replyTo ? <Pressable onPress={() => setReplyTo(null)} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>{replyTo.senderName}</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{replyTo.text}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : null}{mentionSuggestions.length > 0 ? <View style={[styles.mentionBar, { backgroundColor: colors.surface, borderColor: colors.border }]}>{mentionSuggestions.map((name) => <Pressable key={name} onPress={() => setComposerText((current) => completeMention(current, name))} style={[styles.mentionChip, { borderColor: colors.border }]}><Text style={[styles.mentionChipText, { color: colors.primary }]}>{name}</Text></Pressable>)}</View> : null}<View style={[styles.composer, { backgroundColor: colors.surface, borderColor: colors.border }]}><IconButton name="add" color={colors.muted} onPress={() => setShowAttach((current) => !current)} /><Pressable onPress={() => setViewOnce(!viewOnce)} style={[styles.viewOnce, viewOnce && { backgroundColor: colors.primary }]}><Text style={[styles.viewOnceText, { color: viewOnce ? "#FFFFFF" : colors.muted }]}>1</Text></Pressable><TextInput value={composerText} onChangeText={onComposerChange} onSelectionChange={(event) => setComposerSelection(event.nativeEvent.selection)} placeholder={editingId ? "Edit message" : "Write a message"} placeholderTextColor={colors.muted} style={[styles.composerInput, { color: colors.foreground }]} multiline maxLength={500} /><IconButton name="my-location" color={showLocation || myShareId ? colors.primary : colors.muted} onPress={() => { setShowAttach(false); setShowEmoji(false); setShowSchedule(false); setShowLocation((current) => !current); }} /><IconButton name="schedule" color={showSchedule ? colors.primary : colors.muted} onPress={() => { setShowAttach(false); setShowEmoji(false); setShowLocation(false); setShowSchedule((current) => !current); }} /><IconButton name="mood" color={showEmoji ? colors.primary : colors.muted} onPress={() => { setShowAttach(false); setShowEmoji((current) => !current); }} /></View>{showEmoji ? <EmojiPicker colors={colors} onSelect={insertEmoji} onClose={() => setShowEmoji(false)} /> : null}{showAttach ? <View style={styles.attachSheet}><Pressable onPress={() => { setShowAttach(false); void shareMedia(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="perm-media" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Photo or video</Text></Pressable><Pressable onPress={() => { setShowAttach(false); void shareDocument(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="attach-file" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Document</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setPollDraft({ question: "", options: ["", ""] }); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="poll" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Poll</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setShowShareContact(true); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="contact-page" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Contact</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setShowStickers(true); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="emoji-emotions" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Sticker</Text></Pressable></View> : null}<Pressable onPress={editingId ? () => void saveEdit() : composerText.trim() ? () => void sendMessage() : recorderState.isRecording ? () => void stopVoiceNote() : () => void startVoiceNote()} style={({ pressed }) => [styles.sendButton, { backgroundColor: recorderState.isRecording ? colors.error : colors.primary }, pressed && styles.sendPressed]}><MaterialIcons name={editingId ? "check" : composerText.trim() ? "send" : recorderState.isRecording ? "stop" : "mic"} size={21} color="#FFFFFF" /></Pressable></View>
+          <View style={[styles.composerArea, { borderTopColor: colors.border, backgroundColor: colors.background }]}>{editingId ? <Pressable onPress={() => { setEditingId(null); setComposerText(""); }} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>Editing message</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{composerText}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : replyTo ? <Pressable onPress={() => setReplyTo(null)} style={[styles.replyBanner, { backgroundColor: colors.surface }]}><View style={styles.replyBannerCopy}><Text style={[styles.replySender, { color: colors.primary }]}>{replyTo.senderName}</Text><Text style={[styles.replyText, { color: colors.muted }]} numberOfLines={1}>{replyTo.text}</Text></View><MaterialIcons name="close" size={16} color={colors.muted}/></Pressable> : null}{mentionSuggestions.length > 0 ? <View style={[styles.mentionBar, { backgroundColor: colors.surface, borderColor: colors.border }]}>{mentionSuggestions.map((name) => <Pressable key={name} onPress={() => setComposerText((current) => completeMention(current, name))} style={[styles.mentionChip, { borderColor: colors.border }]}><Text style={[styles.mentionChipText, { color: colors.primary }]}>{name}</Text></Pressable>)}</View> : null}<View style={[styles.composer, { backgroundColor: colors.surface, borderColor: colors.border }]}><IconButton name="add" color={colors.muted} onPress={() => setShowAttach((current) => !current)} /><Pressable onPress={() => setViewOnce(!viewOnce)} style={[styles.viewOnce, viewOnce && { backgroundColor: colors.primary }]}><Text style={[styles.viewOnceText, { color: viewOnce ? "#FFFFFF" : colors.muted }]}>1</Text></Pressable><TextInput value={composerText} onChangeText={onComposerChange} onSelectionChange={(event) => setComposerSelection(event.nativeEvent.selection)} placeholder={editingId ? "Edit message" : "Write a message"} placeholderTextColor={colors.muted} style={[styles.composerInput, { color: colors.foreground }]} multiline maxLength={500} /><IconButton name="my-location" color={showLocation || myShareId ? colors.primary : colors.muted} onPress={() => { setShowAttach(false); setShowEmoji(false); setShowSchedule(false); setShowLocation((current) => !current); }} /><IconButton name="schedule" color={showSchedule ? colors.primary : colors.muted} onPress={() => { setShowAttach(false); setShowEmoji(false); setShowLocation(false); setShowSchedule((current) => !current); }} /><IconButton name="mood" color={showEmoji ? colors.primary : colors.muted} onPress={() => { setShowAttach(false); setShowEmoji((current) => !current); }} /></View>{showEmoji ? <EmojiPicker colors={colors} onSelect={insertEmoji} onClose={() => setShowEmoji(false)} /> : null}{showAttach ? <View style={styles.attachSheet}><Pressable onPress={() => { setShowAttach(false); void shareMedia(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="perm-media" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Photo or video</Text></Pressable><Pressable onPress={() => { setShowAttach(false); void shareDocument(); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="attach-file" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Document</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setPollDraft({ question: "", options: ["", ""] }); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="poll" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Poll</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setShowShareContact(true); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="contact-page" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Contact</Text></Pressable><Pressable onPress={() => { setShowAttach(false); setShowStickers(true); }} style={[styles.attachOption, { backgroundColor: colors.surface, borderColor: colors.border }]}><MaterialIcons name="emoji-emotions" size={18} color={colors.primary} /><Text style={[styles.attachLabel, { color: colors.foreground }]}>Sticker</Text></Pressable></View> : null}<Pressable onPress={editingId ? () => void saveEdit() : composerText.trim() ? () => void sendMessage() : recorderState.isRecording ? () => void stopVoiceNote() : () => void startVoiceNote()} style={({ pressed }) => [styles.sendButton, { backgroundColor: recorderState.isRecording ? colors.error : colors.primary }, !online && styles.dimmed, pressed && styles.sendPressed]}><MaterialIcons name={editingId ? "check" : composerText.trim() ? "send" : recorderState.isRecording ? "stop" : "mic"} size={21} color="#FFFFFF" /></Pressable></View>
           {onceVideo ? <View style={styles.overlay}><VideoMessage uri={onceVideo} style={styles.overlayVideo} /><Text style={styles.overlayNote}>This video can only be opened once. The stored copy has already been removed.</Text><Pressable onPress={() => setOnceVideo(null)} style={styles.overlayClose}><Text style={styles.overlayCloseText}>Close</Text></Pressable></View> : null}
           {showLocation ? <View style={[styles.contactSheet, { backgroundColor: colors.background, borderColor: colors.border }]}><View style={styles.contactHeader}><View><Text style={[styles.contactTitle, { color: colors.foreground }]}>Share your location</Text><Text style={[styles.contactSubtitle, { color: colors.muted }]}>It stops on its own, and you can stop it sooner</Text></View><IconButton name="close" color={colors.foreground} onPress={() => setShowLocation(false)} /></View><ScrollView contentContainerStyle={styles.pollBuilder}>{[{ label: "15 minutes", ms: 15 * 60_000 }, { label: "1 hour", ms: 60 * 60_000 }, { label: "8 hours", ms: 8 * 60 * 60_000 }].map((option) => <Pressable key={option.label} disabled={!selectedId} onPress={() => void startSharing(option.ms)} style={({ pressed }) => [styles.scheduleRow, { borderColor: colors.border, backgroundColor: colors.surface, opacity: selectedId ? 1 : 0.5 }, pressed && styles.pressed]}><MaterialIcons name="my-location" size={17} color={colors.primary} /><Text style={[styles.scheduleLabel, { color: colors.foreground }]}>{option.label}</Text></Pressable>)}<Text style={[styles.locationNote, { color: colors.muted }]}>{`Your position updates roughly every 30 seconds while this tab is open. Everyone in the chat can see it until it expires.`}</Text></ScrollView></View> : null}
           {showSchedule ? <View style={[styles.contactSheet, { backgroundColor: colors.background, borderColor: colors.border }]}><View style={styles.contactHeader}><View><Text style={[styles.contactTitle, { color: colors.foreground }]}>Send later</Text><Text style={[styles.contactSubtitle, { color: colors.muted }]}>Nobody else sees it until then</Text></View><IconButton name="close" color={colors.foreground} onPress={() => setShowSchedule(false)} /></View><ScrollView contentContainerStyle={styles.pollBuilder} keyboardShouldPersistTaps="handled"><View style={[styles.reportQuote, { borderColor: colors.border, backgroundColor: colors.surface }]}><Text style={[styles.reportQuoteText, { color: composerText.trim() ? colors.foreground : colors.muted }]} numberOfLines={3}>{composerText.trim() || "Type a message first, then pick a time."}</Text></View>{schedulePresets.map((option) => <Pressable key={option.label} disabled={!composerText.trim()} onPress={() => void scheduleComposer(option.when)} style={({ pressed }) => [styles.scheduleRow, { borderColor: colors.border, backgroundColor: colors.surface, opacity: composerText.trim() ? 1 : 0.5 }, pressed && styles.pressed]}><MaterialIcons name="schedule" size={17} color={colors.primary} /><Text style={[styles.scheduleLabel, { color: colors.foreground }]}>{option.label}</Text><Text style={[styles.scheduleTime, { color: colors.muted }]}>{option.when.toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" })}</Text></Pressable>)}</ScrollView></View> : null}
@@ -1473,6 +1566,7 @@ export default function HomeScreen() {
     <ScreenContainer className="bg-background" edges={["top", "left", "right"]}>
       <StatusBar style="light" />
       <View style={styles.header}><Text style={[styles.heading, { color: colors.foreground }]}>Messages</Text><View style={styles.headerActions}><IconButton name="camera-alt" color={colors.foreground} onPress={() => notify("Camera ready")} /><IconButton name="more-horiz" color={colors.foreground} onPress={() => setShowMenu((current) => !current)} /></View></View>
+      <OfflineBanner />
       {showMenu ? <View style={[styles.menu, { backgroundColor: colors.surface, borderColor: colors.border }]}><Pressable onPress={() => { setChatFilter("all"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="forum" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>All chats</Text></Pressable><Pressable onPress={() => { setChatFilter("unread"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="mark-chat-unread" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Unread</Text></Pressable><Pressable onPress={() => { setChatFilter("groups"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="groups" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Groups</Text></Pressable><Pressable onPress={() => { setChatFilter("archived"); setShowMenu(false); }} style={styles.menuItem}><MaterialIcons name="archive" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Archived</Text></Pressable><Pressable onPress={() => { setShowMenu(false); router.push("/chat/search"); }} style={styles.menuItem}><MaterialIcons name="manage-search" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Search messages</Text></Pressable><Pressable onPress={() => { setShowMenu(false); router.push("/chat/starred"); }} style={styles.menuItem}><MaterialIcons name="star-border" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Starred messages</Text></Pressable><Pressable onPress={() => { setShowMenu(false); router.push("/chat/new-group"); }} style={styles.menuItem}><MaterialIcons name="group-add" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>New group</Text></Pressable><Pressable onPress={() => { setShowMenu(false); Platform.OS === "web" ? requestWebNotifications() : notify(isAuthenticated ? "Push notifications are registered" : "Sign in to enable push notifications"); }} style={styles.menuItem}><MaterialIcons name="notifications-active" size={18} color={colors.foreground}/><Text style={[styles.menuText, { color: colors.foreground }]}>Notification setup</Text></Pressable></View> : null}
       <View style={[styles.searchWrap, { backgroundColor: colors.surface, borderColor: searchFocused ? colors.primary : colors.border }, searchFocused && styles.searchWrapFocused]}><MaterialIcons name="search" size={20} color={searchFocused ? colors.primary : colors.muted} /><TextInput value={query} onChangeText={setQuery} onFocus={() => setSearchFocused(true)} onBlur={() => setSearchFocused(false)} placeholder="Search conversations" placeholderTextColor={colors.muted} style={[styles.searchInput, { color: colors.foreground }]} returnKeyType="search" />{query ? <Pressable onPress={() => setQuery("")} hitSlop={8} style={styles.searchClear}><MaterialIcons name="close" size={18} color={colors.muted} /></Pressable> : null}</View>
       <View style={styles.listHeader}><Text style={[styles.sectionLabel, { color: colors.muted }]}>RECENT</Text><Text style={[styles.countLabel, { color: colors.muted }]}>{filteredConversations.length} {filteredConversations.length === 1 ? "chat" : "chats"}</Text></View>
@@ -1486,7 +1580,7 @@ export default function HomeScreen() {
 }
 
 const styles = StyleSheet.create({
-  flex: { flex: 1 }, header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingTop: 12, paddingBottom: 12 }, eyebrow: { fontSize: 11, fontWeight: "800", letterSpacing: 1.5, marginBottom: 5 }, heading: { fontSize: 22, lineHeight: 28, fontWeight: "800", letterSpacing: -0.4 }, headerActions: { flexDirection: "row", gap: 4 }, iconButton: { width: 38, height: 38, alignItems: "center", justifyContent: "center", borderRadius: 19 }, pressed: { opacity: 0.55 }, searchWrap: { height: 48, borderRadius: 14, marginHorizontal: 16, paddingHorizontal: 14, flexDirection: "row", alignItems: "center", borderWidth: 1 }, searchWrapFocused: { shadowColor: "#00A884", shadowOpacity: 0.25, shadowRadius: 10, shadowOffset: { width: 0, height: 0 }, elevation: 3 }, searchClear: { width: 26, height: 26, borderRadius: 13, alignItems: "center", justifyContent: "center" }, searchInput: { flex: 1, marginLeft: 10, fontSize: 15.5, paddingVertical: 0, letterSpacing: 0.1, backgroundColor: "transparent" }, listHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 22, paddingTop: 25, paddingBottom: 8 }, sectionLabel: { fontSize: 11, fontWeight: "800", letterSpacing: 1.2 }, countLabel: { fontSize: 12 }, chatList: { paddingBottom: 100 }, chatRow: { flexDirection: "row", paddingLeft: 16, minHeight: 74 }, rowPressed: { opacity: 0.68 }, avatarWrap: { width: 60, alignItems: "flex-start", paddingTop: 11 }, avatar: { alignItems: "center", justifyContent: "center" }, avatarText: { color: "#FFFFFF", fontWeight: "800", letterSpacing: 0.2 }, onlineDot: { width: 13, height: 13, borderRadius: 7, backgroundColor: "#25D366", borderWidth: 3, position: "absolute", bottom: 0, right: 5 }, chatCopy: { flex: 1, paddingRight: 16, paddingVertical: 13, borderBottomWidth: StyleSheet.hairlineWidth }, rowTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, chatName: { flex: 1, fontSize: 16.5, fontWeight: "600", letterSpacing: -0.1 }, chatTime: { fontSize: 11.5, fontWeight: "500" }, rowBottom: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 4, gap: 8 }, previewLine: { flex: 1, flexDirection: "row", alignItems: "center" }, pin: { marginRight: 4, transform: [{ rotate: "35deg" }] }, chatPreview: { flex: 1, fontSize: 13.5, lineHeight: 18 }, unread: { minWidth: 21, height: 21, borderRadius: 11, alignItems: "center", justifyContent: "center", paddingHorizontal: 5 }, unreadText: { color: "#FFFFFF", fontSize: 11, fontWeight: "800" }, fab: { position: "absolute", right: 20, bottom: 20, width: 55, height: 55, borderRadius: 28, alignItems: "center", justifyContent: "center", shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 10, shadowOffset: { width: 0, height: 5 }, elevation: 5 }, toast: { position: "absolute", bottom: 24, left: 24, right: 24, paddingVertical: 13, paddingHorizontal: 16, borderRadius: 14, alignItems: "center" }, toastText: { color: "#FFFFFF", fontSize: 13, fontWeight: "700" }, menu: { position: "absolute", zIndex: 5, right: 15, top: 70, width: 210, borderRadius: 14, borderWidth: 1, paddingVertical: 6, shadowColor: "#000", shadowOpacity: 0.12, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 6 }, menuItem: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 12 }, menuText: { fontSize: 13, fontWeight: "600" }, emptyCta: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 18, paddingVertical: 11, borderRadius: 14, marginTop: 14 }, emptyCtaText: { fontSize: 14, fontWeight: "800" }, emptyState: { alignItems: "center", paddingTop: 80, paddingHorizontal: 30 }, emptyTitle: { fontSize: 18, fontWeight: "800", marginTop: 12 }, emptyCopy: { fontSize: 13, marginTop: 5, textAlign: "center" }, chatHeader: { height: 60, flexDirection: "row", alignItems: "center", paddingHorizontal: 8, borderBottomWidth: StyleSheet.hairlineWidth }, backButton: { width: 32, height: 42, justifyContent: "center", alignItems: "center" }, chatTitleBlock: { flex: 1, paddingLeft: 8 }, chatTitle: { fontSize: 16.5, fontWeight: "600" }, chatSubtitle: { fontSize: 11, marginTop: 3, fontWeight: "600" }, messageList: { paddingHorizontal: 12, paddingBottom: 14, flexGrow: 1, justifyContent: "flex-end" }, encryptionNote: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "rgba(245, 158, 11, 0.10)", borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, marginBottom: 20 }, encryptionText: { fontSize: 10, fontWeight: "600" }, messageRow: { width: "100%", marginBottom: 5 }, messageRowMine: { alignItems: "flex-end" }, messageRowTheirs: { alignItems: "flex-start" }, bubble: { maxWidth: "82%", paddingHorizontal: 12, paddingTop: 9, paddingBottom: 6, borderRadius: 12 }, bubbleMine: { borderTopRightRadius: 3 }, bubbleTheirs: { borderTopLeftRadius: 3 }, messageText: { fontSize: 14.5, lineHeight: 20 }, messageMeta: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 4, marginTop: 3 }, messageActions: { flexDirection: "row", gap: 8, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 14, borderWidth: 1, marginTop: 4 }, actionText: { fontSize: 11, fontWeight: "800" }, replyBanner: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 12, marginBottom: 6 }, replyText: { flex: 1, fontSize: 12 }, viewOnce: { width: 25, height: 25, borderRadius: 13, alignItems: "center", justifyContent: "center", marginBottom: 10 }, viewOnceText: { fontSize: 13, fontWeight: "900" }, messageTime: { fontSize: 10 }, messageImage: { width: 190, height: 150, borderRadius: 12, marginBottom: 5 }, stickerImage: { width: 128, height: 128, marginBottom: 5 }, newActions: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingHorizontal: 16, paddingBottom: 10 }, newActionPill: { flexDirection: "row", alignItems: "center", gap: 6, borderWidth: 1, borderRadius: 18, paddingHorizontal: 12, paddingVertical: 7 }, newActionText: { fontSize: 12.5, fontWeight: "700" }, stickerGrid: { padding: 12, gap: 10 }, stickerRow: { gap: 10 }, stickerTile: { width: 68, height: 68, borderWidth: 1, borderRadius: 12, alignItems: "center", justifyContent: "center" }, stickerThumb: { width: 54, height: 54 }, mediaHeld: { width: 190, height: 74, borderRadius: 12, marginBottom: 5, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center", gap: 5 }, mediaHeldText: { fontSize: 11.5, fontWeight: "600" },
+  flex: { flex: 1 }, header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, paddingTop: 12, paddingBottom: 12 }, eyebrow: { fontSize: 11, fontWeight: "800", letterSpacing: 1.5, marginBottom: 5 }, heading: { fontSize: 22, lineHeight: 28, fontWeight: "800", letterSpacing: -0.4 }, headerActions: { flexDirection: "row", gap: 4 },   iconButton: { width: 38, height: 38, alignItems: "center", justifyContent: "center", borderRadius: 19 }, dimmed: { opacity: 0.4 }, pressed: { opacity: 0.55 }, searchWrap: { height: 48, borderRadius: 14, marginHorizontal: 16, paddingHorizontal: 14, flexDirection: "row", alignItems: "center", borderWidth: 1 }, searchWrapFocused: { shadowColor: "#00A884", shadowOpacity: 0.25, shadowRadius: 10, shadowOffset: { width: 0, height: 0 }, elevation: 3 }, searchClear: { width: 26, height: 26, borderRadius: 13, alignItems: "center", justifyContent: "center" }, searchInput: { flex: 1, marginLeft: 10, fontSize: 15.5, paddingVertical: 0, letterSpacing: 0.1, backgroundColor: "transparent" }, listHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingHorizontal: 22, paddingTop: 25, paddingBottom: 8 }, sectionLabel: { fontSize: 11, fontWeight: "800", letterSpacing: 1.2 }, countLabel: { fontSize: 12 }, chatList: { paddingBottom: 100 }, chatRow: { flexDirection: "row", paddingLeft: 16, minHeight: 74 }, rowPressed: { opacity: 0.68 }, avatarWrap: { width: 60, alignItems: "flex-start", paddingTop: 11 }, avatar: { alignItems: "center", justifyContent: "center" }, avatarText: { color: "#FFFFFF", fontWeight: "800", letterSpacing: 0.2 }, onlineDot: { width: 13, height: 13, borderRadius: 7, backgroundColor: "#25D366", borderWidth: 3, position: "absolute", bottom: 0, right: 5 }, chatCopy: { flex: 1, paddingRight: 16, paddingVertical: 13, borderBottomWidth: StyleSheet.hairlineWidth }, rowTop: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 }, chatName: { flex: 1, fontSize: 16.5, fontWeight: "600", letterSpacing: -0.1 }, chatTime: { fontSize: 11.5, fontWeight: "500" }, rowBottom: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: 4, gap: 8 }, previewLine: { flex: 1, flexDirection: "row", alignItems: "center" }, pin: { marginRight: 4, transform: [{ rotate: "35deg" }] }, chatPreview: { flex: 1, fontSize: 13.5, lineHeight: 18 }, unread: { minWidth: 21, height: 21, borderRadius: 11, alignItems: "center", justifyContent: "center", paddingHorizontal: 5 }, unreadText: { color: "#FFFFFF", fontSize: 11, fontWeight: "800" }, fab: { position: "absolute", right: 20, bottom: 20, width: 55, height: 55, borderRadius: 28, alignItems: "center", justifyContent: "center", shadowColor: "#000000", shadowOpacity: 0.18, shadowRadius: 10, shadowOffset: { width: 0, height: 5 }, elevation: 5 }, toast: { position: "absolute", bottom: 24, left: 24, right: 24, paddingVertical: 13, paddingHorizontal: 16, borderRadius: 14, alignItems: "center" }, toastText: { color: "#FFFFFF", fontSize: 13, fontWeight: "700" }, menu: { position: "absolute", zIndex: 5, right: 15, top: 70, width: 210, borderRadius: 14, borderWidth: 1, paddingVertical: 6, shadowColor: "#000", shadowOpacity: 0.12, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 6 }, menuItem: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 12 }, menuText: { fontSize: 13, fontWeight: "600" }, emptyCta: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 18, paddingVertical: 11, borderRadius: 14, marginTop: 14 }, emptyCtaText: { fontSize: 14, fontWeight: "800" }, emptyState: { alignItems: "center", paddingTop: 80, paddingHorizontal: 30 }, emptyTitle: { fontSize: 18, fontWeight: "800", marginTop: 12 }, emptyCopy: { fontSize: 13, marginTop: 5, textAlign: "center" }, chatHeader: { height: 60, flexDirection: "row", alignItems: "center", paddingHorizontal: 8, borderBottomWidth: StyleSheet.hairlineWidth }, backButton: { width: 32, height: 42, justifyContent: "center", alignItems: "center" }, chatTitleBlock: { flex: 1, paddingLeft: 8 }, chatTitle: { fontSize: 16.5, fontWeight: "600" }, chatSubtitle: { fontSize: 11, marginTop: 3, fontWeight: "600" }, messageList: { paddingHorizontal: 12, paddingBottom: 14, flexGrow: 1, justifyContent: "flex-end" }, encryptionNote: { alignSelf: "center", flexDirection: "row", alignItems: "center", gap: 5, backgroundColor: "rgba(245, 158, 11, 0.10)", borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, marginBottom: 20 }, encryptionText: { fontSize: 10, fontWeight: "600" }, messageRow: { width: "100%", marginBottom: 5 }, messageRowMine: { alignItems: "flex-end" }, messageRowTheirs: { alignItems: "flex-start" }, bubble: { maxWidth: "82%", paddingHorizontal: 12, paddingTop: 9, paddingBottom: 6, borderRadius: 12 }, bubbleMine: { borderTopRightRadius: 3 }, bubbleTheirs: { borderTopLeftRadius: 3 }, messageText: { fontSize: 14.5, lineHeight: 20 }, messageMeta: { flexDirection: "row", alignItems: "center", justifyContent: "flex-end", gap: 4, marginTop: 3 }, messageActions: { flexDirection: "row", gap: 8, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 14, borderWidth: 1, marginTop: 4 }, actionText: { fontSize: 11, fontWeight: "800" }, replyBanner: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 14, paddingVertical: 8, borderRadius: 12, marginBottom: 6 }, replyText: { flex: 1, fontSize: 12 }, viewOnce: { width: 25, height: 25, borderRadius: 13, alignItems: "center", justifyContent: "center", marginBottom: 10 }, viewOnceText: { fontSize: 13, fontWeight: "900" }, messageTime: { fontSize: 10 }, messageImage: { width: 190, height: 150, borderRadius: 12, marginBottom: 5 }, stickerImage: { width: 128, height: 128, marginBottom: 5 }, newActions: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingHorizontal: 16, paddingBottom: 10 }, newActionPill: { flexDirection: "row", alignItems: "center", gap: 6, borderWidth: 1, borderRadius: 18, paddingHorizontal: 12, paddingVertical: 7 }, newActionText: { fontSize: 12.5, fontWeight: "700" }, stickerGrid: { padding: 12, gap: 10 }, stickerRow: { gap: 10 }, stickerTile: { width: 68, height: 68, borderWidth: 1, borderRadius: 12, alignItems: "center", justifyContent: "center" }, stickerThumb: { width: 54, height: 54 }, mediaHeld: { width: 190, height: 74, borderRadius: 12, marginBottom: 5, borderWidth: StyleSheet.hairlineWidth, alignItems: "center", justifyContent: "center", gap: 5 }, mediaHeldText: { fontSize: 11.5, fontWeight: "600" },
   messageVideo: { width: 230, height: 152, borderRadius: 12, marginBottom: 5, backgroundColor: "#000" },
   fileTile: { flexDirection: "row", alignItems: "center", gap: 10, paddingVertical: 7, minWidth: 200, maxWidth: 262 },
   fileIcon: { width: 38, height: 38, borderRadius: 10, alignItems: "center", justifyContent: "center" },

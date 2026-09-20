@@ -5,6 +5,7 @@ import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useColors } from "@/hooks/use-colors";
 import * as Auth from "@/lib/_core/auth";
+import { clearQueryCache } from "@/lib/query-cache";
 import { trpc } from "@/lib/trpc";
 
 /** Turns the deadline the server promised into something readable, or null when it is unusable. */
@@ -60,6 +61,9 @@ export default function AccountStatusScreen() {
   const signOut = async () => {
     await Auth.removeSessionToken();
     await Auth.clearUserInfo();
+    // The offline cache holds this account's conversations in plain localStorage, so it leaves with
+    // the account rather than staying behind for whoever uses this browser next.
+    clearQueryCache();
     router.replace("/login");
   };
 

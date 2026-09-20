@@ -3,6 +3,7 @@ import type { Room as LiveKitRoom } from "livekit-client";
 
 import { useAuth } from "@/hooks/use-auth";
 import { setNativeCallActive } from "@/lib/native-call";
+import { isOnline, OFFLINE_CALL_MESSAGE } from "@/lib/offline";
 import { trpc } from "@/lib/trpc";
 
 /**
@@ -167,6 +168,14 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const startCall = useCallback(
     async ({ conversationId, kind, peerName }: { conversationId: string; kind: CallKind; peerName: string }) => {
       if (phaseRef.current !== "idle") return;
+      // Refused before the mutation is fired, not after. React Query pauses a mutation while offline
+      // rather than failing it, so `mutateAsync` below would never settle and the ring timer below it
+      // would never be armed - a call button that hangs with no explanation. The screens that offer
+      // the button say why; this is the backstop for a path that forgets to.
+      if (!isOnline()) {
+        setError(OFFLINE_CALL_MESSAGE);
+        return;
+      }
       setError(null);
       try {
         const started = await startMutation.mutateAsync({ conversationId, kind });
@@ -188,6 +197,12 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const joinLink = useCallback(
     async ({ room: roomName, token, url, peerName, kind }: { room: string; token: string; url: string; peerName: string; kind: CallKind }) => {
       if (phaseRef.current !== "idle") return;
+      // A link can be opened from anywhere, including a place with no signal, and joining a LiveKit
+      // room with no transport produces a call screen that sits at "Connecting…" indefinitely.
+      if (!isOnline()) {
+        setError(OFFLINE_CALL_MESSAGE);
+        return;
+      }
       setError(null);
       const next: CallSession = { callId: null, room: roomName, token, url, kind, peerName, conversationId: null, outgoing: true };
       sessionRef.current = next;
@@ -206,6 +221,12 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const accept = useCallback(async () => {
     const current = sessionRef.current;
     if (!current?.callId) return;
+    // Answering is a write like any other: without a connection the answer never reaches the caller,
+    // who keeps ringing while this side shows a call that is not connected to anything.
+    if (!isOnline()) {
+      setError(OFFLINE_CALL_MESSAGE);
+      return;
+    }
     setError(null);
     try {
       const answered = await answerMutation.mutateAsync({ callId: current.callId });

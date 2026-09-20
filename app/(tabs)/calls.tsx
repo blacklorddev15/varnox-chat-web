@@ -5,9 +5,11 @@ import { useFocusEffect, useRouter } from "expo-router";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 
 import { ScreenContainer } from "@/components/screen-container";
+import { OfflineBanner } from "@/components/offline-banner";
 import { useColors } from "@/hooks/use-colors";
 import { trpc } from "@/lib/trpc";
 import { useCall } from "@/lib/call-context";
+import { isOnline, OFFLINE_CALL_MESSAGE } from "@/lib/offline";
 import { shortTime } from "@/lib/media-url";
 
 function initialsOf(name: string) {
@@ -41,6 +43,9 @@ export default function CallsScreen() {
   useFocusEffect(useCallback(() => { void refetchHistory(); }, [refetchHistory]));
 
   const makeLink = async () => {
+    // A link is minted on the server, so it needs a connection. Pressing through would leave the
+    // button stuck on "Creating…" because the mutation pauses rather than fails while offline.
+    if (!isOnline()) { notify(OFFLINE_CALL_MESSAGE); return; }
     try {
       const created = await createLink.mutateAsync({ kind: "audio" });
       const base = Platform.OS === "web" && typeof window !== "undefined" ? window.location.origin : "";
@@ -82,6 +87,8 @@ export default function CallsScreen() {
         </Pressable>
       </View>
 
+      <OfflineBanner />
+
       <View style={[styles.callCard, { backgroundColor: colors.surface, borderColor: colors.border }]}>
         <View style={[styles.callCardIcon, { backgroundColor: "rgba(16,185,129,0.14)" }]}>
           <MaterialIcons name="link" size={23} color={colors.success} />
@@ -121,7 +128,7 @@ export default function CallsScreen() {
           const bad = item.status === "missed" || item.status === "declined";
           return (
             <Pressable
-              onPress={() => void startCall({ conversationId: item.conversationId, kind: item.kind === "video" ? "video" : "audio", peerName: name })}
+              onPress={() => { if (!isOnline()) { notify(OFFLINE_CALL_MESSAGE); return; } void startCall({ conversationId: item.conversationId, kind: item.kind === "video" ? "video" : "audio", peerName: name }); }}
               style={({ pressed }) => [styles.callRow, pressed && styles.pressed]}
             >
               <View style={[styles.avatar, { backgroundColor: colors.primary }]}>
