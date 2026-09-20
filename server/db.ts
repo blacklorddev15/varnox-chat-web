@@ -1680,10 +1680,29 @@ export async function findOrCreateDirectConversation(userId: number, otherUserId
   if (existing.length === 0) {
     await createConversation(conversationId, userId, undefined, [otherUserId]);
   } else {
+    // Repair path, and it runs on every tap rather than only on the first one. A conversation under
+    // a stable `direct-<a>-<b>` id is a 1:1 by construction, so both people belong in it and it is
+    // not a group. Either of those can be wrong on a row that predates this code or was created
+    // through a path that missed the second member - which is precisely how somebody ends up typing
+    // into a chat that nobody else can see. Re-adding is idempotent, so this costs one upsert each.
     await addConversationMember(conversationId, userId);
     await addConversationMember(conversationId, otherUserId);
+    await setConversationKind(conversationId, "direct");
   }
   return { conversationId, created: true };
+}
+
+/**
+ * Forces a conversation's kind.
+ *
+ * Used only to correct a row that is wrong by construction - a 1:1 stored as a group. There is no
+ * user-facing way to change a conversation between the two: turning a group into a 1:1 would have to
+ * decide what happens to the other members, and that is a decision nobody asked this app to make.
+ */
+export async function setConversationKind(conversationId: string, kind: "direct" | "group") {
+  const db = await getDb();
+  if (!db) return;
+  await db.update(conversations).set({ kind }).where(eq(conversations.id, conversationId));
 }
 
 export async function addConversationMember(conversationId: string, userId: number) {

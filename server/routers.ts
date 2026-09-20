@@ -159,15 +159,47 @@ export const appRouter = router({
     // ---- groups: the creator owns the group, and only the owner manages admins ----------
     createGroup: protectedProcedure.input(z.object({ title: z.string().trim().min(1).max(80), memberIds: z.array(z.number().int().positive()).max(256).default([]) })).mutation(async ({ ctx, input }) => {
       // Being added to a new group by a stranger is the complaint people change first, so the same
-      // setting that guards `addMembers` guards creation. The group is still created: the caller
-      // becomes its owner, and simply nobody else joins without agreeing to.
+      // setting that guards `addMembers` guards creation.
+      //
+      // What is different here is that there is nothing to add people to yet. This used to create the
+      // group regardless and simply leave out everybody who refused - which produced a group with one
+      // member that looked, from the creator's side, exactly like a normal chat. They wrote into it,
+      // the messages sent fine because they were a member, and nobody else ever received any of them.
+      // The old comment called that "nobody else joins without agreeing to", which was true and beside
+      // the point: the person doing it was never told.
+      //
+      // So the two cases are now handled separately. Somebody picked and nobody accepted is a failure,
+      // not a group. Somebody picked and some accepted creates the group but reports who was left out,
+      // because a group that quietly has three members instead of five is the same bug in miniature.
       const permittedIds: number[] = [];
+      const refusedIds: number[] = [];
       for (const userId of input.memberIds) {
         if (await canAddToGroup(ctx.user.id, userId)) permittedIds.push(userId);
+        else refusedIds.push(userId);
       }
+
+      const describe = async (userIds: number[]) => {
+        const users = await Promise.all(userIds.map((userId) => getUserById(userId)));
+        return users.map((user) => user?.name?.trim() || user?.username || "That account");
+      };
+
+      if (permittedIds.length === 0 && refusedIds.length > 0) {
+        const names = await describe(refusedIds);
+        // The wording points at the path that does work. A direct chat is not gated by this setting,
+        // so "open a chat instead" is a way forward rather than a brush-off.
+        throw new Error(
+          refusedIds.length > 1
+            ? "None of those people can be added to a group right now: their privacy settings only allow it from someone they already chat with. Open a direct chat with each of them instead."
+            : `${names[0]} can only be added to groups by someone they already chat with. Open a direct chat with them instead - that works regardless of this setting.`,
+        );
+      }
+
       const conversationId = await createGroupConversation(ctx.user.id, input.title, permittedIds);
       for (const userId of permittedIds) void logGroupEvent(conversationId, ctx.user.id, "member-add", userId);
-      return { conversationId };
+      // Whoever could not be added is reported rather than dropped in silence. A group that quietly
+      // has three members instead of five is the same bug this branch exists to fix, in miniature.
+      const skippedNames = await describe(refusedIds);
+      return { conversationId, skipped: refusedIds.map((id, index) => ({ id, name: skippedNames[index] })) };
     }),
     members: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(async ({ ctx, input }) => {
       const role = await getConversationRole(input.conversationId, ctx.user.id);
