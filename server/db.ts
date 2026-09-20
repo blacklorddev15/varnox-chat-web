@@ -1,7 +1,7 @@
-import { and, desc, eq, gt, ilike, inArray, isNull, like, lt, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, ilike, inArray, isNotNull, isNull, like, lt, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import { appeals, authTokens, blockedContacts, broadcastLists, broadcastRecipients, calls, channelFollowers, channelPosts, channels, communities, communityGroups, conversationMembers, conversations, InsertUser, inviteLinks, joinRequests, messageHides, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, sessions, statusUpdates, statusViews, stickers, userAvatars, userSettings, users } from "../drizzle/schema";
+import { appeals, authTokens, blockedContacts, broadcastLists, broadcastRecipients, calls, channelFollowers, channelPosts, channels, communities, communityGroups, conversationMembers, conversations, InsertUser, inviteLinks, joinRequests, linkPreviews, messageHides, messageKeeps, messageMedia, messageReactions, messageStars, messages, pollVotes, presence, pushTokens, reports, sessions, statusUpdates, statusViews, stickers, userAvatars, userSettings, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: ReturnType<typeof drizzle> | null = null;
@@ -173,6 +173,112 @@ export async function getMessageMedia(id: number) {
   if (!db) return undefined;
   const rows = await db.select().from(messageMedia).where(eq(messageMedia.id, id)).limit(1);
   return rows[0];
+}
+
+/**
+ * How much stored media a reader's chats account for, broken down per conversation.
+ *
+ * "Bytes" here is derived from the length of the stored base64 text rather than measured on disk,
+ * because attachments live in a text column: the real figure would mean decoding every row. Base64
+ * inflates by about a third, so the stored length is scaled back down - it stays an estimate, and
+ * `approximate: true` on the result says so rather than letting the screen imply precision.
+ *
+ * The sizes are read with `length(data)` in SQL, so the base64 itself is never pulled into memory -
+ * a chat full of photos would otherwise be tens of megabytes per request.
+ */
+const BASE64_TO_BYTES = 3 / 4;
+/** `/api/media/<id>` is the only shape the app writes, but parsing defensively costs nothing. */
+function mediaIdFromUrl(url: string | null): number | null {
+  if (!url) return null;
+  const match = /\/api\/media\/(\d+)/.exec(url);
+  return match ? Number(match[1]) : null;
+}
+
+export async function storageUsageForUser(userId: number) {
+  const db = await getDb();
+  const empty = {
+    approximate: true as const,
+    mediaBytes: 0,
+    mediaCount: 0,
+    messageCount: 0,
+    stickerBytes: 0,
+    stickerCount: 0,
+    avatarBytes: 0,
+    conversations: [] as Array<{ conversationId: string; title: string; bytes: number; count: number }>,
+  };
+  if (!db) return empty;
+
+  const memberships = await db
+    .select({ conversationId: conversationMembers.conversationId, title: conversations.title, kind: conversations.kind })
+    .from(conversationMembers)
+    .leftJoin(conversations, eq(conversations.id, conversationMembers.conversationId))
+    .where(eq(conversationMembers.userId, userId));
+  if (memberships.length === 0) return empty;
+
+  const conversationIds = memberships.map((row) => row.conversationId);
+
+  const withMedia = await db
+    .select({ conversationId: messages.conversationId, mediaUrl: messages.mediaUrl })
+    .from(messages)
+    .where(and(inArray(messages.conversationId, conversationIds), isNotNull(messages.mediaUrl), isNull(messages.deletedAt)));
+
+  // Which media rows belong to which chat. One media row can back at most one message, so the map is
+  // a plain reverse index rather than a list.
+  const ownerOf = new Map<number, string>();
+  for (const row of withMedia) {
+    const id = mediaIdFromUrl(row.mediaUrl);
+    if (id === null) continue;
+    ownerOf.set(id, row.conversationId);
+  }
+
+  const sizes = ownerOf.size
+    ? await db
+        .select({ id: messageMedia.id, stored: sql<number>`length(${messageMedia.data})` })
+        .from(messageMedia)
+        .where(inArray(messageMedia.id, [...ownerOf.keys()]))
+    : [];
+
+  const perConversation = new Map<string, { bytes: number; count: number }>();
+  let mediaBytes = 0;
+  for (const row of sizes) {
+    const conversationId = ownerOf.get(row.id);
+    if (!conversationId) continue;
+    const bytes = Math.round(Number(row.stored ?? 0) * BASE64_TO_BYTES);
+    mediaBytes += bytes;
+    const entry = perConversation.get(conversationId) ?? { bytes: 0, count: 0 };
+    entry.bytes += bytes;
+    entry.count += 1;
+    perConversation.set(conversationId, entry);
+  }
+
+  // Stickers and a profile photo are also stored as text, and are worth showing for completeness:
+  // they are the other two things a person can put in the database.
+  const stickerRows = await db.select({ stored: sql<number>`coalesce(sum(length(${stickers.data})), 0)`, count: sql<number>`count(*)` }).from(stickers).where(eq(stickers.userId, userId));
+  const avatarRows = await db.select({ stored: sql<number>`coalesce(sum(length(${userAvatars.data})), 0)` }).from(userAvatars).where(eq(userAvatars.userId, userId));
+
+  return {
+    approximate: true as const,
+    mediaBytes,
+    mediaCount: ownerOf.size,
+    messageCount: withMedia.length,
+    stickerBytes: Math.round(Number(stickerRows[0]?.stored ?? 0) * BASE64_TO_BYTES),
+    stickerCount: Number(stickerRows[0]?.count ?? 0),
+    avatarBytes: Math.round(Number(avatarRows[0]?.stored ?? 0) * BASE64_TO_BYTES),
+    conversations: memberships
+      .map((row) => {
+        const entry = perConversation.get(row.conversationId);
+        return {
+          conversationId: row.conversationId,
+          // A direct chat has no stored title; the client already knows the other person's name and
+          // is better placed to label it, so an empty title is left for it to fill in.
+          title: row.title ?? "",
+          bytes: entry?.bytes ?? 0,
+          count: entry?.count ?? 0,
+        };
+      })
+      .filter((row) => row.count > 0)
+      .sort((a, b) => b.bytes - a.bytes),
+  };
 }
 
 /** Searches message text inside the conversations the user is a member of. */
@@ -718,6 +824,8 @@ export async function listMessages(conversationId: string, userId: number, since
   const hiddenIds = new Set(hidden.map((row) => row.messageId));
   const stars = await db.select({ messageId: messageStars.messageId }).from(messageStars).where(and(eq(messageStars.userId, userId), inArray(messageStars.messageId, ids)));
   const starredIds = new Set(stars.map((row) => row.messageId));
+  // Messages this reader asked to keep. They survive the disappearing timer below.
+  const keptIds = await keptMessageIds(userId, ids);
 
   const reactionRows = await db
     .select({ messageId: messageReactions.messageId, userId: messageReactions.userId, emoji: messageReactions.emoji, name: users.name, username: users.username })
@@ -777,7 +885,8 @@ export async function listMessages(conversationId: string, userId: number, since
   const allDeliveredAt = deliveredOthers.length > 0 ? new Date(Math.min(...deliveredOthers.map((other) => other.lastDeliveredAt!.getTime()))) : null;
 
   return rows
-    .filter((row) => !hiddenIds.has(row.id) && (!row.expiresAt || row.expiresAt.getTime() > nowMs))
+    // A kept message outlives its timer for this reader only; everyone else's copy still expires.
+    .filter((row) => !hiddenIds.has(row.id) && (!row.expiresAt || row.expiresAt.getTime() > nowMs || keptIds.has(row.id)))
     .map((row) => {
       const quote = row.replyToId ? quotedById.get(row.replyToId) ?? null : null;
       const mine = row.senderId === userId;
@@ -785,6 +894,7 @@ export async function listMessages(conversationId: string, userId: number, since
       return {
         ...row,
         starred: starredIds.has(row.id),
+        kept: keptIds.has(row.id),
         reactions: reactionsByMessage.get(row.id) ?? [],
         votes: votesByMessage.get(row.id) ?? [],
         replyTo: quote
@@ -994,6 +1104,143 @@ export async function reviewAppeal(id: number, reviewerId: number, status: "appr
   await db.update(appeals).set({ status, reviewedBy: reviewerId, reviewNote: note }).where(eq(appeals.id, id));
   if (status === "approved") await db.update(users).set({ moderationStatus: "active", suspendedUntil: null, moderationReason: null }).where(eq(users.id, appeal.userId));
   return appeal;
+}
+
+// ---------------------------------------------------------------- abuse reports
+/** The categories a report can carry. Kept as a closed set so the moderator queue can be grouped. */
+export const REPORT_CATEGORIES = ["spam", "abuse", "scam", "impersonation", "other"] as const;
+export type ReportCategory = (typeof REPORT_CATEGORIES)[number];
+
+/**
+ * Files a report.
+ *
+ * The excerpt is copied at this moment rather than read later: the message can be edited or deleted
+ * after the report lands, and a moderator who cannot see what was reported has nothing to judge.
+ * A report that names no target and no message is refused, since there would be nothing to act on.
+ */
+export async function submitReport(input: {
+  reporterId: number;
+  targetUserId?: number | null;
+  conversationId?: string | null;
+  messageId?: string | null;
+  category: ReportCategory;
+  note?: string | null;
+}) {
+  const db = await getDb();
+  if (!db) throw new Error("Reports are not available");
+
+  let excerpt: string | null = null;
+  let targetUserId = input.targetUserId ?? null;
+
+  if (input.messageId) {
+    const message = await getMessageById(input.messageId);
+    if (!message) throw new Error("That message no longer exists");
+    // The reporter must be able to see the message they are reporting.
+    if (!(await isConversationMember(message.conversationId, input.reporterId))) throw new Error("That message is not in a chat you are in");
+    // Fall back to the authored kind when there is no text, so the queue shows something useful.
+    excerpt = message.body ?? message.mediaName ?? `[${message.kind}]`;
+    targetUserId = targetUserId ?? message.senderId;
+  }
+
+  if (!targetUserId && !input.conversationId) throw new Error("Nothing was reported");
+
+  const rows = await db
+    .insert(reports)
+    .values({
+      reporterId: input.reporterId,
+      targetUserId,
+      conversationId: input.conversationId ?? null,
+      messageId: input.messageId ?? null,
+      category: input.category,
+      note: input.note?.trim() || null,
+      excerpt,
+    })
+    .returning({ id: reports.id });
+
+  return { id: rows[0]?.id ?? null };
+}
+
+/** The moderator queue, newest first, with enough identity to act on. */
+export async function listReportsForAdmin(limit = 200) {
+  const db = await getDb();
+  if (!db) return [];
+  return db
+    .select({
+      id: reports.id,
+      category: reports.category,
+      note: reports.note,
+      excerpt: reports.excerpt,
+      status: reports.status,
+      conversationId: reports.conversationId,
+      messageId: reports.messageId,
+      createdAt: reports.createdAt,
+      reviewedAt: reports.updatedAt,
+      reporterId: reports.reporterId,
+      targetUserId: reports.targetUserId,
+      reviewNote: reports.reviewNote,
+      reporterName: users.name,
+      reporterUsername: users.username,
+    })
+    .from(reports)
+    .leftJoin(users, eq(users.id, reports.reporterId))
+    .orderBy(desc(reports.createdAt))
+    .limit(limit);
+}
+
+/**
+ * Records a moderator's decision.
+ *
+ * Deciding is what the report asks for, so `status` moves to closed or actioned and the record
+ * remembers who decided. The report row itself is the decision log - there is no second table that
+ * could disagree with it.
+ */
+export async function reviewReport(id: number, reviewerId: number, status: "closed" | "actioned", note: string | null) {
+  const db = await getDb();
+  if (!db) throw new Error("Reports are not available");
+  const rows = await db.select().from(reports).where(eq(reports.id, id)).limit(1);
+  const report = rows[0];
+  if (!report) throw new Error("Report not found");
+  await db.update(reports).set({ status, reviewedBy: reviewerId, reviewNote: note, updatedAt: new Date() }).where(eq(reports.id, id));
+  return report;
+}
+
+// ---------------------------------------------------------------- link previews
+/**
+ * A cached preview for a URL, or null when it has never been fetched.
+ *
+ * A row with `failedAt` set is a cached miss: it is returned so the caller can decide not to retry,
+ * rather than being treated as absent and fetched again on every render.
+ */
+export async function getLinkPreview(url: string) {
+  const db = await getDb();
+  if (!db) return null;
+  const rows = await db.select().from(linkPreviews).where(eq(linkPreviews.url, url)).limit(1);
+  return rows[0] ?? null;
+}
+
+/** Stores a fetched preview, or a miss when `preview` is null. */
+export async function saveLinkPreview(
+  url: string,
+  preview: { title?: string | null; description?: string | null; siteName?: string | null; imageUrl?: string | null } | null,
+) {
+  const db = await getDb();
+  if (!db) return;
+  const values = preview
+    ? {
+        url,
+        title: preview.title ?? null,
+        description: preview.description ?? null,
+        siteName: preview.siteName ?? null,
+        imageUrl: preview.imageUrl ?? null,
+        fetchedAt: new Date(),
+        failedAt: null,
+      }
+    : { url, title: null, description: null, siteName: null, imageUrl: null, fetchedAt: null, failedAt: new Date() };
+
+  await db
+    .insert(linkPreviews)
+    .values(values)
+    .onConflictDoUpdate({ target: linkPreviews.url, set: values });
 }
 
 export async function createAuthToken(userId: number, kind: string, tokenHash: string, expiresAt: Date) {
@@ -1409,12 +1656,14 @@ export async function deleteMessageForEveryone(messageId: string, userId: number
   if (!db) return false;
   const rows = await db
     .update(messages)
-    .set({ deletedAt: new Date(), body: null, mediaUrl: null, mediaName: null, mediaMime: null, voiceDurationMs: null })
+    // The pin goes with the body: a banner pointing at a tombstone helps nobody.
+    .set({ deletedAt: new Date(), body: null, mediaUrl: null, mediaName: null, mediaMime: null, voiceDurationMs: null, pinnedAt: null, pinnedBy: null })
     .where(and(eq(messages.id, messageId), eq(messages.senderId, userId), isNull(messages.deletedAt)))
     .returning({ id: messages.id });
   if (rows.length === 0) return false;
-  // Reactions attached to a tombstone are noise.
+  // Reactions and keeps attached to a tombstone are noise.
   await db.delete(messageReactions).where(eq(messageReactions.messageId, messageId));
+  await db.delete(messageKeeps).where(eq(messageKeeps.messageId, messageId));
   return true;
 }
 
@@ -1423,6 +1672,132 @@ export async function hideMessageForUser(messageId: string, userId: number) {
   const db = await getDb();
   if (!db) return;
   await db.insert(messageHides).values({ messageId, userId }).onConflictDoNothing();
+}
+
+/** How many messages a conversation may pin at once, matching the apps this follows. */
+export const MAX_PINNED_MESSAGES = 3;
+
+export type PinResult = { ok: true } | { ok: false; reason: "not-found" | "limit" };
+
+/**
+ * Pins or unpins a message for the whole conversation.
+ *
+ * A pin is shared, so any member may set one - but the cap is checked here rather than in the UI, so
+ * a second client cannot sidestep it. Pinning something already pinned is a no-op that leaves the
+ * timestamp alone; otherwise a second person agreeing would reshuffle the banner under everyone.
+ */
+export async function setMessagePinned(messageId: string, userId: number, pinned: boolean): Promise<PinResult> {
+  const db = await getDb();
+  if (!db) return { ok: false, reason: "not-found" };
+
+  const message = await getMessageById(messageId);
+  // A tombstone, or a message the caller cannot see, is reported the same way: nothing to pin.
+  if (!message || message.deletedAt) return { ok: false, reason: "not-found" };
+  if (!(await isConversationMember(message.conversationId, userId))) return { ok: false, reason: "not-found" };
+
+  if (!pinned) {
+    await db.update(messages).set({ pinnedAt: null, pinnedBy: null }).where(eq(messages.id, messageId));
+    return { ok: true };
+  }
+
+  if (message.pinnedAt) return { ok: true };
+
+  const existing = await db
+    .select({ id: messages.id })
+    .from(messages)
+    .where(and(eq(messages.conversationId, message.conversationId), isNotNull(messages.pinnedAt), isNull(messages.deletedAt)));
+  if (existing.length >= MAX_PINNED_MESSAGES) return { ok: false, reason: "limit" };
+
+  await db.update(messages).set({ pinnedAt: new Date(), pinnedBy: userId }).where(eq(messages.id, messageId));
+  return { ok: true };
+}
+
+/**
+ * The pins one reader can see in a conversation.
+ *
+ * Deleted and expired messages are left out, and so are messages this reader has hidden. The banner
+ * must never offer to jump to something that is no longer there.
+ */
+export async function listPinnedMessages(conversationId: string, userId: number) {
+  const db = await getDb();
+  if (!db || !(await isConversationMember(conversationId, userId))) return [];
+
+  const now = new Date();
+  const rows = await db
+    .select({
+      id: messages.id,
+      body: messages.body,
+      kind: messages.kind,
+      mediaName: messages.mediaName,
+      senderId: messages.senderId,
+      pinnedAt: messages.pinnedAt,
+      name: users.name,
+      username: users.username,
+    })
+    .from(messages)
+    .leftJoin(users, eq(users.id, messages.senderId))
+    .where(
+      and(
+        eq(messages.conversationId, conversationId),
+        isNotNull(messages.pinnedAt),
+        isNull(messages.deletedAt),
+        or(isNull(messages.expiresAt), gt(messages.expiresAt, now)),
+      ),
+    )
+    .orderBy(desc(messages.pinnedAt))
+    .limit(MAX_PINNED_MESSAGES);
+  if (rows.length === 0) return [];
+
+  const hidden = await db
+    .select({ messageId: messageHides.messageId })
+    .from(messageHides)
+    .where(and(eq(messageHides.userId, userId), inArray(messageHides.messageId, rows.map((row) => row.id))));
+  const hiddenIds = new Set(hidden.map((row) => row.messageId));
+
+  return rows
+    .filter((row) => !hiddenIds.has(row.id))
+    .map((row) => ({
+      id: row.id,
+      body: row.body,
+      kind: row.kind,
+      mediaName: row.mediaName,
+      senderId: row.senderId,
+      senderName: row.name ?? row.username ?? "Someone",
+    }));
+}
+
+/**
+ * "Keep in chat": a reader asks that a disappearing message stay for them.
+ *
+ * The keep is personal. Keeping is idempotent, and keeping something that was never on a timer is
+ * harmless - it simply records the intent.
+ */
+export async function setMessageKept(messageId: string, userId: number, kept: boolean) {
+  const db = await getDb();
+  if (!db) return false;
+
+  const message = await getMessageById(messageId);
+  if (!message || message.deletedAt) return false;
+  if (!(await isConversationMember(message.conversationId, userId))) return false;
+
+  if (kept) {
+    await db.insert(messageKeeps).values({ messageId, userId }).onConflictDoNothing();
+    return true;
+  }
+
+  await db.delete(messageKeeps).where(and(eq(messageKeeps.messageId, messageId), eq(messageKeeps.userId, userId)));
+  return true;
+}
+
+/** Which of these messages the reader has kept, so the thread can mark them. */
+export async function keptMessageIds(userId: number, messageIds: string[]) {
+  const db = await getDb();
+  if (!db || messageIds.length === 0) return new Set<string>();
+  const rows = await db
+    .select({ messageId: messageKeeps.messageId })
+    .from(messageKeeps)
+    .where(and(eq(messageKeeps.userId, userId), inArray(messageKeeps.messageId, messageIds)));
+  return new Set(rows.map((row) => row.messageId));
 }
 
 /**

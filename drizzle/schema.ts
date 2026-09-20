@@ -34,7 +34,9 @@ export const joinRequests = pgTable("joinRequests", { conversationId: varchar("c
 // Per-person state for a chat lives here rather than in shared columns: archiving, muting,
 // pinning and drafts are personal, and one member's choices must not rewrite everyone's row.
 export const conversationMembers = pgTable("conversationMembers", { conversationId: varchar("conversationId", { length: 64 }).notNull(), userId: integer("userId").notNull(), joinedAt: timestamp("joinedAt").defaultNow().notNull(), lastReadAt: timestamp("lastReadAt"), lastDeliveredAt: timestamp("lastDeliveredAt"), role: varchar("role", { length: 16 }).default("member").notNull(), archived: integer("archived").default(0).notNull(), muted: integer("muted").default(0).notNull(), pinned: integer("pinned").default(0).notNull(), draft: text("draft"), mediaAutoLoad: integer("mediaAutoLoad").default(1).notNull() }, (table) => ({ pk: primaryKey({ columns: [table.conversationId, table.userId] }) }));
-export const messages = pgTable("messages", { id: varchar("id", { length: 64 }).primaryKey(), conversationId: varchar("conversationId", { length: 64 }).notNull(), senderId: integer("senderId").notNull(), body: text("body"), kind: messageKindEnum("kind").default("text").notNull(), mediaUrl: text("mediaUrl"), mediaMime: varchar("mediaMime", { length: 160 }), mediaName: varchar("mediaName", { length: 255 }), voiceDurationMs: integer("voiceDurationMs"), replyToId: varchar("replyToId", { length: 64 }), forwardedFromId: varchar("forwardedFromId", { length: 64 }), viewOnce: integer("viewOnce").default(0).notNull(), editedAt: timestamp("editedAt"), deletedAt: timestamp("deletedAt"), expiresAt: timestamp("expiresAt"), meta: jsonb("meta").$type<MessageMeta>(), createdAt: timestamp("createdAt").defaultNow().notNull() });
+export const messages = pgTable("messages", { id: varchar("id", { length: 64 }).primaryKey(), conversationId: varchar("conversationId", { length: 64 }).notNull(), senderId: integer("senderId").notNull(), body: text("body"), kind: messageKindEnum("kind").default("text").notNull(), mediaUrl: text("mediaUrl"), mediaMime: varchar("mediaMime", { length: 160 }), mediaName: varchar("mediaName", { length: 255 }), voiceDurationMs: integer("voiceDurationMs"), replyToId: varchar("replyToId", { length: 64 }), forwardedFromId: varchar("forwardedFromId", { length: 64 }), viewOnce: integer("viewOnce").default(0).notNull(), editedAt: timestamp("editedAt"), deletedAt: timestamp("deletedAt"), expiresAt: timestamp("expiresAt"), meta: jsonb("meta").$type<MessageMeta>(), createdAt: timestamp("createdAt").defaultNow().notNull(), // A pin belongs to the conversation, not to the person who set it: everyone sees the same banner.
+  // Whoever pinned it last is recorded so the sheet can say who did, and unpinning clears both.
+  pinnedAt: timestamp("pinnedAt"), pinnedBy: integer("pinnedBy") });
 export const pushTokens = pgTable("pushTokens", { id: serial("id").primaryKey(), userId: integer("userId").notNull(), token: varchar("token", { length: 512 }).notNull().unique(), platform: varchar("platform", { length: 32 }), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 // ---------------------------------------------------------------- group invites
 // The table already exists in the database from an earlier build; it was dropped from this schema at
@@ -50,6 +52,13 @@ export const messageReactions = pgTable("messageReactions", { messageId: varchar
 export const messageStars = pgTable("messageStars", { messageId: varchar("messageId", { length: 64 }).notNull(), userId: integer("userId").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.messageId, table.userId] }) }));
 // "Delete for me": the message row survives for everybody else, it is only hidden from one reader.
 export const messageHides = pgTable("messageHides", { messageId: varchar("messageId", { length: 64 }).notNull(), userId: integer("userId").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.messageId, table.userId] }) }));
+// "Keep in chat": a disappearing message one reader has asked to keep.
+//
+// Per-person, because two people in the same chat can disagree about whether to keep something, and
+// the sender's timer must not be able to delete a copy the recipient was promised. The expiry check
+// consults this table, so a kept row survives for that reader only - everybody else's timer still
+// runs out on schedule.
+export const messageKeeps = pgTable("messageKeeps", { messageId: varchar("messageId", { length: 64 }).notNull(), userId: integer("userId").notNull(), createdAt: timestamp("createdAt").defaultNow().notNull() }, (table) => ({ pk: primaryKey({ columns: [table.messageId, table.userId] }) }));
 // One vote per person per poll, replaced when they change their answer. `optionIndex` is kept
 // rather than a foreign key to an option row, because the options are part of the message and never
 // change after it is sent - editing a poll is not supported, and a stale index simply lands out of
@@ -72,6 +81,22 @@ export const blockedContacts = pgTable("blockedContacts", { userId: integer("use
 // back only when someone actually approves the review.
 export const appeals = pgTable("appeals", { id: serial("id").primaryKey(), userId: integer("userId").notNull(), reason: text("reason").notNull(), status: varchar("status", { length: 16 }).default("pending").notNull(), reviewedBy: integer("reviewedBy"), reviewNote: text("reviewNote"), reviewDueAt: timestamp("reviewDueAt"), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
 export const authTokens = pgTable("authTokens", { id: serial("id").primaryKey(), userId: integer("userId").notNull(), kind: varchar("kind", { length: 32 }).notNull(), tokenHash: varchar("tokenHash", { length: 128 }).notNull().unique(), expiresAt: timestamp("expiresAt").notNull(), usedAt: timestamp("usedAt"), createdAt: timestamp("createdAt").defaultNow().notNull() });
+
+// ---------------------------------------------------------------- abuse reports
+// A report is filed by a user and decided by a moderator, which is why `status` and `reviewedBy`
+// sit on the same row as the complaint: the queue and the decision are one record, so nothing can
+// be adjudicated twice or forgotten between two tables.
+//
+// `excerpt` is a copy of what was reported. The message itself can be edited or deleted after the
+// report lands, and a moderator who cannot see the original has nothing to judge. A target is
+// optional because a report can be about an account with no single message behind it.
+export const reports = pgTable("reports", { id: serial("id").primaryKey(), reporterId: integer("reporterId").notNull(), targetUserId: integer("targetUserId"), conversationId: varchar("conversationId", { length: 64 }), messageId: varchar("messageId", { length: 64 }), category: varchar("category", { length: 32 }).notNull(), note: text("note"), excerpt: text("excerpt"), status: varchar("status", { length: 16 }).default("open").notNull(), reviewedBy: integer("reviewedBy"), reviewNote: text("reviewNote"), createdAt: timestamp("createdAt").defaultNow().notNull(), updatedAt: timestamp("updatedAt").defaultNow().notNull() });
+
+// ---------------------------------------------------------------- link previews
+// One row per URL, shared by every message that contains it, so a link pasted into fifty chats is
+// fetched once. `failedAt` caches a dead link: without it, a URL that 404s would be refetched on
+// every render of every message that mentions it.
+export const linkPreviews = pgTable("linkPreviews", { url: varchar("url", { length: 1024 }).primaryKey(), title: varchar("title", { length: 300 }), description: text("description"), siteName: varchar("siteName", { length: 120 }), imageUrl: varchar("imageUrl", { length: 1024 }), fetchedAt: timestamp("fetchedAt"), failedAt: timestamp("failedAt") });
 
 // ---------------------------------------------------------------- signed-in devices
 // One row per issued session, so a person can see where their account is signed in and end any of it.

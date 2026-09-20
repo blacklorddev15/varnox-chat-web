@@ -24,6 +24,10 @@ import {
   unlinkCommunityGroup,
 } from "./db";
 import { getConversationSummary, leaveGroup, listConversationMemberIds, listConversationPeerIds, readPresenceForUsers, readPresenceInbox, recordPresence } from "./db";
+// Pins, keeps, abuse reports and the link-preview cache. Grouped on their own lines for the same
+// reason as the two blocks above: the main list is already long enough to be hard to scan.
+import { MAX_PINNED_MESSAGES, REPORT_CATEGORIES, getLinkPreview, listPinnedMessages, listReportsForAdmin, reviewReport, saveLinkPreview, setMessageKept, setMessagePinned, storageUsageForUser, submitReport } from "./db";
+import { fetchLinkPreview } from "./linkPreview";
 // Server-Sent Events nudge channel; see nudgeConversation below.
 import { isRealtimeEnabled, publishToUsers } from "./realtime";
 
@@ -269,6 +273,8 @@ export const appRouter = router({
     }),
 
     /** What this chat's settings screen needs: the chat's own values plus the defaults behind them. */
+    // The pins everyone in the conversation sees, newest first.
+    pinned: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(({ ctx, input }) => listPinnedMessages(input.conversationId, ctx.user.id)),
     chatSettings: protectedProcedure.input(z.object({ conversationId: z.string().min(1) })).query(async ({ ctx, input }) => {
       const settings = await chatSettingsFor(input.conversationId, ctx.user.id);
       if (!settings) throw new Error("You are not a member of this conversation");
@@ -343,6 +349,27 @@ export const appRouter = router({
       return { ok: true as const, starred: input.starred };
     }),
     starred: protectedProcedure.query(({ ctx }) => listStarredMessages(ctx.user.id)),
+    // Pinning is shared with the conversation, so unlike star it tells everyone else to refetch.
+    pin: protectedProcedure.input(z.object({ messageId: z.string().min(1), pinned: z.boolean() })).mutation(async ({ ctx, input }) => {
+      const message = await requireVisibleMessage(input.messageId, ctx.user.id);
+      const result = await setMessagePinned(message.id, ctx.user.id, input.pinned);
+      if (!result.ok) {
+        throw new Error(
+          result.reason === "limit"
+            ? `A chat can keep ${MAX_PINNED_MESSAGES} pinned messages. Unpin one first.`
+            : "That message can no longer be pinned",
+        );
+      }
+      void nudgeConversation(message.conversationId, ctx.user.id, "message-updated");
+      return { ok: true as const, pinned: input.pinned };
+    }),
+    // "Keep in chat" is personal, so nothing is broadcast to the other members.
+    keep: protectedProcedure.input(z.object({ messageId: z.string().min(1), kept: z.boolean() })).mutation(async ({ ctx, input }) => {
+      const message = await requireVisibleMessage(input.messageId, ctx.user.id);
+      const ok = await setMessageKept(message.id, ctx.user.id, input.kept);
+      if (!ok) throw new Error("That message can no longer be kept");
+      return { ok: true as const, kept: input.kept };
+    }),
     editMessage: protectedProcedure.input(z.object({ messageId: z.string().min(1), body: z.string().trim().min(1).max(10000) })).mutation(async ({ ctx, input }) => {
       const message = await requireVisibleMessage(input.messageId, ctx.user.id);
       if (message.senderId !== ctx.user.id) throw new Error("You can only edit your own messages");
@@ -459,6 +486,58 @@ export const appRouter = router({
   }),
   push: router({
     register: protectedProcedure.input(z.object({ token: z.string().min(1).max(512), platform: z.string().max(32).optional() })).mutation(({ ctx, input }) => registerPushToken(ctx.user.id, input.token, input.platform)),
+  }),
+  // ---- link previews: fetched by the server, cached per URL ---------------------------------
+  // Only public addresses are fetched - see server/linkPreview.ts for the guard, and why it exists.
+  // The result is cached because the same link is usually pasted into several chats, and a miss is
+  // cached too, so a dead URL is not refetched on every render of every message that mentions it.
+  links: router({
+    preview: protectedProcedure.input(z.object({ url: z.string().trim().min(1).max(1024) })).query(async ({ input }) => {
+      const cached = await getLinkPreview(input.url);
+      if (cached) {
+        // A cached miss: there is nothing to show and nothing worth retrying for now.
+        if (cached.failedAt && !cached.fetchedAt) return null;
+        return { url: cached.url, title: cached.title, description: cached.description, siteName: cached.siteName, imageUrl: cached.imageUrl };
+      }
+
+      try {
+        const preview = await fetchLinkPreview(input.url);
+        await saveLinkPreview(input.url, preview);
+        return preview;
+      } catch {
+        // A link that cannot be previewed is not something the reader needs told about. The message
+        // still renders; it simply has no card.
+        await saveLinkPreview(input.url, null);
+        return null;
+      }
+    }),
+  }),
+  // ---- storage: what this account is actually keeping ----------------------------------------
+  storage: router({
+    usage: protectedProcedure.query(({ ctx }) => storageUsageForUser(ctx.user.id)),
+  }),
+  // ---- abuse reports: filed by a user, decided by a moderator --------------------------------
+  reports: router({
+    submit: protectedProcedure
+      .input(
+        z.object({
+          category: z.enum(REPORT_CATEGORIES),
+          note: z.string().max(1000).optional(),
+          messageId: z.string().min(1).max(64).optional(),
+          targetUserId: z.number().int().positive().optional(),
+          conversationId: z.string().min(1).max(64).optional(),
+        }),
+      )
+      .mutation(({ ctx, input }) =>
+        submitReport({
+          reporterId: ctx.user.id,
+          category: input.category,
+          note: input.note?.trim() || null,
+          messageId: input.messageId ?? null,
+          targetUserId: input.targetUserId ?? null,
+          conversationId: input.conversationId ?? null,
+        }),
+      ),
   }),
   // ---- calls: LiveKit carries the audio/video, this carries ringing state and history ---
   calls: router({
@@ -900,6 +979,11 @@ export const appRouter = router({
     users: adminProcedure.query(() => listUsersForAdmin()),
     appeals: adminProcedure.query(() => listAppealsForAdmin()),
     reviewAppeal: adminProcedure.input(z.object({ id: z.number().int().positive(), status: z.enum(["approved", "rejected"]), note: z.string().max(1000).optional() })).mutation(({ ctx, input }) => reviewAppeal(input.id, ctx.user.id, input.status, input.note?.trim() || null)),
+    // The abuse-report queue. Deciding a report does not itself punish anyone: a suspension is a
+    // separate, deliberate call through `moderate`, so one moderator cannot quietly ban on a
+    // single unverified complaint.
+    reports: adminProcedure.query(() => listReportsForAdmin()),
+    reviewReport: adminProcedure.input(z.object({ id: z.number().int().positive(), status: z.enum(["closed", "actioned"]), note: z.string().max(1000).optional() })).mutation(({ ctx, input }) => reviewReport(input.id, ctx.user.id, input.status, input.note?.trim() || null)),
     moderate: adminProcedure.input(z.object({ userId: z.number().int().positive(), status: z.enum(["active", "suspended", "banned"]), durationHours: z.number().int().min(1).max(8760).optional(), reason: z.string().max(500).optional() })).mutation(async ({ ctx, input }) => {
       if (input.userId === ctx.user.id) throw new Error("Administrators cannot moderate their own account");
       const until = input.status === "suspended" ? new Date(Date.now() + (input.durationHours ?? 24) * 60 * 60 * 1000) : null;
