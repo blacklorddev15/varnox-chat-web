@@ -43,6 +43,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { useOnline } from "@/hooks/use-online";
 import { appendMessage, filterConversations } from "@/lib/pulse-chat";
 import { describeConversation, isStrandedGroup } from "@/lib/conversation-info";
+import { avatarUrl } from "@/lib/media-url";
 import { isOnline, OFFLINE_ACTION_MESSAGE, OFFLINE_CALL_MESSAGE, OFFLINE_SEND_MESSAGE, OFFLINE_UPLOAD_MESSAGE } from "@/lib/offline";
 import { MAX_ATTACHMENT_BYTES, pickDocumentFile, prepareAttachment, prepareDocument } from "@/lib/media-upload";
 import { getApiBaseUrl } from "@/constants/oauth";
@@ -71,6 +72,18 @@ type Conversation = {
   kind?: string | null;
   /** How many people are in it, which is how a group nobody was added to becomes visible. */
   memberCount?: number | null;
+  /**
+   * The other person in a direct chat, and the stamp that versions their photo.
+   *
+   * Carried on the row so the avatar can be drawn without a query per chat: the server already
+   * returns `otherMember` on every conversation, and it was being read for the name and thrown away
+   * for the picture.
+   *
+   * `Date` as well as string because that is what actually arrives: the column is a timestamp and
+   * superjson preserves it rather than stringifying it. `avatarUrl` accepts either.
+   */
+  peerId?: number | null;
+  avatarUpdatedAt?: string | Date | null;
   // Drafts come back from the server so a half-written message survives leaving the chat.
   draft?: string | null;
   disappearSeconds?: number | null;
@@ -204,7 +217,22 @@ function chatTime(value?: string | Date | null): string {
 // Demo message and contact fixtures deleted - messages come from conversations.messages
 // and people come from people.search.
 
-function Avatar({ item, size = 52 }: { item: Pick<Conversation, "initials" | "color">; size?: number }) {
+/**
+ * A chat's picture: the other person's photo in a direct chat, initials when there is none.
+ *
+ * This drew initials and nothing else, which is why a chat header and a chat list row showed "ED"
+ * for somebody whose photo the Contact info screen displayed perfectly well. The photo was being
+ * fetched by that one screen and by nothing else.
+ *
+ * `avatarUrl` carries `avatarUpdatedAt` in the query string, so a replaced photo is not masked by a
+ * cached response, and it returns undefined when the person has never set one - which is the signal
+ * to fall back rather than to render nothing.
+ */
+function Avatar({ item, size = 52 }: { item: Pick<Conversation, "initials" | "color" | "peerId" | "avatarUpdatedAt">; size?: number }) {
+  const photo = item.peerId ? avatarUrl(item.peerId, item.avatarUpdatedAt) : undefined;
+  if (photo) {
+    return <Image source={{ uri: photo }} style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: item.color }} />;
+  }
   return <View style={[styles.avatar, { width: size, height: size, borderRadius: size / 2, backgroundColor: item.color }]}><Text style={[styles.avatarText, { fontSize: size * 0.31 }]}>{item.initials}</Text></View>;
 }
 
@@ -536,6 +564,8 @@ export default function HomeScreen() {
         group: item.kind === "group",
         kind: item.kind,
         memberCount: item.memberCount,
+        peerId: item.otherMember?.id ?? null,
+        avatarUpdatedAt: item.otherMember?.avatarUpdatedAt ?? null,
         muted: item.muted,
         pinned: item.pinned,
         archived: item.archived,
