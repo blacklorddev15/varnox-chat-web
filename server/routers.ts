@@ -952,12 +952,18 @@ export const appRouter = router({
       // The author's own statuses lead the row, as they do in the apps this follows.
       return Array.from(byAuthor.values()).sort((a, b) => Number(b.userId === ctx.user.id) - Number(a.userId === ctx.user.id));
     }),
-    create: protectedProcedure.input(z.object({ kind: z.enum(["text", "image"]).default("text"), body: z.string().trim().max(700).optional(), mediaUrl: z.string().max(2000).optional(), background: z.string().max(16).default("amber") })).mutation(async ({ ctx, input }) => {
+    create: protectedProcedure.input(z.object({ kind: z.enum(["text", "image", "video", "voice"]).default("text"), body: z.string().trim().max(700).optional(), mediaUrl: z.string().max(2000).optional(), mediaMime: z.string().max(100).optional(), voiceDurationMs: z.number().int().min(0).max(600000).optional(), background: z.string().max(16).default("amber") })).mutation(async ({ ctx, input }) => {
       if (input.kind === "text" && !input.body) throw new Error("Write something for your status");
-      if (input.kind === "image" && !input.mediaUrl) throw new Error("Add a photo to your status");
+      // One message per kind rather than "add media", so the person knows which picker to open.
+      const mediaWord = input.kind === "video" ? "a video" : input.kind === "voice" ? "a recording" : "a photo";
+      if (input.kind !== "text" && !input.mediaUrl) throw new Error(`Add ${mediaWord} to your status`);
+      // A video status without a mime type cannot be played back, since the client has nothing to
+      // hand the player. The recording path sends a duration for the same reason voice notes do.
+      if (input.kind === "video" && !input.mediaMime) throw new Error("That video is missing its format");
+      if (input.kind === "voice" && !input.voiceDurationMs) throw new Error("That recording is missing its length");
       const id = crypto.randomUUID();
       const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-      await createStatus({ id, userId: ctx.user.id, kind: input.kind, body: input.body ?? null, mediaUrl: input.mediaUrl ?? null, background: input.background, expiresAt });
+      await createStatus({ id, userId: ctx.user.id, kind: input.kind, body: input.body ?? null, mediaUrl: input.mediaUrl ?? null, mediaMime: input.mediaMime ?? null, voiceDurationMs: input.voiceDurationMs ?? null, background: input.background, expiresAt });
       return { id, expiresAt };
     }),
     view: protectedProcedure.input(z.object({ statusId: z.string().min(1) })).mutation(async ({ ctx, input }) => {

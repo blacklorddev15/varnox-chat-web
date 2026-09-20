@@ -1,5 +1,41 @@
 import { useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Image, Pressable, StyleSheet, Text, View } from "react-native";
+import { VideoView, useVideoPlayer } from "expo-video";
+import { useAudioPlayer, useAudioPlayerStatus } from "expo-audio";
+
+/**
+ * Plays a video or a recording inside the status stage.
+ *
+ * A component of its own because the players are hooks, and the viewer decides what to render with a
+ * conditional - hooks cannot be created inside one branch of a ternary.
+ */
+function StatusMedia({ kind, url, durationMs }: { kind: "video" | "voice"; url: string; durationMs?: number | null }) {
+  const source = resolveMediaUrl(url) ?? null;
+  const videoPlayer = useVideoPlayer(kind === "video" ? source : null, (player) => {
+    player.loop = false;
+    player.play();
+  });
+  const audioPlayer = useAudioPlayer(kind === "voice" ? source : null);
+  const audioStatus = useAudioPlayerStatus(audioPlayer);
+
+  if (kind === "video") {
+    return <VideoView player={videoPlayer} style={styles.image} contentFit="contain" nativeControls />;
+  }
+
+  const seconds = Math.round((durationMs ?? 0) / 1000);
+  return (
+    <View style={styles.voiceStage}>
+      <MaterialIcons name="mic" size={38} color="#FFFFFF" />
+      <Text style={styles.voiceStageText}>{seconds}s recording</Text>
+      <Pressable
+        onPress={() => (audioStatus.playing ? audioPlayer.pause() : audioPlayer.play())}
+        style={({ pressed }) => [styles.voiceStageButton, pressed && styles.pressed]}
+      >
+        <MaterialIcons name={audioStatus.playing ? "pause" : "play-arrow"} size={24} color="#FFFFFF" />
+      </Pressable>
+    </View>
+  );
+}
 import { useLocalSearchParams, useRouter } from "expo-router";
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 
@@ -89,6 +125,8 @@ export default function StatusViewerScreen() {
         <View style={styles.stage}>
           {current.kind === "image" && current.mediaUrl ? (
             <Image source={{ uri: resolveMediaUrl(current.mediaUrl) }} style={styles.image} resizeMode="contain" />
+          ) : (current.kind === "video" || current.kind === "voice") && current.mediaUrl ? (
+            <StatusMedia kind={current.kind} url={current.mediaUrl} durationMs={current.voiceDurationMs} />
           ) : (
             <View style={[styles.textStage, { backgroundColor: background }]}>
               <Text style={styles.stageText}>{current.body}</Text>
@@ -132,6 +170,10 @@ export default function StatusViewerScreen() {
 }
 
 const styles = StyleSheet.create({
+  voiceStage: { flex: 1, alignItems: "center", justifyContent: "center", gap: 12, backgroundColor: "#1B1B22" },
+  voiceStageText: { color: "#FFFFFF", fontSize: 14, fontWeight: "700" },
+  voiceStageButton: { width: 54, height: 54, borderRadius: 27, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(255,255,255,0.18)" },
+  pressed: { opacity: 0.6 },
   bars: { flexDirection: "row", gap: 4, paddingHorizontal: 10, paddingTop: 8 },
   bar: { flex: 1, height: 3, borderRadius: 2 },
   header: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 14, paddingVertical: 12 },

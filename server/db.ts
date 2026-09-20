@@ -1534,7 +1534,19 @@ export async function listContactIdsForUser(userId: number): Promise<number[]> {
   return Array.from(new Set(peers.map((row) => row.userId))).filter((id) => id !== userId);
 }
 
-export async function createStatus(input: { id: string; userId: number; kind: string; body: string | null; mediaUrl: string | null; background: string; expiresAt: Date }) {
+export async function createStatus(input: {
+  id: string;
+  userId: number;
+  kind: string;
+  body: string | null;
+  mediaUrl: string | null;
+  // Only meaningful for a video status; the viewer needs it to hand the file to a player.
+  mediaMime?: string | null;
+  // Only meaningful for a voice status; lets the viewer draw progress without loading the file.
+  voiceDurationMs?: number | null;
+  background: string;
+  expiresAt: Date;
+}) {
   const db = await getDb();
   if (!db) throw new Error("Account storage is not available");
   await db.insert(statusUpdates).values(input);
@@ -1546,7 +1558,7 @@ export async function listActiveStatusesByAuthors(authorIds: number[]) {
   const db = await getDb();
   if (!db || authorIds.length === 0) return [];
   return db
-    .select({ id: statusUpdates.id, userId: statusUpdates.userId, kind: statusUpdates.kind, body: statusUpdates.body, mediaUrl: statusUpdates.mediaUrl, background: statusUpdates.background, createdAt: statusUpdates.createdAt, expiresAt: statusUpdates.expiresAt, authorName: users.name, authorUsername: users.username, authorAvatarUpdatedAt: users.avatarUpdatedAt })
+    .select({ id: statusUpdates.id, userId: statusUpdates.userId, kind: statusUpdates.kind, body: statusUpdates.body, mediaUrl: statusUpdates.mediaUrl, mediaMime: statusUpdates.mediaMime, voiceDurationMs: statusUpdates.voiceDurationMs, background: statusUpdates.background, createdAt: statusUpdates.createdAt, expiresAt: statusUpdates.expiresAt, authorName: users.name, authorUsername: users.username, authorAvatarUpdatedAt: users.avatarUpdatedAt })
     .from(statusUpdates)
     .innerJoin(users, eq(users.id, statusUpdates.userId))
     .where(and(inArray(statusUpdates.userId, authorIds), isNull(statusUpdates.removedAt), gt(statusUpdates.expiresAt, new Date())))
